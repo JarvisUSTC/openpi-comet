@@ -18,15 +18,6 @@ logger.setLevel(20)  # info
 RESIZE_SIZE = 224
 DESPTH_RESIZE_SIZE = 720
 
-SKILL_PROMPT = """
-You are a robot that is trying to complete the global task: {task_prompt}
-
-The skills are:
-{skill_prompts}
-
-What's the next skill to perform? Only respond with a single skill name.
-"""
-
 class B1KPolicyWrapper():
     def __init__(
         self, 
@@ -41,9 +32,9 @@ class B1KPolicyWrapper():
         self.policy = policy
         self.task_name = task_name
 
-        # load the task name from the metadata
-        metadata = json.load(open(f"scripts/task_mapping.json"))
-        self.task_prompt = metadata[task_name].get("task")  
+        # load the task prompt and skills from the metadata
+        metadata = json.load(open("scripts/task_mapping.json"))
+        self.task_prompt = metadata[task_name].get("task")
         self.subtask_prompts = metadata[task_name].get("subtask")
         self.skill_prompts = metadata[task_name].get("skill")
 
@@ -80,6 +71,23 @@ class B1KPolicyWrapper():
         logger.info(f"{self.task_prompt=}")
         logger.info(f"{self.subtask_prompts=}")
         logger.info(f"{self.skill_prompts=}")
+
+    def _get_current_prompt(self, obs: dict | None = None) -> str:
+        """
+        Decide which prompt to send to the VLA model.
+
+        Priority:
+        1. Per-call prompt provided by the caller in the observation dict, under
+           the key \"prompt\" or \"task_prompt\".
+        2. The default task prompt loaded from task_mapping.json (self.task_prompt).
+        """
+        if obs is not None:
+            # Allow the websocket client / external VLM to override the prompt
+            for key in ("prompt", "task_prompt"):
+                value = obs.get(key)
+                if isinstance(value, str) and value.strip():
+                    return value
+        return self.task_prompt
 
     def reset(self):
         self.action_queue = deque([],maxlen=self.action_horizon)
@@ -137,14 +145,17 @@ class B1KPolicyWrapper():
             
         return processed_obs
     
-    def act_receeding_temporal(self, input_obs):
+    def act_receeding_temporal(self, input_obs, prompt: str | None = None):
         # Step 1: check if we should re-run policy
+        prompt = prompt or self.task_prompt
         if self.step_counter % self.replan_interval == 0:
             nbatch = copy.deepcopy(input_obs)
             if nbatch["observation"].shape[-1] != 3: 
                 # make B, num_cameras, H, W, C  from B, num_cameras, C, H, W
                 # permute if pytorch
-                nbatch["observation"] = np.transpose(nbatch["observation"], (0, 1, 3, 4, 2))
+                nbatch["observation"] = np.transpose(
+                    nbatch["observation"], (0, 1, 3, 4, 2)
+                )
 
             # nbatch["proprio"] is B, 16, where B=1
             joint_positions = nbatch["proprio"][0]
@@ -153,12 +164,12 @@ class B1KPolicyWrapper():
                 "observation/wrist_image_left": nbatch["observation"][0, 1],
                 "observation/wrist_image_right": nbatch["observation"][0, 2],
                 "observation/state": joint_positions,
-                "prompt": self.task_prompt,
+                "prompt": prompt,
             }
 
             if self.fine_grained_level > 0:
                 reasoner_response = self.reasoner.generate_subtask(
-                    high_level_task=self.task_prompt,
+                    high_level_task=prompt,
                     multi_modals=[batch["observation/egocentric_camera"]],
                 )
                 logger.info(f"* {reasoner_response}")
@@ -243,9 +254,12 @@ class B1KPolicyWrapper():
             Dtype: float64
             Shape: (10, 16)
         """
+        # Decide the prompt for this call (can be overridden by the caller).
+        current_prompt = self._get_current_prompt(input_obs)
+
         input_obs = self.process_obs(input_obs)
         if self.control_mode == 'receeding_temporal':
-            return self.act_receeding_temporal(input_obs)
+            return self.act_receeding_temporal(input_obs, prompt=current_prompt)
         
         if self.control_mode == 'receeding_horizon':
             if len(self.action_queue) > 0:
@@ -266,7 +280,7 @@ class B1KPolicyWrapper():
             "observation/wrist_image_left": nbatch["observation"][0, 1],
             "observation/wrist_image_right": nbatch["observation"][0, 2],
             "observation/state": joint_positions,
-            "prompt": self.task_prompt,
+            "prompt": current_prompt,
         }
 
         if "observation/egocentric_depth" in nbatch:
@@ -275,7 +289,7 @@ class B1KPolicyWrapper():
         if self.fine_grained_level > 0:
             # skill_prompt = SKILL_PROMPT.format(task_prompt=self.task_prompt, skill_prompts="\n".join(self.skill_prompts))
             reasoner_response = self.reasoner.generate_subtask(
-                high_level_task=self.task_prompt,
+                high_level_task=current_prompt,
                 multi_modals=[batch["observation/egocentric_camera"]],
             )
             logger.info(f"* {reasoner_response}")

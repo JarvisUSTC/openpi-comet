@@ -1,0 +1,17 @@
+{
+    // Use IntelliSense to learn about possible attributes.
+    // Hover to view descriptions of existing attributes.
+    // For more information, visit: https://go.microsoft.com/fwlink/?linkid=830387
+    "version": "0.2.0",
+    "configurations": [
+        // python scripts/serve_b1k.py --task_name=turning_on_radio policy:checkpoint --policy.config=pi0_b1k --policy.dir=/home/simpleai/ruike/task_checkpoint/openpi_comet/pi05-b1kpt50-cs32
+        {
+            "name": "serve_b1k",
+            "type": "debugpy",
+            "request": "launch",
+            "program": "${file}",
+            "console": "integratedTerminal",
+            "args": "--task_name=turning_on_radio --record --control_mode=receeding_horizon --dataset_root=/home/simpleai/ruike/2025-challenge-demos policy:checkpoint --policy.config=pi05_b1k-pt50_cs32_bs64_lr2.5e-5_step50k --policy.dir=/home/simpleai/ruike/task_checkpoint/openpi_comet/pi05-b1kpt50-cs32"
+        }
+    ]
+}
