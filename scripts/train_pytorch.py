@@ -41,10 +41,31 @@ import tqdm
 import wandb
 
 import openpi.models.pi0_config
+import openpi.models.tokenizer as _tokenizer
 import openpi.models_pytorch.pi0_pytorch
 import openpi.shared.normalize as _normalize
 import openpi.training.config as _config
 import openpi.training.data_loader as _data_loader
+
+_PROMPT_LOG_INTERVAL = 10
+
+
+def _decode_prompt_for_logging(observation, tokenizer: _tokenizer.PaligemmaTokenizer) -> str:
+    tokens = observation.tokenized_prompt[0]
+    token_mask = getattr(observation, "tokenized_prompt_mask", None)
+    token_mask = None if token_mask is None else token_mask[0].to(torch.bool)
+
+    token_ar_mask = getattr(observation, "token_ar_mask", None)
+    token_ar_mask = None if token_ar_mask is None else token_ar_mask[0]
+    if token_ar_mask is not None:
+        prompt_mask = token_ar_mask == 0
+        if token_mask is not None:
+            prompt_mask = prompt_mask & token_mask
+        return tokenizer.decode(tokens.detach().cpu().numpy(), mask=prompt_mask.detach().cpu().numpy())
+
+    if token_mask is not None:
+        return tokenizer.decode(tokens.detach().cpu().numpy(), mask=token_mask.detach().cpu().numpy())
+    return tokenizer.decode(tokens.detach().cpu().numpy())
 
 
 def init_logging():
@@ -508,6 +529,8 @@ def train_loop(config: _config.TrainConfig):
         logging.info("EMA is not supported for PyTorch training")
         logging.info(f"Training precision: {model_cfg.dtype}")
 
+    prompt_tokenizer = _tokenizer.PaligemmaTokenizer(config.model.max_token_len) if is_main else None
+
     # Training loop - iterate until we reach num_train_steps
     pbar = (
         tqdm.tqdm(total=config.num_train_steps, initial=global_step, desc="Training", disable=not is_main)
@@ -524,6 +547,16 @@ def train_loop(config: _config.TrainConfig):
             # Check if we've reached the target number of steps
             if global_step >= config.num_train_steps:
                 break
+
+            if prompt_tokenizer is not None and (global_step % _PROMPT_LOG_INTERVAL == 0):
+                try:
+                    prompt_text = _decode_prompt_for_logging(observation, prompt_tokenizer)
+                    if pbar is not None:
+                        pbar.write(f"[prompt step={global_step}] {prompt_text}")
+                    else:
+                        logging.info("[prompt step=%s] %s", global_step, prompt_text)
+                except Exception:
+                    logging.exception("Failed to decode/log prompt at step=%s", global_step)
 
             # The unified data loader returns (observation, actions) tuple
             observation = jax.tree.map(lambda x: x.to(device), observation)  # noqa: PLW2901

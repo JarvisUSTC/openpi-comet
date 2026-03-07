@@ -13,8 +13,10 @@ import jax.numpy as jnp
 import optax
 import tqdm_loggable.auto as tqdm
 import wandb
+import numpy as np
 
 import openpi.models.model as _model
+import openpi.models.tokenizer as _tokenizer
 import openpi.shared.array_typing as at
 import openpi.shared.nnx_utils as nnx_utils
 import openpi.training.checkpoints as _checkpoints
@@ -24,6 +26,64 @@ import openpi.training.optimizer as _optimizer
 import openpi.training.sharding as sharding
 import openpi.training.utils as training_utils
 import openpi.training.weight_loaders as _weight_loaders
+
+_PROMPT_LOG_INTERVAL = 10
+
+
+def _decode_prompt_for_logging(observation: Any, tokenizer: _tokenizer.PaligemmaTokenizer) -> str:
+    tokens = jax.device_get(observation.tokenized_prompt)[0]
+    token_mask = getattr(observation, "tokenized_prompt_mask", None)
+    token_mask = None if token_mask is None else jax.device_get(token_mask)[0].astype(bool)
+
+    token_ar_mask = getattr(observation, "token_ar_mask", None)
+    token_ar_mask = None if token_ar_mask is None else jax.device_get(token_ar_mask)[0]
+    if token_ar_mask is not None:
+        prompt_mask = token_ar_mask == 0
+        if token_mask is not None:
+            prompt_mask = prompt_mask & token_mask
+        return tokenizer.decode(tokens, mask=prompt_mask)
+
+    if token_mask is not None:
+        return tokenizer.decode(tokens, mask=token_mask)
+    return tokenizer.decode(tokens)
+
+def _validation_is_enabled(config: _config.TrainConfig) -> bool:
+    if config.val_log_interval <= 0 or config.val_num_batches <= 0:
+        return False
+    # Require an explicit validation split/dataset override to avoid silently "validating" on the train set.
+    return (config.val_repo_id is not None) or (config.val_episodes_index is not None)
+
+
+def _override_factory_for_val(factory: _config.DataConfigFactory, config: _config.TrainConfig) -> _config.DataConfigFactory:
+    if config.val_repo_id is not None:
+        factory = dataclasses.replace(factory, repo_id=config.val_repo_id)
+    if config.val_episodes_index is not None:
+        base = factory.base_config or _config.DataConfig()
+        base = dataclasses.replace(base, episodes_index=config.val_episodes_index)
+        factory = dataclasses.replace(factory, base_config=base)
+    return factory
+
+
+def _make_val_config(config: _config.TrainConfig) -> _config.TrainConfig:
+    val_batch_size = config.batch_size if config.val_batch_size is None else config.val_batch_size
+    if isinstance(config.data, list):
+        val_data = [_override_factory_for_val(f, config) for f in config.data]
+    else:
+        val_data = _override_factory_for_val(config.data, config)
+    return dataclasses.replace(config, batch_size=val_batch_size, data=val_data)
+
+
+@at.typecheck
+def eval_step(
+    rng: at.KeyArrayLike,
+    state: training_utils.TrainState,
+    batch: tuple[_model.Observation, _model.Actions],
+) -> at.Float[at.Array, ""]:
+    model = nnx.merge(state.model_def, state.params)
+    model.eval()
+    observation, actions = batch
+    chunked_loss = model.compute_loss(rng, observation, actions, train=False)
+    return jnp.mean(chunked_loss)
 
 
 def init_logging():
@@ -230,7 +290,15 @@ def main(config: _config.TrainConfig):
     )
     data_iter = iter(data_loader)
     batch = next(data_iter)
+    logging.info(
+        "Data config: fine_grained_level=%s (0=global task, 1=subtask, 2=skill)",
+        getattr(data_loader.data_config(), "fine_grained_level", "?"),
+    )
     logging.info(f"Initialized data loader:\n{training_utils.array_tree_to_info(batch)}")
+
+    prompt_tokenizer = None
+    if jax.process_index() == 0:
+        prompt_tokenizer = _tokenizer.PaligemmaTokenizer(config.model.max_token_len)
 
     train_state, train_state_sharding = init_train_state(config, init_rng, mesh, resume=resuming)
     jax.block_until_ready(train_state)
@@ -246,6 +314,31 @@ def main(config: _config.TrainConfig):
         donate_argnums=(1,),
     )
 
+    val_loader = None
+    peval_step = None
+    if _validation_is_enabled(config):
+        val_config = _make_val_config(config)
+        val_loader = _data_loader.create_behavior_data_loader(
+            val_config,
+            sharding=data_sharding,
+            shuffle=False,
+            num_batches=val_config.val_num_batches,
+            skip_norm_stats=False,
+        )
+        peval_step = jax.jit(
+            eval_step,
+            in_shardings=(replicated_sharding, train_state_sharding, data_sharding),
+            out_shardings=replicated_sharding,
+        )
+        logging.info(
+            "Validation enabled: val_repo_id=%s val_episodes_index=%s val_batch_size=%s val_num_batches=%s val_log_interval=%s",
+            val_config.val_repo_id,
+            val_config.val_episodes_index,
+            val_config.batch_size,
+            val_config.val_num_batches,
+            val_config.val_log_interval,
+        )
+
     start_step = int(train_state.step)
     pbar = tqdm.tqdm(
         range(start_step, config.num_train_steps),
@@ -256,6 +349,28 @@ def main(config: _config.TrainConfig):
 
     infos = []
     for step in pbar:
+        if prompt_tokenizer is not None and (step % _PROMPT_LOG_INTERVAL == 0):
+            try:
+                observation, _actions = batch
+                prompt_text = _decode_prompt_for_logging(observation, prompt_tokenizer)
+                pbar.write(f"[prompt step={step}] {prompt_text}")
+            except Exception:
+                logging.exception("Failed to decode/log prompt at step=%s", step)
+
+        if val_loader is not None and peval_step is not None and (step % config.val_log_interval == 0):
+            try:
+                val_losses = []
+                val_rng = jax.random.fold_in(train_rng, 1_000_000 + step)
+                for val_batch in val_loader:
+                    with sharding.set_mesh(mesh):
+                        val_loss = peval_step(val_rng, train_state, val_batch)
+                    val_losses.append(val_loss)
+                val_loss_mean = float(np.mean(jax.device_get(jnp.stack(val_losses))))
+                pbar.write(f"Step {step}: val_loss={val_loss_mean:.4f}")
+                wandb.log({"val_loss": val_loss_mean}, step=step)
+            except Exception:
+                logging.exception("Validation failed at step=%s", step)
+
         with sharding.set_mesh(mesh):
             train_state, info = ptrain_step(train_rng, train_state, batch)
         infos.append(info)

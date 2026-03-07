@@ -19,6 +19,32 @@ class PaligemmaTokenizer:
         with path.open("rb") as f:
             self._tokenizer = sentencepiece.SentencePieceProcessor(model_proto=f.read())
 
+    def decode(self, tokens: np.ndarray | list[int], *, mask: np.ndarray | list[bool] | None = None) -> str:
+        """Decode token ids back into a string.
+
+        Notes:
+        - This is primarily intended for debugging/logging, e.g. decoding `tokenized_prompt`.
+        - If `mask` is provided, only tokens where mask is True are decoded.
+        - If `mask` is not provided, trailing zero-padding is stripped.
+        """
+
+        tokens_arr = np.asarray(tokens)
+        if tokens_arr.ndim != 1:
+            tokens_arr = tokens_arr.reshape(-1)
+
+        if mask is not None:
+            mask_arr = np.asarray(mask).astype(bool)
+            if mask_arr.ndim != 1:
+                mask_arr = mask_arr.reshape(-1)
+            tokens_arr = tokens_arr[mask_arr]
+        else:
+            # Heuristic: our padding is `False` which becomes 0 in numeric arrays; strip trailing zeros.
+            while tokens_arr.size > 0 and int(tokens_arr[-1]) == 0:
+                tokens_arr = tokens_arr[:-1]
+
+        decoded = self._tokenizer.decode([int(t) for t in tokens_arr.tolist()])
+        return decoded.strip()
+
     def tokenize(self, prompt: str, state: np.ndarray | None = None) -> tuple[np.ndarray, np.ndarray]:
         cleaned_text = prompt.strip().replace("_", " ").replace("\n", " ")
         if state is not None:

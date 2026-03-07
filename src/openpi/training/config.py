@@ -122,7 +122,7 @@ class DataConfig:
     tolerance_s: float = 1e-4
 
     # fine-grained level of orchestrators to use for training
-    fine_grained_level: int = (0,)  # 0, 1, 2
+    fine_grained_level: int = 0  # 0, 1, 2
 
     # whether to return seg instance
     return_seg_instance: bool = False
@@ -771,6 +771,77 @@ _CONFIGS = [
         freeze_filter=pi0_config.Pi0Config(pi05=True, action_horizon=32).get_freeze_filter(),
         ema_decay=None,
         checkpoint_base_dir=".",
+        num_workers=8,
+        batch_size=8 * 32,
+    ),
+    # debug
+    TrainConfig(
+        name="pi05_b1k-turning_on_radio",
+        exp_name="openpi",
+        project_name="B1K",
+        model=pi0_config.Pi0Config(pi05=True, action_horizon=32),
+        data=LeRobotB1KDataConfig(
+            repo_id="behavior-1k/2025-challenge-demos",
+            base_config=DataConfig(
+                prompt_from_task=True,
+                behavior_dataset_root="../DATASETS/behavior/2025-challenge-demos",
+                tasks=["turning_on_radio"],
+                fine_grained_level=1,  # 0, 1, 2
+                # Debug split: indices are PER-TASK positional episode indices (not global episode ids).
+                episodes_index=list(range(0, 20)),
+            ),
+        ),
+        weight_loader=weight_loaders.CheckpointWeightLoader(
+            "/root/Models/pi05_base/params"
+        ),  # hf download in advance
+        num_train_steps=200,
+        lr_schedule=_optimizer.CosineDecaySchedule(
+            peak_lr=2.5e-6,
+            decay_steps=20_000,
+        ),
+        log_interval=10,
+        val_log_interval=10,
+        val_num_batches=2,
+        val_episodes_index=list(range(20, 30)),
+        freeze_filter=pi0_config.Pi0Config(pi05=True, action_horizon=32).get_freeze_filter(),
+        ema_decay=None,
+        checkpoint_base_dir="./outputs/checkpoints/debug",
+        num_workers=1,
+        batch_size=1 * 32,
+    ),
+    TrainConfig(
+        name="pi05_b1k-all_skills",
+        exp_name="openpi",
+        project_name="B1K",
+        model=pi0_config.Pi0Config(pi05=True, action_horizon=32),
+        data=LeRobotB1KDataConfig(
+            repo_id="behavior-1k/2025-challenge-demos",
+            base_config=DataConfig(
+                prompt_from_task=True,
+                behavior_dataset_root="../DATASETS/behavior/2025-challenge-demos",
+                # Train/val split: these are PER-TASK positional episode indices (not global episode ids).
+                episodes_index=list(range(0, 180)),
+                fine_grained_level=1,  # 0, 1, 2
+            ),
+        ),
+        weight_loader=weight_loaders.CheckpointWeightLoader(
+            "/root/Models/pi05_base/params"
+        ),  # hf download in advance
+        num_train_steps=50_000,
+        lr_schedule=_optimizer.CosineDecaySchedule(
+            peak_lr=2.5e-5,
+            decay_steps=50_000,
+        ),
+        # Keep train logging reasonably frequent; run validation less often to limit overhead.
+        log_interval=100,
+        save_interval=5000,
+        val_log_interval=100,
+        val_num_batches=10,
+        val_batch_size=2 * 32,
+        val_episodes_index=list(range(180, 200)),
+        freeze_filter=pi0_config.Pi0Config(pi05=True, action_horizon=32).get_freeze_filter(),
+        ema_decay=None,
+        checkpoint_base_dir="./outputs/checkpoints/pi05_b1k-all_skills",
         num_workers=8,
         batch_size=8 * 32,
     ),
