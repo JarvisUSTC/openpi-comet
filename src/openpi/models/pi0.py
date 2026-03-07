@@ -69,6 +69,7 @@ class Pi0(_model.BaseModel):
         super().__init__(config.action_dim, config.action_horizon, config.max_token_len)
         self.pi05 = config.pi05
         self.pcd = config.pcd
+        self.knowledge_insulation = getattr(config, "knowledge_insulation", False)
         paligemma_config = _gemma.get_config(config.paligemma_variant)
         action_expert_config = _gemma.get_config(config.action_expert_variant)
         # TODO: rewrite gemma in NNX. For now, use bridge.
@@ -159,6 +160,37 @@ class Pi0(_model.BaseModel):
         return tokens, input_mask, ar_mask
 
     @at.typecheck
+    def embed_prefix_for_fast(
+        self, obs: _model.Observation
+    ) -> tuple[at.Float[at.Array, "b s emb"], at.Bool[at.Array, "b s"], at.Bool[at.Array, "b s"]]:
+        """Prefix for π0.5 + KI: image + full token sequence (lang + action tokens) with causal mask on tokens."""
+        input_mask_list = []
+        tokens_list = []
+        # embed images (same as embed_prefix)
+        for name in obs.images:
+            image_tokens, _ = self.PaliGemma.img(obs.images[name], train=False)
+            tokens_list.append(image_tokens)
+            input_mask_list.append(
+                einops.repeat(
+                    obs.image_masks[name],
+                    "b -> b s",
+                    s=image_tokens.shape[1],
+                )
+            )
+        # full token sequence (lang + action tokens) for FAST loss
+        assert obs.tokenized_prompt is not None and obs.token_ar_mask is not None
+        tokenized_inputs = self.PaliGemma.llm(obs.tokenized_prompt, method="embed")
+        tokens_list.append(tokenized_inputs)
+        input_mask_list.append(obs.tokenized_prompt_mask)
+        tokens = jnp.concatenate(tokens_list, axis=1)
+        input_mask = jnp.concatenate(input_mask_list, axis=1)
+        # ar_mask: image = full attention (False), tokens = causal from token_ar_mask (bool)
+        image_len = tokens.shape[1] - tokenized_inputs.shape[1]
+        image_ar = jnp.zeros((tokens.shape[0], image_len), dtype=jnp.bool_)  # False = full attention
+        ar_mask = jnp.concatenate([image_ar, obs.token_ar_mask.astype(jnp.bool_)], axis=1)
+        return tokens, input_mask, ar_mask
+
+    @at.typecheck
     def embed_suffix(
         self, obs: _model.Observation, noisy_actions: _model.Actions, timestep: at.Float[at.Array, " b"]
     ) -> tuple[
@@ -208,6 +240,31 @@ class Pi0(_model.BaseModel):
         ar_mask = jnp.array(ar_mask)
         return tokens, input_mask, ar_mask, adarms_cond
 
+    def _compute_loss_fast(
+        self, observation: _model.Observation
+    ) -> at.Float[at.Array, "*b"]:
+        """FAST (discrete action token) CE loss for KI: updates backbone only."""
+        prefix_tokens, prefix_mask, prefix_ar_mask = self.embed_prefix_for_fast(observation)
+        attn_mask = make_attn_mask(prefix_mask, prefix_ar_mask)
+        positions = jnp.cumsum(prefix_mask, axis=1) - 1
+        (prefix_out, _), _ = self.PaliGemma.llm(
+            [prefix_tokens, None],
+            mask=attn_mask,
+            positions=positions,
+            adarms_cond=[None, None],
+        )
+        # prefix_out is (output, None); use first expert's hidden for next-token logits
+        logits = self.PaliGemma.llm(prefix_out[:, :-1], method="decode_logits")
+        targets = jax.nn.one_hot(
+            observation.tokenized_prompt[:, 1:],
+            logits.shape[-1],
+        )
+        logp = jax.nn.log_softmax(logits, axis=-1)
+        token_pplx = jnp.sum(targets * logp, axis=-1)
+        assert observation.token_loss_mask is not None
+        loss_mask = observation.token_loss_mask[:, 1:]
+        return -jnp.sum(token_pplx * loss_mask, axis=-1) / jnp.clip(jnp.sum(loss_mask, axis=-1), 1)
+
     @override
     def compute_loss(
         self, rng: at.KeyArrayLike, observation: _model.Observation, actions: _model.Actions, *, train: bool = False
@@ -232,9 +289,16 @@ class Pi0(_model.BaseModel):
         (prefix_out, suffix_out), _ = self.PaliGemma.llm(
             [prefix_tokens, suffix_tokens], mask=attn_mask, positions=positions, adarms_cond=[None, adarms_cond]
         )
+        # Knowledge insulation: stop gradient from action expert to backbone
+        if self.knowledge_insulation:
+            suffix_out = jax.lax.stop_gradient(suffix_out)
         v_t = self.action_out_proj(suffix_out[:, -self.action_horizon :])
 
-        return jnp.mean(jnp.square(v_t - u_t), axis=-1)
+        loss_flow = jnp.mean(jnp.square(v_t - u_t), axis=-1)  # (*b, ah)
+        if self.knowledge_insulation:
+            loss_fast = self._compute_loss_fast(observation)  # (*b,)
+            return loss_fast[..., None] + loss_flow
+        return loss_flow
 
     @override
     def sample_actions(

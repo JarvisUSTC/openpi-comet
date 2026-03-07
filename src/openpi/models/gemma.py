@@ -395,6 +395,10 @@ class Module(nn.Module):
     def embed(self, tokens: at.Int[at.Array, "b t"]) -> at.Float[at.Array, "b t d"]:
         return self.embedder.encode(tokens).astype(self.embed_dtype)
 
+    def decode_logits(self, hidden: at.Float[at.Array, "b t d"]) -> at.Float[at.Array, "b t v"]:
+        """Decode hidden states to vocabulary logits (for next-token prediction, e.g. KI FAST loss)."""
+        return self.embedder.decode(hidden)
+
     @at.typecheck
     def __call__(
         self,

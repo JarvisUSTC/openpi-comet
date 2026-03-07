@@ -181,6 +181,27 @@ class ModelTransformFactory(GroupFactory):
                 )
             case _model.ModelType.PI05:
                 assert isinstance(model_config, pi0_config.Pi0Config)
+                if getattr(model_config, "knowledge_insulation", False):
+                    # π0.5 + KI: FAST tokenization for backbone, keep continuous actions for flow loss.
+                    tokenizer_cls = getattr(
+                        model_config, "fast_model_tokenizer", _tokenizer.FASTTokenizer
+                    ) or _tokenizer.FASTTokenizer
+                    tokenizer_kwargs = getattr(
+                        model_config, "fast_model_tokenizer_kwargs", None
+                    ) or {}
+                    fast_tokenizer = tokenizer_cls(model_config.max_token_len, **tokenizer_kwargs)
+                    return _transforms.Group(
+                        inputs=[
+                            *meta_input_transforms,
+                            _transforms.InjectDefaultPrompt(self.default_prompt),
+                            _transforms.ResizeImages(224, 224),
+                            _transforms.TokenizeFASTInputs(fast_tokenizer),
+                            _transforms.PadStatesAndActions(model_config.action_dim),
+                        ],
+                        outputs=[
+                            *meta_output_transforms[::-1],  # inverse
+                        ],
+                    )
                 return _transforms.Group(
                     inputs=[
                         *meta_input_transforms,
@@ -622,6 +643,35 @@ def eps_index_fn(*indexs):
 # Use `get_config` if you need to get a config by name in your code.
 _CONFIGS = [
     # 0. Base Model Configs
+    TrainConfig(
+        name="pi05_b1k_ki",
+        exp_name="openpi_ki",
+        project_name="B1K",
+        model=pi0_config.Pi0Config(pi05=True, action_horizon=32, knowledge_insulation=True),
+        data=LeRobotB1KDataConfig(
+            repo_id="behavior-1k/2025-challenge-demos",
+            base_config=DataConfig(
+                prompt_from_task=True,
+                episodes_index=list(range(200)),
+                behavior_dataset_root="../DATASETS/behavior/2025-challenge-demos",
+                tasks=["turning_on_radio"],
+                fine_grained_level=0,
+            ),
+        ),
+        weight_loader=weight_loaders.CheckpointWeightLoader("gs://openpi-assets/checkpoints/pi05_base/params"),
+        num_train_steps=30_000,
+        lr_schedule=_optimizer.CosineDecaySchedule(
+            peak_lr=2.5e-5,
+            decay_steps=30_000,
+        ),
+        freeze_filter=pi0_config.Pi0Config(
+            pi05=True, action_horizon=32, knowledge_insulation=True
+        ).get_freeze_filter(),
+        ema_decay=None,
+        checkpoint_base_dir=".",
+        num_workers=8,
+        batch_size=8 * 32,
+    ),
     TrainConfig(
         name="pi05_b1k-base",
         exp_name="openpi",

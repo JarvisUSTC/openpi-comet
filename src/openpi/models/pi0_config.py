@@ -37,6 +37,10 @@ class Pi0Config(_model.BaseModelConfig):
     # whether to use pointnet to encode the point cloud
     pcd: bool = False
 
+    # π0.5 + Knowledge Insulation: train backbone with FAST (discrete) action tokens and
+    # action expert with flow-matching, with stop_gradient from action expert to backbone.
+    knowledge_insulation: bool = False
+
     def __post_init__(self):
         if self.max_token_len is None:
             object.__setattr__(self, "max_token_len", 200 if self.pi05 else 48)
@@ -76,6 +80,12 @@ class Pi0Config(_model.BaseModelConfig):
                 state=jax.ShapeDtypeStruct([batch_size, self.action_dim], jnp.float32),
                 tokenized_prompt=jax.ShapeDtypeStruct([batch_size, self.max_token_len], jnp.int32),
                 tokenized_prompt_mask=jax.ShapeDtypeStruct([batch_size, self.max_token_len], bool),
+                token_ar_mask=jax.ShapeDtypeStruct([batch_size, self.max_token_len], jnp.int32)
+                if self.knowledge_insulation
+                else None,
+                token_loss_mask=jax.ShapeDtypeStruct([batch_size, self.max_token_len], bool)
+                if self.knowledge_insulation
+                else None,
                 pcd_xyz=jax.ShapeDtypeStruct([batch_size, 16, 2025, 3], jnp.float32),
             )
         action_spec = jax.ShapeDtypeStruct([batch_size, self.action_horizon, self.action_dim], jnp.float32)
