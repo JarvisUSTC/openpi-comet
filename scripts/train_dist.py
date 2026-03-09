@@ -18,6 +18,7 @@ import tqdm_loggable.auto as tqdm
 import wandb
 
 import openpi.models.model as _model
+import openpi.models.tokenizer as _tokenizer
 import openpi.shared.array_typing as at
 import openpi.shared.nnx_utils as nnx_utils
 import openpi.training.checkpoints_dist as _checkpoints
@@ -27,6 +28,26 @@ import openpi.training.optimizer as _optimizer
 import openpi.training.sharding as sharding
 import openpi.training.utils as training_utils
 import openpi.training.weight_loaders as _weight_loaders
+
+_PROMPT_LOG_INTERVAL = 10
+
+
+def _decode_prompt_for_logging(observation: Any, tokenizer: _tokenizer.PaligemmaTokenizer) -> str:
+    tokens = jax.device_get(observation.tokenized_prompt)[0]
+    token_mask = getattr(observation, "tokenized_prompt_mask", None)
+    token_mask = None if token_mask is None else jax.device_get(token_mask)[0].astype(bool)
+
+    token_ar_mask = getattr(observation, "token_ar_mask", None)
+    token_ar_mask = None if token_ar_mask is None else jax.device_get(token_ar_mask)[0]
+    if token_ar_mask is not None:
+        prompt_mask = token_ar_mask == 0
+        if token_mask is not None:
+            prompt_mask = prompt_mask & token_mask
+        return tokenizer.decode(tokens, mask=prompt_mask)
+
+    if token_mask is not None:
+        return tokenizer.decode(tokens, mask=token_mask)
+    return tokenizer.decode(tokens)
 
 
 def _broadcast_str_from_primary(s: str, max_len: int = 512) -> str:
@@ -252,6 +273,10 @@ def main(config: _config.TrainConfig):
     data_iter = iter(data_loader)
     batch = next(data_iter)
 
+    prompt_tokenizer = None
+    if jax.process_index() == 0:
+        prompt_tokenizer = _tokenizer.PaligemmaTokenizer(config.model.max_token_len)
+
     train_state, train_state_sharding = init_train_state(config, init_rng, mesh, resume=resuming)
     jax.block_until_ready(train_state)
     logging.info(
@@ -284,6 +309,14 @@ def main(config: _config.TrainConfig):
     logging.info(f"[P{jax.process_index()}] Steps per epoch: {N}")
 
     for step in pbar:
+        if prompt_tokenizer is not None and (step % _PROMPT_LOG_INTERVAL == 0):
+            try:
+                observation, _actions = batch
+                prompt_text = _decode_prompt_for_logging(observation, prompt_tokenizer)
+                pbar.write(f"[prompt step={step}] {prompt_text}")
+            except Exception:
+                logging.exception("Failed to decode/log prompt at step=%s", step)
+
         with sharding.set_mesh(mesh):
             train_state, info = ptrain_step(train_rng, train_state, batch)
         infos.append(info)

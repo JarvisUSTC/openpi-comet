@@ -5,6 +5,7 @@ import json
 import os
 from pathlib import Path
 import random
+import re
 
 import datasets
 from datasets import load_dataset
@@ -47,6 +48,141 @@ from torch.utils.data import get_worker_info
 ANNOTATIONS_PATH = "annotations"
 ORCHESTRATORS_PATH = "orchestrators"
 logger = create_module_logger("BehaviorLeRobotDataset")
+
+# Skill -> task prompt formatting (aligned with scripts/check_skill_coverage.py)
+_SKILL_PREP_PATTERNS = [
+    (" from", 5), (" on", 3), (" in", 3), (" into", 5), (" onto", 5),
+    (" under", 6), (" to", 3), (" off", 4), (" with", 5),
+]
+
+
+def _sanitize_object_name(obj_id: str) -> str:
+    return re.sub(r"(_[a-zA-Z0-9]+)*_\d+$", "", obj_id) or obj_id
+
+
+def _flatten_objs(objs) -> list:
+    """Flatten object list (handle nested lists and stringified lists)."""
+    out = []
+    for o in objs:
+        if isinstance(o, list):
+            out.extend(_flatten_objs(o))
+        elif isinstance(o, str):
+            if o.startswith("[") and "]" in o:
+                try:
+                    parsed = json.loads(o.replace("'", '"'))
+                    out.extend(_flatten_objs(parsed) if isinstance(parsed, list) else [parsed])
+                except Exception:
+                    out.append(o)
+            else:
+                out.append(o)
+    return out
+
+
+def format_skill_prompt(skill_item: dict) -> str:
+    """Format a skill_annotation item into a short task prompt (object names sanitized)."""
+    raw = skill_item.get("skill_description")
+    if isinstance(raw, list):
+        skill_desc = (raw or [""])[0]
+    else:
+        skill_desc = str(raw) if raw else ""
+    obj_groups = skill_item.get("object_id") or [[]]
+    objs = _flatten_objs(obj_groups[0]) if obj_groups else []
+
+    if not objs:
+        return skill_desc
+
+    objs_clean = [_sanitize_object_name(str(o)) for o in objs]
+
+    for prep, strip_len in _SKILL_PREP_PATTERNS:
+        if len(objs_clean) >= 2 and skill_desc.endswith(prep):
+            verb = skill_desc[:-strip_len].strip()
+            return f"{verb} {objs_clean[0]} {prep.strip()} {objs_clean[1]}"
+    if len(objs_clean) >= 3 and " next to" in skill_desc:
+        base = skill_desc.replace(" next to", "")
+        for prep, strip_len in _SKILL_PREP_PATTERNS:
+            if base.endswith(prep):
+                verb = base[:-strip_len].strip()
+                return f"{verb} {objs_clean[0]} {prep.strip()} {objs_clean[1]} next to {objs_clean[2]}"
+    if len(objs_clean) >= 2:
+        if skill_desc == "attach":
+            return f"attach {objs_clean[0]} to {objs_clean[1]}"
+        if skill_desc == "hang":
+            return f"hang {objs_clean[0]} on {objs_clean[1]}"
+        if skill_desc == "chop":
+            return f"chop {objs_clean[1]} with {objs_clean[0]}"
+        if skill_desc == "ignite":
+            return f"ignite {objs_clean[1]} with {objs_clean[0]}"
+        if skill_desc == "insert":
+            return f"insert {objs_clean[0]} into {objs_clean[1]}"
+        if skill_desc == "spray":
+            return f"spray {objs_clean[0]} on {objs_clean[1]}"
+        if skill_desc == "sweep surface":
+            return f"sweep {objs_clean[1]} with {objs_clean[0]}"
+
+    return f"{skill_desc} {' '.join(objs_clean)}".strip()
+
+
+def build_orchestrator_levels_from_annotations(
+    episode_key: int,
+    episode_len: int,
+    skill_annotation: list,
+    level_0_task: str,
+) -> dict:
+    """
+    Build orchestrator levels 0, 1, 2 from skill_annotation when no orchestrator files exist.
+    - level 0: one segment, whole episode, level_0_task.
+    - level 1 & 2: one segment per skill; task text = format_skill_prompt(skill).
+    Uses frame_duration [start, end] per skill if present (end exclusive); else equal split.
+    """
+    output_data = defaultdict(list)
+    output_data[0].append({
+        "task": level_0_task,
+        "start_frame": 0,
+        "end_frame": episode_len - 1,
+    })
+    if not skill_annotation:
+        output_data[1] = list(output_data[0])
+        output_data[2] = list(output_data[0])
+        output_data[3] = list(output_data[0])
+        return output_data
+
+    def _parse_frame_duration(fd) -> tuple[int, int] | None:
+        """Parse frame_duration as [start, end] or [[start, end]]; return (start, end) or None."""
+        if fd is None or not isinstance(fd, (list, tuple)) or len(fd) < 2:
+            return None
+        a, b = fd[0], fd[1]
+        if isinstance(a, (list, tuple)):
+            a = a[0] if len(a) > 0 else 0
+        if isinstance(b, (list, tuple)):
+            b = b[0] if len(b) > 0 else 0
+        try:
+            return int(a), int(b)
+        except (TypeError, ValueError):
+            return None
+
+    n = len(skill_annotation)
+    for i, s in enumerate(skill_annotation):
+        task_text = format_skill_prompt(s)
+        parsed = _parse_frame_duration(s.get("frame_duration")) if "frame_duration" in s else None
+        if parsed is not None:
+            start_f, end_f = parsed
+            end_frame = min(end_f - 1, episode_len - 1) if end_f > 0 else episode_len - 1
+            start_frame = max(0, start_f)
+        else:
+            start_frame = (i * episode_len) // n
+            end_frame = ((i + 1) * episode_len - 1) // n if i < n - 1 else episode_len - 1
+        output_data[1].append({
+            "task": task_text,
+            "start_frame": start_frame,
+            "end_frame": end_frame,
+        })
+        output_data[2].append({
+            "task": task_text,
+            "start_frame": start_frame,
+            "end_frame": end_frame,
+        })
+    output_data[3] = list(output_data[2])
+    return output_data
 
 
 class BehaviorLeRobotDataset(LeRobotDataset):
@@ -337,6 +473,11 @@ class BehaviorLeRobotDataset(LeRobotDataset):
         if not self._chunk_streaming_using_keyframe:
             item = super().__getitem__(idx)
             item["task"] = self._get_fine_grained_task(item)
+            ep_idx = item["episode_index"].item()
+            frame_index = round(item["timestamp"].item() * self.fps)
+            skill_end = self._get_skill_end_frame(ep_idx, frame_index)
+            if skill_end is not None:
+                self._mask_action_chunks_to_skill_end(item, frame_index, skill_end)
             return item
 
         # Streaming mode: we will load the episode at the current streaming index, and then increment the index for next call
@@ -453,6 +594,12 @@ class BehaviorLeRobotDataset(LeRobotDataset):
 
         # Add task as a string
         item["task"] = self._get_fine_grained_task(item)
+        # Mask action chunk beyond current skill end so model learns "stop" not next-skill actions
+        ep_idx = item["episode_index"].item()
+        frame_index = round(item["timestamp"].item() * self.fps)
+        skill_end = self._get_skill_end_frame(ep_idx, frame_index)
+        if skill_end is not None:
+            self._mask_action_chunks_to_skill_end(item, frame_index, skill_end)
         self.current_streaming_frame_idx += 1
 
         return item
@@ -473,9 +620,70 @@ class BehaviorLeRobotDataset(LeRobotDataset):
             task_text = self.meta.orchestrators[ep_idx][self.fine_grained_level][sub_idx]["task"]
 
         except Exception as e:
-            print(f"[warn] {self.repo_id} failed to get subtask {item}: {e}")
+            logger.warning(
+                "%s fine_grained_level=%d failed to get subtask (fallback to global task): ep_idx=%s task_idx=%s frame=%s error=%s",
+                self.repo_id,
+                self.fine_grained_level,
+                ep_idx,
+                task_idx,
+                frame_index,
+                e,
+            )
             task_text = self.meta.tasks[task_idx]
         return task_text
+
+    def _get_skill_end_frame(self, ep_idx: int, frame_index: int) -> int | None:
+        """Return the end_frame of the skill segment containing this frame, or None if not using segments."""
+        if self.fine_grained_level < 1 or ep_idx not in self.task_sizes:
+            return None
+        try:
+            sub_idx = bisect.bisect_right(
+                self.task_sizes[ep_idx], frame_index, hi=len(self.task_sizes[ep_idx]) - 1
+            )
+            return self.meta.orchestrators[ep_idx][self.fine_grained_level][sub_idx]["end_frame"]
+        except Exception:
+            return None
+
+    def _mask_action_chunks_to_skill_end(
+        self, item: dict, frame_index: int, skill_end: int
+    ) -> None:
+        """
+        For frames near the end of a skill segment, the action chunk would otherwise extend
+        into the next skill. Overwrite chunk positions beyond skill_end with the action at
+        skill_end (repeat last action of the skill) so the model learns to predict "stop"
+        instead of the next skill's actions. Modifies item in place for keys in delta_indices.
+        """
+        if self.delta_indices is None:
+            return
+        for key in self.delta_indices:
+            if key not in item:
+                continue
+            arr = item[key]
+            try:
+                delta_list = list(self.delta_indices[key])
+            except Exception:
+                continue
+            H = len(delta_list)
+            # Chunk shape must be (H, ...); skip if single-step or wrong shape
+            arr_shape = getattr(arr, "shape", None) or (len(arr),)
+            if not arr_shape or arr_shape[0] != H:
+                continue
+            end_offset = skill_end - frame_index
+            if end_offset < 0 or end_offset >= H:
+                continue
+            # Clone so we don't mutate shared/cached data
+            if hasattr(arr, "clone"):
+                arr = arr.clone()
+            else:
+                arr = np.copy(arr)
+            # For i > end_offset: chunk[i] = chunk[end_offset] (repeat last action of skill)
+            last_action = arr[end_offset]
+            for i in range(end_offset + 1, H):
+                if hasattr(last_action, "clone"):
+                    arr[i] = last_action.clone()
+                else:
+                    arr[i] = np.copy(last_action) if isinstance(arr, np.ndarray) else last_action.copy()
+            item[key] = arr
 
     def _get_query_indices(self, idx: int, ep_idx: int) -> tuple[dict[str, list[int | bool]]]:
         ep_idx = self.episode_data_index_pos[ep_idx]
@@ -652,6 +860,20 @@ class BehaviorLerobotDatasetMetadata(LeRobotDatasetMetadata):
                             for episode in sorted((orchestrators_path / f"task-{task:04d}").iterdir())
                         }
                     )
+        # When annotations have skill_annotation, build level 1/2 from them (no orchestrator files needed)
+        for ep_id, ep_data in self.episodes.items():
+            ann = self.annotations.get(ep_id)
+            if not ann:
+                continue
+            skill_ann = ann.get("skill_annotation")
+            if not skill_ann:
+                continue
+            ep_len = ep_data["length"]
+            task_idx = ep_data["tasks"][0]
+            level_0_task = self.tasks.get(task_idx, "task")
+            orchestrators[ep_id] = build_orchestrator_levels_from_annotations(
+                ep_id, ep_len, skill_ann, level_0_task
+            )
         return orchestrators
 
     def get_annotation_path(self, ep_index: int) -> Path:

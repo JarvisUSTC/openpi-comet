@@ -1,5 +1,6 @@
 from collections.abc import Callable, Mapping, Sequence
 import dataclasses
+import logging
 import re
 from typing import Protocol, TypeAlias, TypeVar, runtime_checkable
 
@@ -14,6 +15,17 @@ from openpi.shared import normalize as _normalize
 
 DataDict: TypeAlias = at.PyTree
 NormStats: TypeAlias = _normalize.NormStats
+
+# Debug: only log prompt for first N samples at data generation (no strings in JAX batch)
+_DEBUG_PROMPT_LOG_LIMIT = 8
+_debug_prompt_log_count: int = 0
+
+
+def _debug_log_prompt(prompt: str) -> None:
+    global _debug_prompt_log_count
+    if _debug_prompt_log_count < _DEBUG_PROMPT_LOG_LIMIT:
+        logging.info("[DEBUG] prompt[%d]: %s", _debug_prompt_log_count, prompt)
+        _debug_prompt_log_count += 1
 
 
 T = TypeVar("T")
@@ -335,6 +347,9 @@ class TokenizeFASTInputs(DataTransformFn):
 
         if not isinstance(prompt, str):
             prompt = prompt.item()
+
+        # Debug: log prompt only first few times at data generation (no strings in JAX batch)
+        _debug_log_prompt(prompt)
 
         state, actions = data["state"], data.get("actions")
         tokens, token_mask, ar_mask, loss_mask = self.tokenizer.tokenize(prompt, state, actions)
