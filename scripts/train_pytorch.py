@@ -50,6 +50,33 @@ import openpi.training.data_loader as _data_loader
 _PROMPT_LOG_INTERVAL = 10
 
 
+def _validation_is_enabled(config: _config.TrainConfig) -> bool:
+    if config.val_log_interval <= 0 or config.val_num_batches <= 0:
+        return False
+    return (config.val_repo_id is not None) or (config.val_episodes_index is not None)
+
+
+def _override_factory_for_val(
+    factory: _config.DataConfigFactory, config: _config.TrainConfig
+) -> _config.DataConfigFactory:
+    if config.val_repo_id is not None:
+        factory = dataclasses.replace(factory, repo_id=config.val_repo_id)
+    if config.val_episodes_index is not None:
+        base = factory.base_config or _config.DataConfig()
+        base = dataclasses.replace(base, episodes_index=config.val_episodes_index)
+        factory = dataclasses.replace(factory, base_config=base)
+    return factory
+
+
+def _make_val_config(config: _config.TrainConfig) -> _config.TrainConfig:
+    val_batch_size = config.batch_size if config.val_batch_size is None else config.val_batch_size
+    if isinstance(config.data, list):
+        val_data = [_override_factory_for_val(f, config) for f in config.data]
+    else:
+        val_data = _override_factory_for_val(config.data, config)
+    return dataclasses.replace(config, batch_size=val_batch_size, data=val_data)
+
+
 def _decode_prompt_for_logging(observation, tokenizer: _tokenizer.PaligemmaTokenizer) -> str:
     tokens = observation.tokenized_prompt[0]
     token_mask = getattr(observation, "tokenized_prompt_mask", None)
@@ -156,6 +183,73 @@ def build_datasets(config: _config.TrainConfig):
         seed=config.seed,
     )
     return data_loader, data_loader.data_config()
+
+
+def build_val_loader(config: _config.TrainConfig):
+    """Build a validation data loader from the training config."""
+    val_config = _make_val_config(config)
+    val_batch_size = config.batch_size if config.val_batch_size is None else config.val_batch_size
+    val_loader = _data_loader.create_torch_behavior_data_loader(
+        val_config,
+        action_horizon=config.model.action_horizon,
+        batch_size=val_batch_size,
+        skip_norm_stats=False,
+        shuffle=False,
+        num_workers=0,
+        seed=config.seed + 1000,
+    )
+    return val_loader
+
+
+@torch.no_grad()
+def validate(model, val_loader, device, config):
+    """Run validation and return a dict of metrics."""
+    raw_model = model.module if isinstance(model, torch.nn.parallel.DistributedDataParallel) else model
+    was_training = raw_model.training
+    raw_model.eval()
+
+    flow_losses = []
+    action_mses = []
+    action_maes = []
+    action_cosine_sims = []
+    first_action_mses = []
+
+    for batch_idx, (observation, actions) in enumerate(val_loader):
+        if batch_idx >= config.val_num_batches:
+            break
+
+        observation = jax.tree.map(lambda x: x.to(device), observation)
+        actions = actions.to(torch.float32).to(device)
+
+        per_element_loss = raw_model(observation, actions)
+        flow_losses.append(per_element_loss.mean().item())
+
+        pred_actions = raw_model.sample_actions(device, observation, num_steps=config.val_denoise_steps)
+
+        action_error = pred_actions - actions
+        action_mses.append(torch.mean(action_error**2).item())
+        action_maes.append(torch.mean(torch.abs(action_error)).item())
+
+        pred_flat = pred_actions.reshape(pred_actions.shape[0], -1)
+        gt_flat = actions.reshape(actions.shape[0], -1)
+        cos_sim = torch.sum(pred_flat * gt_flat, dim=-1) / (
+            torch.norm(pred_flat, dim=-1) * torch.norm(gt_flat, dim=-1) + 1e-8
+        )
+        action_cosine_sims.append(cos_sim.mean().item())
+
+        first_action_mses.append(torch.mean((pred_actions[:, 0] - actions[:, 0]) ** 2).item())
+
+    if was_training:
+        raw_model.train()
+
+    return {
+        "val_loss": float(np.mean(flow_losses)),
+        "val/flow_loss": float(np.mean(flow_losses)),
+        "val/action_mse": float(np.mean(action_mses)),
+        "val/action_mae": float(np.mean(action_maes)),
+        "val/action_cosine_sim": float(np.mean(action_cosine_sims)),
+        "val/first_action_mse": float(np.mean(first_action_mses)),
+    }
 
 
 def get_model_state_dict(model):
@@ -531,6 +625,18 @@ def train_loop(config: _config.TrainConfig):
 
     prompt_tokenizer = _tokenizer.PaligemmaTokenizer(config.model.max_token_len) if is_main else None
 
+    val_loader = None
+    if is_main and _validation_is_enabled(config):
+        val_loader = build_val_loader(config)
+        logging.info(
+            "Validation enabled: val_repo_id=%s val_episodes_index=%s val_batch_size=%s val_num_batches=%s val_log_interval=%s",
+            config.val_repo_id,
+            config.val_episodes_index,
+            config.val_batch_size,
+            config.val_num_batches,
+            config.val_log_interval,
+        )
+
     # Training loop - iterate until we reach num_train_steps
     pbar = (
         tqdm.tqdm(total=config.num_train_steps, initial=global_step, desc="Training", disable=not is_main)
@@ -557,6 +663,19 @@ def train_loop(config: _config.TrainConfig):
                         logging.info("[prompt step=%s] %s", global_step, prompt_text)
                 except Exception:
                     logging.exception("Failed to decode/log prompt at step=%s", global_step)
+
+            if val_loader is not None and (global_step % config.val_log_interval == 0):
+                try:
+                    val_metrics = validate(model, val_loader, device, config)
+                    metrics_str = ", ".join(f"{k}={v:.4f}" for k, v in val_metrics.items() if not k.startswith("val/"))
+                    if pbar is not None:
+                        pbar.write(f"Step {global_step}: {metrics_str}")
+                    else:
+                        logging.info("Step %s: %s", global_step, metrics_str)
+                    if config.wandb_enabled:
+                        wandb.log(val_metrics, step=global_step)
+                except Exception:
+                    logging.exception("Validation failed at step=%s", global_step)
 
             # The unified data loader returns (observation, actions) tuple
             observation = jax.tree.map(lambda x: x.to(device), observation)  # noqa: PLW2901

@@ -73,17 +73,43 @@ def _make_val_config(config: _config.TrainConfig) -> _config.TrainConfig:
     return dataclasses.replace(config, batch_size=val_batch_size, data=val_data)
 
 
-@at.typecheck
 def eval_step(
+    num_denoise_steps: int,
     rng: at.KeyArrayLike,
     state: training_utils.TrainState,
     batch: tuple[_model.Observation, _model.Actions],
-) -> at.Float[at.Array, ""]:
+) -> dict[str, at.Float[at.Array, ""]]:
     model = nnx.merge(state.model_def, state.params)
     model.eval()
     observation, actions = batch
-    chunked_loss = model.compute_loss(rng, observation, actions, train=False)
-    return jnp.mean(chunked_loss)
+
+    loss_rng, sample_rng = jax.random.split(rng)
+
+    chunked_loss = model.compute_loss(loss_rng, observation, actions, train=False)
+    flow_loss = jnp.mean(chunked_loss)
+
+    pred_actions = model.sample_actions(sample_rng, observation, num_steps=num_denoise_steps)
+
+    action_error = pred_actions - actions
+    action_mse = jnp.mean(jnp.square(action_error))
+    action_mae = jnp.mean(jnp.abs(action_error))
+
+    pred_flat = pred_actions.reshape(pred_actions.shape[0], -1)
+    gt_flat = actions.reshape(actions.shape[0], -1)
+    cos_sim = jnp.sum(pred_flat * gt_flat, axis=-1) / (
+        jnp.linalg.norm(pred_flat, axis=-1) * jnp.linalg.norm(gt_flat, axis=-1) + 1e-8
+    )
+
+    first_action_mse = jnp.mean(jnp.square(pred_actions[:, 0] - actions[:, 0]))
+
+    return {
+        "val_loss": flow_loss,
+        "val/flow_loss": flow_loss,
+        "val/action_mse": action_mse,
+        "val/action_mae": action_mae,
+        "val/action_cosine_sim": jnp.mean(cos_sim),
+        "val/first_action_mse": first_action_mse,
+    }
 
 
 def init_logging():
@@ -326,7 +352,7 @@ def main(config: _config.TrainConfig):
             skip_norm_stats=False,
         )
         peval_step = jax.jit(
-            eval_step,
+            functools.partial(eval_step, config.val_denoise_steps),
             in_shardings=(replicated_sharding, train_state_sharding, data_sharding),
             out_shardings=replicated_sharding,
         )
@@ -359,15 +385,17 @@ def main(config: _config.TrainConfig):
 
         if val_loader is not None and peval_step is not None and (step % config.val_log_interval == 0):
             try:
-                val_losses = []
+                val_metrics_list = []
                 val_rng = jax.random.fold_in(train_rng, 1_000_000 + step)
                 for val_batch in val_loader:
                     with sharding.set_mesh(mesh):
-                        val_loss = peval_step(val_rng, train_state, val_batch)
-                    val_losses.append(val_loss)
-                val_loss_mean = float(np.mean(jax.device_get(jnp.stack(val_losses))))
-                pbar.write(f"Step {step}: val_loss={val_loss_mean:.4f}")
-                wandb.log({"val_loss": val_loss_mean}, step=step)
+                        metrics = peval_step(val_rng, train_state, val_batch)
+                    val_metrics_list.append(metrics)
+                stacked = common_utils.stack_forest(val_metrics_list)
+                val_metrics = {k: float(v) for k, v in jax.device_get(jax.tree.map(jnp.mean, stacked)).items()}
+                metrics_str = ", ".join(f"{k}={v:.4f}" for k, v in val_metrics.items() if not k.startswith("val/"))
+                pbar.write(f"Step {step}: {metrics_str}")
+                wandb.log(val_metrics, step=step)
             except Exception:
                 logging.exception("Validation failed at step=%s", step)
 

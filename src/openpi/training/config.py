@@ -582,6 +582,9 @@ class TrainConfig:
     val_batch_size: int | None = None
     # Number of validation batches to average for validation loss
     val_num_batches: int = 10
+    # Number of ODE integration steps when computing denoised-action metrics during
+    # validation. Higher = more accurate but slower (each step is one extra forward pass).
+    val_denoise_steps: int = 10
     # Optionally, repo_id for validation set (if different from train)
     val_repo_id: str | None = None
     val_episodes_index: list[int] | None = None
