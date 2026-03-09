@@ -2,6 +2,7 @@ from collections import deque
 import copy
 import json
 import logging
+import os
 
 import cv2
 import numpy as np
@@ -29,21 +30,59 @@ class B1KPolicyWrapper:
     def __init__(
         self,
         policy: BasePolicy,
-        task_name: str = "turning_on_radio",
+        task_name: str | None = "turning_on_radio",
+        # If provided, overrides any task_mapping-derived prompt.
+        task_prompt_override: str | None = None,
+        # If True, and incoming obs contains a prompt, use it (unless overridden).
+        prompt_from_obs: bool = False,
+        # Which key to read the prompt from in the incoming obs.
+        prompt_key: str = "prompt",
+        # Final fallback if no mapping / override / obs prompt is available.
+        fallback_prompt: str | None = None,
+        # If True, append `working_memory` into the final prompt as a [WM]...[/WM] block.
+        # If False, ignore WM for prompt injection (ablation: no-WM-in-prompt).
+        wm_in_prompt: bool = True,
         control_mode: str = "temporal_ensemble",
         max_len: int = 32,  # receeding horizon | receeding temporal mode
         action_horizon: int = 5,  # temporal ensemble mode | receeding temporal mode
         temporal_ensemble_max: int = 3,  # receeding temporal mode
         fine_grained_level: int = 0,
+        # MEM: video memory parameters
+        video_memory_frames: int = 1,
+        video_memory_stride: int = 1,
     ) -> None:
         self.policy = policy
         self.task_name = task_name
+        self.task_prompt_override = task_prompt_override
+        self.prompt_from_obs = prompt_from_obs
+        self.prompt_key = prompt_key
+        self.fallback_prompt = fallback_prompt
+        self.wm_in_prompt = wm_in_prompt
 
         # load the task name from the metadata
-        metadata = json.load(open("scripts/task_mapping.json"))
-        self.task_prompt = metadata[task_name].get("task")
-        self.subtask_prompts = metadata[task_name].get("subtask")
-        self.skill_prompts = metadata[task_name].get("skill")
+        self._task_mapping = None
+        self._task_prompt_from_mapping = None
+        self.subtask_prompts = None
+        self.skill_prompts = None
+        mapping_path = "scripts/task_mapping.json"
+        if os.path.exists(mapping_path):
+            try:
+                self._task_mapping = json.load(open(mapping_path))
+            except Exception:
+                logger.exception("Failed to load %s", mapping_path)
+                self._task_mapping = None
+
+        if self._task_mapping and self.task_name and self.task_name in self._task_mapping:
+            entry = self._task_mapping[self.task_name]
+            self._task_prompt_from_mapping = entry.get("task")
+            self.subtask_prompts = entry.get("subtask")
+            self.skill_prompts = entry.get("skill")
+        elif self.task_name is not None:
+            logger.warning(
+                "task_name '%s' not found in %s; will rely on override / obs prompt / fallback",
+                self.task_name,
+                mapping_path,
+            )
 
         self.control_mode = control_mode
         self.action_queue = deque(maxlen=action_horizon)
@@ -55,6 +94,12 @@ class B1KPolicyWrapper:
         self.temporal_ensemble_max = temporal_ensemble_max  # max number of sequences to ensemble
         self.step_counter = 0
 
+        # MEM: video memory frame buffers
+        self.video_memory_frames = video_memory_frames
+        self.video_memory_stride = max(1, video_memory_stride)
+        self._frame_buffers: dict[str, deque] = {}
+        self._frame_buffer_maxlen = (video_memory_frames - 1) * self.video_memory_stride + 1
+
         self.fine_grained_level = fine_grained_level
         if self.fine_grained_level > 0:
             from openpi.shared.client import Client
@@ -64,6 +109,33 @@ class B1KPolicyWrapper:
             self.reasoner = None
 
         self.log_config()
+
+    def _effective_task_prompt(self, input_obs: dict) -> str:
+        """
+        Decide which prompt to send to the model.
+
+        Priority:
+          1) task_prompt_override (CLI)
+          2) prompt from incoming obs (if enabled)
+          3) task_mapping.json-derived prompt (50-task mapping)
+          4) fallback_prompt
+          5) empty string
+        """
+        if self.task_prompt_override:
+            return self.task_prompt_override
+
+        if self.prompt_from_obs and isinstance(input_obs, dict):
+            obs_prompt = input_obs.get(self.prompt_key)
+            if isinstance(obs_prompt, str) and obs_prompt.strip():
+                return obs_prompt
+
+        if isinstance(self._task_prompt_from_mapping, str) and self._task_prompt_from_mapping.strip():
+            return self._task_prompt_from_mapping
+
+        if isinstance(self.fallback_prompt, str) and self.fallback_prompt.strip():
+            return self.fallback_prompt
+
+        return ""
 
     def log_config(self):
         logger.info(f"{self.task_name=}")
@@ -75,16 +147,133 @@ class B1KPolicyWrapper:
         logger.info(f"{self.fine_grained_level=}")
         logger.info(f"{self.step_counter=}")
         logger.info(f"{self.action_queue=}")
-        logger.info(f"{self.task_prompt=}")
+        logger.info(f"{self.task_prompt_override=}")
+        logger.info(f"{self.prompt_from_obs=}")
+        logger.info(f"{self.prompt_key=}")
+        logger.info(f"{self.fallback_prompt=}")
+        logger.info(f"{self.wm_in_prompt=}")
+        logger.info(f"{self._task_prompt_from_mapping=}")
         logger.info(f"{self.subtask_prompts=}")
         logger.info(f"{self.skill_prompts=}")
+        logger.info(f"{self.video_memory_frames=}")
+        logger.info(f"{self.video_memory_stride=}")
 
     def reset(self):
         self.action_queue = deque(maxlen=self.action_horizon)
         self.last_action = {"actions": np.zeros((self.action_horizon, 23), dtype=np.float64)}
         self.step_counter = 0
+        self._frame_buffers = {}
         if self.reasoner:
             self.reasoner.reset()
+
+    def _format_working_memory_for_prompt(self, wm) -> str:
+        """
+        Convert `working_memory` (usually a small dict) into a compact, stable prompt block.
+
+        This is intentionally minimal for ablations: it only includes fields that are reliably
+        available from the eval-side WM extractor.
+        """
+        if wm is None:
+            return ""
+
+        # If wm is already a string, wrap it for delimiting.
+        if not isinstance(wm, dict):
+            text = str(wm).strip()
+            if not text:
+                return ""
+            return "\n".join(["[WM]", text, "[/WM]"])
+
+        def _fmt_subtask_done_map(m) -> str:
+            """
+            Format a subtask-done mapping into: key1=true, key2=false
+            Keeps a stable key order (sorted).
+            """
+            if m is None:
+                return ""
+            # Allow passing a single "k=v" string through.
+            if isinstance(m, str):
+                return m.strip()
+            if not isinstance(m, dict):
+                return str(m).strip()
+            items = []
+            for k in sorted(m.keys(), key=lambda x: str(x)):
+                v = m.get(k)
+                if hasattr(v, "item"):  # numpy scalar
+                    v = v.item()
+                if isinstance(v, bool):
+                    v_str = "true" if v else "false"
+                else:
+                    v_str = str(v)
+                items.append(f"{k}={v_str}")
+            return ", ".join(items).strip()
+
+        def _fmt_val(v) -> str:
+            # 处理 numpy 数组（如 array(False), array(True)）
+            if hasattr(v, 'item'):  # numpy scalar
+                v = v.item()
+            elif hasattr(v, 'tolist'):  # numpy array
+                v = v.tolist()
+                if isinstance(v, list) and len(v) == 1:
+                    v = v[0]
+            
+            # 统一布尔值为小写
+            if isinstance(v, bool):
+                return "true" if v else "false"
+            
+            # 字符串直接返回（如 stage, target, holding）
+            if isinstance(v, str):
+                return v
+            
+            return str(v)
+
+        lines = ["[WM]"]
+        # Keep a stable field order.
+        for k in ("stage", "target", "grasped", "holding", "dropped"):
+            if k in wm and wm[k] is not None:
+                if k == "subtask_done":
+                    s = _fmt_subtask_done_map(wm[k])
+                    if s:
+                        lines.append(f"{k.upper()}: {s}")
+                else:
+                    lines.append(f"{k.upper()}: {_fmt_val(wm[k])}")
+        lines.append("[/WM]")
+
+        # If nothing beyond header/footer, skip.
+        if len(lines) <= 2:
+            return ""
+        return "\n".join(lines)
+
+    def _append_working_memory_to_prompt(self, prompt: str, wm) -> str:
+        wm_block = self._format_working_memory_for_prompt(wm)
+        if not wm_block:
+            return prompt
+        prompt = prompt or ""
+        # Separate cleanly from the main task prompt.
+        return (prompt.rstrip() + "\n\n" + wm_block).strip()
+
+    def _buffer_frame(self, cam_name: str, frame: np.ndarray) -> list[np.ndarray]:
+        """Buffer a frame and return K-1 history frames (oldest first) for MEM.
+
+        Returns empty list if video_memory_frames <= 1.
+        """
+        K = self.video_memory_frames
+        if K <= 1:
+            return []
+
+        if cam_name not in self._frame_buffers:
+            self._frame_buffers[cam_name] = deque(maxlen=self._frame_buffer_maxlen)
+        buf = self._frame_buffers[cam_name]
+        buf.append(frame.copy())
+
+        available = list(buf)[:-1]
+        sampled = []
+        for i in range(K - 1, 0, -1):
+            idx = len(available) - i * self.video_memory_stride
+            if idx < 0:
+                sampled.append(available[0] if available else frame)
+            else:
+                sampled.append(available[idx])
+        return sampled
 
     def process_obs(self, obs: dict) -> dict:
         """
@@ -120,50 +309,81 @@ class B1KPolicyWrapper:
             "proprio": prop_state,
         }
 
+        # MEM: buffer each camera frame for video memory
+        if self.video_memory_frames > 1:
+            head_hist = self._buffer_frame("head", img_obs[0, 0])
+            left_hist = self._buffer_frame("left_wrist", img_obs[0, 1])
+            right_hist = self._buffer_frame("right_wrist", img_obs[0, 2])
+            processed_obs["_frame_history"] = {
+                "head": head_hist,
+                "left_wrist": left_hist,
+                "right_wrist": right_hist,
+            }
+
+        if isinstance(obs, dict) and self.prompt_key in obs:
+            processed_obs[self.prompt_key] = obs[self.prompt_key]
+
         if "robot_r1::robot_r1:zed_link:Camera:0::depth_linear" in obs:
             depth_obs = obs["robot_r1::robot_r1:zed_link:Camera:0::depth_linear"]
             depth_obs = cv2.resize(depth_obs, (DESPTH_RESIZE_SIZE, DESPTH_RESIZE_SIZE), interpolation=cv2.INTER_LINEAR)
             processed_obs["observation/egocentric_depth"] = depth_obs[None]
 
-        # if "robot_r1::robot_r1:left_realsense_link:Camera:0::depth_linear" in obs:
-        #     depth_obs = obs["robot_r1::robot_r1:left_realsense_link:Camera:0::depth_linear"][None]
-        #     processed_obs["observation/wrist_depth_left"] = depth_obs
-
-        # if "robot_r1::robot_r1:right_realsense_link:Camera:0::depth_linear" in obs:
-        #     depth_obs = obs["robot_r1::robot_r1:right_realsense_link:Camera:0::depth_linear"][None]
-        #     processed_obs["observation/wrist_depth_right"] = depth_obs
+        if "working_memory" in obs:
+            processed_obs["working_memory"] = obs["working_memory"]
 
         return processed_obs
+
+    def _build_policy_batch(self, nbatch: dict) -> dict:
+        """Build the dict expected by policy.infer from processed obs."""
+        if nbatch["observation"].shape[-1] != 3:
+            nbatch["observation"] = np.transpose(nbatch["observation"], (0, 1, 3, 4, 2))
+
+        joint_positions = nbatch["proprio"][0]
+        prompt = self._effective_task_prompt(nbatch)
+
+        batch = {
+            "observation/egocentric_camera": nbatch["observation"][0, 0],
+            "observation/wrist_image_left": nbatch["observation"][0, 1],
+            "observation/wrist_image_right": nbatch["observation"][0, 2],
+            "observation/state": joint_positions,
+            "prompt": prompt,
+        }
+
+        # MEM: attach frame history from process_obs
+        if self.video_memory_frames > 1 and "_frame_history" in nbatch:
+            fh = nbatch["_frame_history"]
+            batch["observation/egocentric_camera_history"] = fh["head"]
+            batch["observation/wrist_image_left_history"] = fh["left_wrist"]
+            batch["observation/wrist_image_right_history"] = fh["right_wrist"]
+
+        if self.wm_in_prompt and "working_memory" in nbatch:
+            batch["working_memory"] = nbatch["working_memory"]
+            if self.step_counter % 100 == 0:
+                logger.info(f"[WM] {batch['working_memory']}")
+
+        if "observation/egocentric_depth" in nbatch:
+            batch["observation/egocentric_depth"] = nbatch["observation/egocentric_depth"][0]
+
+        return batch
 
     def act_receeding_temporal(self, input_obs):
         # Step 1: check if we should re-run policy
         if self.step_counter % self.replan_interval == 0:
             nbatch = copy.deepcopy(input_obs)
-            if nbatch["observation"].shape[-1] != 3:
-                # make B, num_cameras, H, W, C  from B, num_cameras, C, H, W
-                # permute if pytorch
-                nbatch["observation"] = np.transpose(nbatch["observation"], (0, 1, 3, 4, 2))
-
-            # nbatch["proprio"] is B, 16, where B=1
-            joint_positions = nbatch["proprio"][0]
-            batch = {
-                "observation/egocentric_camera": nbatch["observation"][0, 0],
-                "observation/wrist_image_left": nbatch["observation"][0, 1],
-                "observation/wrist_image_right": nbatch["observation"][0, 2],
-                "observation/state": joint_positions,
-                "prompt": self.task_prompt,
-            }
+            batch = self._build_policy_batch(nbatch)
 
             if self.fine_grained_level > 0:
                 reasoner_response = self.reasoner.generate_subtask(
-                    high_level_task=self.task_prompt,
+                    high_level_task=batch["prompt"],
                     multi_modals=[batch["observation/egocentric_camera"]],
                 )
                 logger.info(f"* {reasoner_response}")
                 batch["prompt"] = reasoner_response
 
-            if "observation/egocentric_depth" in nbatch:
-                batch["observation/egocentric_depth"] = nbatch["observation/egocentric_depth"][0]
+            if self.wm_in_prompt and "working_memory" in batch:
+                batch["prompt"] = self._append_working_memory_to_prompt(batch["prompt"], batch["working_memory"])
+                if self.step_counter % 10 == 0:
+                    logger.info(f"[PROMPT_TAIL] ...{batch['prompt'][-400:]}")
 
             try:
                 action = self.policy.infer(batch)
@@ -171,7 +391,7 @@ class B1KPolicyWrapper:
             except Exception as e:
                 action = self.last_action
                 logger.info(
-                    f"Error in action prediction at step {self.step_counter}, {joint_positions.shape=}, using last action: {e}"
+                    f"Error in action prediction at step {self.step_counter}, using last action: {e}"
                 )
 
             target_joint_positions = action["actions"].copy()
@@ -253,32 +473,19 @@ class B1KPolicyWrapper:
                 return torch.from_numpy(final_action)
 
         nbatch = copy.deepcopy(input_obs)
-        if nbatch["observation"].shape[-1] != 3:
-            # make B, num_cameras, H, W, C  from B, num_cameras, C, H, W
-            # permute if pytorch
-            nbatch["observation"] = np.transpose(nbatch["observation"], (0, 1, 3, 4, 2))
-
-        # nbatch["proprio"] is B, 16, where B=1
-        joint_positions = nbatch["proprio"][0]
-        batch = {
-            "observation/egocentric_camera": nbatch["observation"][0, 0],
-            "observation/wrist_image_left": nbatch["observation"][0, 1],
-            "observation/wrist_image_right": nbatch["observation"][0, 2],
-            "observation/state": joint_positions,
-            "prompt": self.task_prompt,
-        }
-
-        if "observation/egocentric_depth" in nbatch:
-            batch["observation/egocentric_depth"] = nbatch["observation/egocentric_depth"][0]
+        batch = self._build_policy_batch(nbatch)
 
         if self.fine_grained_level > 0:
-            # skill_prompt = SKILL_PROMPT.format(task_prompt=self.task_prompt, skill_prompts="\n".join(self.skill_prompts))
             reasoner_response = self.reasoner.generate_subtask(
-                high_level_task=self.task_prompt,
+                high_level_task=batch["prompt"],
                 multi_modals=[batch["observation/egocentric_camera"]],
             )
             logger.info(f"* {reasoner_response}")
             batch["prompt"] = reasoner_response
+
+        if self.wm_in_prompt and "working_memory" in batch:
+            batch["prompt"] = self._append_working_memory_to_prompt(batch["prompt"], batch["working_memory"])
+            logger.info(f"[PROMPT_TAIL] ...{batch['prompt'][-400:]}")
 
         try:
             action = self.policy.infer(batch)

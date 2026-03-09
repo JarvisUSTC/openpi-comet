@@ -57,12 +57,6 @@ class Args:
     dataset_root: str | None = "/scr/behavior/2025-challenge-demos"
     # If provided, will be used to retrieve the prompt of the task, otherwise use turning_on_radio as default.
     task_name: str | None = None
-    # If provided, overrides task_mapping-derived prompt (i.e. do NOT pick from the 50-task mapping).
-    task_prompt: str | None = None
-    # If True, and incoming websocket observations include a "prompt" field, use it (unless task_prompt is set).
-    prompt_from_obs: bool = False
-    # Key name to read prompt from in incoming observations.
-    prompt_key: str = "prompt"
 
     # Port to serve the policy on.
     port: int = 8000
@@ -82,15 +76,6 @@ class Args:
     max_len: int = 32  # receeding horizon | receeding temporal mode
     action_horizon: int = 5  # temporal ensemble mode
     temporal_ensemble_max: int = 3  # receeding temporal mode
-
-    # If True, the policy wrapper will append eval-provided `working_memory` to the prompt.
-    # If False, `working_memory` is ignored for prompt injection (ablation: no WM in prompt).
-    wm_in_prompt: bool = True
-
-    # MEM: number of video memory frames (1 = single-frame, no history).
-    video_memory_frames: int = 1
-    # MEM: stride in environment steps between historical frames.
-    video_memory_stride: int = 1
 
 
 class WebsocketPolicyServer:
@@ -185,9 +170,6 @@ def create_policy(args: Args) -> _policy.Policy:
 def main(args: Args) -> None:
     # log the prompt used
     logging.info(f"Using task_name: {args.task_name}")
-    logging.info(f"Using task_prompt override: {args.task_prompt is not None}")
-    logging.info(f"Using prompt_from_obs: {args.prompt_from_obs} (key={args.prompt_key})")
-    logging.info(f"Using wm_in_prompt: {args.wm_in_prompt}")
 
     policy = create_policy(args)
     policy_metadata = policy.metadata
@@ -199,18 +181,11 @@ def main(args: Args) -> None:
     policy = B1KPolicyWrapper(
         policy,
         task_name=args.task_name,
-        task_prompt_override=args.task_prompt,
-        prompt_from_obs=args.prompt_from_obs,
-        prompt_key=args.prompt_key,
-        fallback_prompt=args.default_prompt,
-        wm_in_prompt=args.wm_in_prompt,
         control_mode=args.control_mode,
         max_len=args.max_len,
         action_horizon=args.action_horizon,
         temporal_ensemble_max=args.temporal_ensemble_max,
         fine_grained_level=args.fine_grained_level,
-        video_memory_frames=args.video_memory_frames,
-        video_memory_stride=args.video_memory_stride,
     )
 
     hostname = socket.gethostname()

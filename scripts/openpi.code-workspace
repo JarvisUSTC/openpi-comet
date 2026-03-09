@@ -1,0 +1,14 @@
+{
+	"folders": [
+		{
+			"path": "../../openpi"
+		},
+		{
+			"path": ".."
+		},
+		{
+			"path": "../../BEHAVIOR-1K"
+		}
+	],
+	"settings": {}
+}

@@ -345,6 +345,91 @@ def eager_attention_forward(
     return attn_output, attn_weights
 
 
+# ============================================================
+# MEM: Temporal attention utilities for short-term video memory
+# ============================================================
+
+def temporal_posemb_sincos(K: int, width: int, device: torch.device, max_period: float = 10000.0) -> torch.Tensor:
+    """Sinusoidal temporal positional encoding.
+
+    Returns shape [K, width]. The *last* frame (index K-1) is the current frame
+    and gets a zero vector, ensuring backward compatibility with single-frame.
+    """
+    if K == 1:
+        return torch.zeros(1, width, device=device)
+
+    half = width // 2
+    freqs = torch.arange(half, device=device, dtype=torch.float32)
+    freqs = 1.0 / (max_period ** (freqs / half))
+
+    # t=0 for current frame (last), negative for history
+    t = torch.arange(K, device=device, dtype=torch.float32) - (K - 1)  # [-K+1, ..., -1, 0]
+    angles = t[:, None] * freqs[None, :]  # [K, half]
+
+    pe = torch.cat([angles.sin(), angles.cos() - 1.0], dim=-1)  # [K, width]
+    if width % 2 == 1:
+        pe = torch.cat([pe, torch.zeros(K, 1, device=device)], dim=-1)
+    return pe
+
+
+def temporal_causal_attention(
+    x: torch.Tensor,
+    num_frames: int,
+    num_heads: int,
+) -> torch.Tensor:
+    """Causal temporal self-attention across frames at each patch position.
+
+    MEM paper: reuse existing spatial attention weights (Q/K/V projections are
+    identity here — we operate on the hidden states directly). Each patch
+    position attends causally across the time dimension.
+
+    Args:
+        x: [B*K, n, d] — hidden states for all frames.
+        num_frames: K — number of frames.
+        num_heads: number of attention heads.
+
+    Returns:
+        Residual delta of shape [B*K, n, d]. Zero when K=1.
+    """
+    if num_frames <= 1:
+        return torch.zeros_like(x)
+
+    BK, n, d = x.shape
+    B = BK // num_frames
+    K = num_frames
+    head_dim = d // num_heads
+
+    # Add temporal PE (cast to match x dtype, e.g. bfloat16)
+    pe = temporal_posemb_sincos(K, d, device=x.device).to(dtype=x.dtype)  # [K, d]
+    pe = pe.repeat(B, 1).view(BK, 1, d)
+    x_pe = x + pe
+
+    # Reshape: [B*K, n, d] -> [B, K, n, d] -> [B, n, K, d] -> [B*n, K, num_heads, head_dim]
+    x_pe = x_pe.view(B, K, n, d).permute(0, 2, 1, 3).reshape(B * n, K, num_heads, head_dim)
+
+    # [B*n, num_heads, K, head_dim]
+    q = x_pe.permute(0, 2, 1, 3)
+    k = q
+    v_raw = x.view(B, K, n, d).permute(0, 2, 1, 3).reshape(B * n, K, num_heads, head_dim).permute(0, 2, 1, 3)
+
+    scale = head_dim ** -0.5
+    attn = torch.matmul(q, k.transpose(-2, -1)) * scale  # [B*n, num_heads, K, K]
+
+    # Causal mask: each frame can only attend to itself and earlier frames
+    causal_mask = torch.triu(torch.ones(K, K, device=x.device, dtype=torch.bool), diagonal=1)
+    attn = attn.masked_fill(causal_mask[None, None, :, :], float("-inf"))
+
+    attn = torch.softmax(attn, dim=-1)
+    out = torch.matmul(attn, v_raw)  # [B*n, num_heads, K, head_dim]
+
+    # Reshape back: [B*n, num_heads, K, head_dim] -> [B, n, K, d] -> [B, K, n, d] -> [B*K, n, d]
+    out = out.permute(0, 2, 1, 3).reshape(B * n, K, d)
+    out = out.view(B, n, K, d).permute(0, 2, 1, 3).reshape(BK, n, d)
+
+    # Return residual: temporal_output - original (so adding this to x gives the attended result)
+    return out - x
+
+
 class SiglipAttention(nn.Module):
     """Multi-headed attention from 'Attention Is All You Need' paper"""
 
@@ -446,6 +531,8 @@ class SiglipEncoderLayer(GradientCheckpointingLayer):
         hidden_states: torch.Tensor,
         attention_mask: torch.Tensor,
         output_attentions: Optional[bool] = False,
+        num_frames: int = 1,
+        layer_idx: int = 0,
     ) -> tuple[torch.FloatTensor]:
         """
         Args:
@@ -456,6 +543,10 @@ class SiglipEncoderLayer(GradientCheckpointingLayer):
             output_attentions (`bool`, *optional*, defaults to `False`):
                 Whether or not to return the attentions tensors of all attention layers. See `attentions` under
                 returned tensors for more detail.
+            num_frames (`int`):
+                Number of video frames (MEM). 1 = single-frame (original behavior).
+            layer_idx (`int`):
+                Index of this layer in the encoder stack (MEM temporal attention every 4th layer).
         """
         residual = hidden_states
 
@@ -466,6 +557,12 @@ class SiglipEncoderLayer(GradientCheckpointingLayer):
             output_attentions=output_attentions,
         )
         hidden_states = residual + hidden_states
+
+        # MEM: interleave temporal causal attention every 4th layer (after spatial attn)
+        if num_frames > 1 and (layer_idx + 1) % 4 == 0:
+            hidden_states = hidden_states + temporal_causal_attention(
+                hidden_states, num_frames=num_frames, num_heads=self.self_attn.num_heads
+            )
 
         residual = hidden_states
         hidden_states = self.layer_norm2(hidden_states)
@@ -569,6 +666,7 @@ class SiglipEncoder(nn.Module):
         attention_mask: Optional[torch.Tensor] = None,
         output_attentions: Optional[bool] = None,
         output_hidden_states: Optional[bool] = None,
+        num_frames: int = 1,
     ) -> BaseModelOutput:
         r"""
         Args:
@@ -591,6 +689,8 @@ class SiglipEncoder(nn.Module):
                 for more detail.
             return_dict (`bool`, *optional*):
                 Whether or not to return a [`~utils.ModelOutput`] instead of a plain tuple.
+            num_frames (`int`):
+                Number of video frames (MEM). 1 = single-frame (original behavior).
         """
         output_attentions = output_attentions if output_attentions is not None else self.config.output_attentions
         output_hidden_states = (
@@ -601,7 +701,7 @@ class SiglipEncoder(nn.Module):
         all_attentions = () if output_attentions else None
 
         hidden_states = inputs_embeds
-        for encoder_layer in self.layers:
+        for layer_idx, encoder_layer in enumerate(self.layers):
             if output_hidden_states:
                 encoder_states = encoder_states + (hidden_states,)
 
@@ -609,6 +709,8 @@ class SiglipEncoder(nn.Module):
                 hidden_states,
                 attention_mask,
                 output_attentions=output_attentions,
+                num_frames=num_frames,
+                layer_idx=layer_idx,
             )
 
             hidden_states = layer_outputs[0]
@@ -618,6 +720,12 @@ class SiglipEncoder(nn.Module):
 
         if output_hidden_states:
             encoder_states = encoder_states + (hidden_states,)
+
+        # MEM: discard history frames, keep only the current (last) frame
+        if num_frames > 1:
+            BK, n, d = hidden_states.shape
+            B = BK // num_frames
+            hidden_states = hidden_states.view(B, num_frames, n, d)[:, -1, :, :]  # [B, n, d]
 
         return BaseModelOutput(
             last_hidden_state=hidden_states,
@@ -766,6 +874,7 @@ class SiglipVisionTransformer(nn.Module):
         output_attentions: Optional[bool] = None,
         output_hidden_states: Optional[bool] = None,
         interpolate_pos_encoding: Optional[bool] = False,
+        num_frames: int = 1,
     ) -> BaseModelOutputWithPooling:
         output_attentions = output_attentions if output_attentions is not None else self.config.output_attentions
         output_hidden_states = (
@@ -781,6 +890,7 @@ class SiglipVisionTransformer(nn.Module):
             inputs_embeds=hidden_states,
             output_attentions=output_attentions,
             output_hidden_states=output_hidden_states,
+            num_frames=num_frames,
         )
 
         last_hidden_state = encoder_outputs.last_hidden_state
@@ -848,6 +958,7 @@ class SiglipVisionModel(SiglipPreTrainedModel):
         output_attentions: Optional[bool] = None,
         output_hidden_states: Optional[bool] = None,
         interpolate_pos_encoding: bool = False,
+        num_frames: int = 1,
     ) -> BaseModelOutputWithPooling:
         r"""
         Examples:
@@ -875,6 +986,7 @@ class SiglipVisionModel(SiglipPreTrainedModel):
             output_attentions=output_attentions,
             output_hidden_states=output_hidden_states,
             interpolate_pos_encoding=interpolate_pos_encoding,
+            num_frames=num_frames,
         )
 
 

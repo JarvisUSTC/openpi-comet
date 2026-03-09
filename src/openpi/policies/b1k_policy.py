@@ -1,8 +1,55 @@
 import dataclasses
+from collections import OrderedDict
 
 import einops
 import numpy as np
-from omnigibson.learning.utils.eval_utils import PROPRIOCEPTION_INDICES
+
+try:
+    from omnigibson.learning.utils.eval_utils import PROPRIOCEPTION_INDICES
+except ModuleNotFoundError:
+    # Minimal fallback to avoid OmniGibson dependency when serving policies.
+    # Keep indices aligned with BEHAVIOR-1K OmniGibson eval_utils.
+    PROPRIOCEPTION_INDICES = {
+        "R1Pro": OrderedDict(
+            {
+                "joint_qpos": np.s_[0:28],
+                "joint_qpos_sin": np.s_[28:56],
+                "joint_qpos_cos": np.s_[56:84],
+                "joint_qvel": np.s_[84:112],
+                "joint_qeffort": np.s_[112:140],
+                "robot_pos": np.s_[140:143],
+                "robot_ori_cos": np.s_[143:146],
+                "robot_ori_sin": np.s_[146:149],
+                "robot_2d_ori": np.s_[149:150],
+                "robot_2d_ori_cos": np.s_[150:151],
+                "robot_2d_ori_sin": np.s_[151:152],
+                "robot_lin_vel": np.s_[152:155],
+                "robot_ang_vel": np.s_[155:158],
+                "arm_left_qpos": np.s_[158:165],
+                "arm_left_qpos_sin": np.s_[165:172],
+                "arm_left_qpos_cos": np.s_[172:179],
+                "arm_left_qvel": np.s_[179:186],
+                "eef_left_pos": np.s_[186:189],
+                "eef_left_quat": np.s_[189:193],
+                "gripper_left_qpos": np.s_[193:195],
+                "gripper_left_qvel": np.s_[195:197],
+                "arm_right_qpos": np.s_[197:204],
+                "arm_right_qpos_sin": np.s_[204:211],
+                "arm_right_qpos_cos": np.s_[211:218],
+                "arm_right_qvel": np.s_[218:225],
+                "eef_right_pos": np.s_[225:228],
+                "eef_right_quat": np.s_[228:232],
+                "gripper_right_qpos": np.s_[232:234],
+                "gripper_right_qvel": np.s_[234:236],
+                "trunk_qpos": np.s_[236:240],
+                "trunk_qvel": np.s_[240:244],
+                "base_qpos": np.s_[244:247],
+                "base_qpos_sin": np.s_[247:250],
+                "base_qpos_cos": np.s_[250:253],
+                "base_qvel": np.s_[253:256],
+            }
+        )
+    }
 
 from openpi import transforms
 from openpi.models import model as _model
@@ -107,6 +154,9 @@ class B1kInputs(transforms.DataTransformFn):
 
     pcd_downsample: int = 6
 
+    # MEM: number of video memory frames. 1 = single-frame (original behavior).
+    video_memory_frames: int = 1
+
     def __call__(self, data: dict) -> dict:
         proprio_data = data["observation/state"]
         # extract joint position
@@ -114,11 +164,19 @@ class B1kInputs(transforms.DataTransformFn):
         if "actions" in data:
             action = data["actions"]
 
+        K = self.video_memory_frames
+
         # Possibly need to parse images to uint8 (H,W,C) since LeRobot automatically
         # stores as float32 (C,H,W), gets skipped for policy inference
         base_image = _parse_image(data["observation/egocentric_camera"])
         wrist_image_left = _parse_image(data["observation/wrist_image_left"])
         wrist_image_right = _parse_image(data["observation/wrist_image_right"])
+
+        # MEM: stack history frames if available
+        if K > 1:
+            base_image = _stack_history_frames(data, "observation/egocentric_camera", base_image, K)
+            wrist_image_left = _stack_history_frames(data, "observation/wrist_image_left", wrist_image_left, K)
+            wrist_image_right = _stack_history_frames(data, "observation/wrist_image_right", wrist_image_right, K)
 
         meta_images, meta_image_names = [], []
 
@@ -138,7 +196,6 @@ class B1kInputs(transforms.DataTransformFn):
                 image_masks = (np.True_, np.True_, np.True_)
             case _model.ModelType.PI0_FAST:
                 names = ("base_0_rgb", "base_1_rgb", "wrist_0_rgb")
-                # We don't mask out padding images for FAST models.
                 images = (base_image, wrist_image_left, wrist_image_right)
                 image_masks = (np.True_, np.True_, np.True_)
             case _:
@@ -163,6 +220,32 @@ class B1kInputs(transforms.DataTransformFn):
         if self.depth_as_pcd:
             inputs["pcd_xyz"] = pcd_xyz
         return inputs
+
+
+# Mapping from repacked key to raw B1K dataset key (for history lookup)
+_REPACK_TO_RAW = {
+    "observation/egocentric_camera": "observation.images.rgb.head",
+    "observation/wrist_image_left": "observation.images.rgb.left_wrist",
+    "observation/wrist_image_right": "observation.images.rgb.right_wrist",
+}
+
+
+def _stack_history_frames(data: dict, key: str, current_frame: np.ndarray, K: int) -> np.ndarray:
+    """Stack K frames: K-1 history + 1 current. Returns [K, H, W, C].
+
+    Looks for history frames in data using both repacked and raw key conventions.
+    If not available, repeats the current frame K times.
+    """
+    # Try repacked key first, then raw key
+    history = None
+    for candidate in (f"{key}_history", f"{_REPACK_TO_RAW.get(key, key)}_history"):
+        if candidate in data and len(data[candidate]) >= K - 1:
+            history = [_parse_image(f) for f in data[candidate][-(K - 1):]]
+            break
+
+    if history is not None:
+        return np.stack(history + [current_frame], axis=0)  # [K, H, W, C]
+    return np.stack([current_frame] * K, axis=0)  # [K, H, W, C]
 
 
 @dataclasses.dataclass(frozen=True)

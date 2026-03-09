@@ -125,7 +125,78 @@ class FakeDataset(Dataset):
         return self._num_samples
 
 
-def create_behavior_dataset(data_config: _config.DataConfig, action_horizon: int) -> Dataset:
+class VideoMemoryDataset(Dataset):
+    """Wraps a dataset to provide K historical frames per camera.
+
+    Maintains a per-episode frame buffer. The returned item contains extra keys
+    like ``{cam_key}_history`` with a list of K-1 historical frames (oldest first).
+    If fewer than K-1 frames are available, the earliest frame is repeated.
+
+    Works with both raw keys (``observation.images.rgb.head``) and repacked keys
+    (``observation/egocentric_camera``). Specify ``camera_keys`` to control which
+    keys to buffer.
+    """
+
+    # Default camera keys (raw B1K dataset keys, before repack)
+    _DEFAULT_CAMERA_KEYS = (
+        "observation.images.rgb.head",
+        "observation.images.rgb.left_wrist",
+        "observation.images.rgb.right_wrist",
+    )
+
+    def __init__(self, dataset: Dataset, num_frames: int, stride: int = 1, camera_keys: Sequence[str] | None = None):
+        self._dataset = dataset
+        self._num_frames = num_frames
+        self._stride = max(1, stride)
+        self._camera_keys = camera_keys or self._DEFAULT_CAMERA_KEYS
+        self._buffers: dict[int, dict[str, list]] = {}
+        self._max_buffer = (num_frames - 1) * self._stride + 1
+
+    def __getitem__(self, index):
+        item = self._dataset[index]
+        if self._num_frames <= 1:
+            return item
+
+        ep_idx = item.get("episode_index")
+        if hasattr(ep_idx, "item"):
+            ep_idx = ep_idx.item()
+
+        if ep_idx not in self._buffers:
+            self._buffers = {}
+            self._buffers[ep_idx] = {}
+
+        for cam_key in self._camera_keys:
+            if cam_key not in item:
+                continue
+            if cam_key not in self._buffers[ep_idx]:
+                self._buffers[ep_idx][cam_key] = []
+
+            buf = self._buffers[ep_idx][cam_key]
+            frame = item[cam_key]
+            buf.append(frame.clone() if hasattr(frame, "clone") else np.copy(frame))
+
+            if len(buf) > self._max_buffer:
+                buf.pop(0)
+
+            K = self._num_frames
+            available = buf[:-1]
+            sampled = []
+            for i in range(K - 1, 0, -1):
+                idx = len(available) - i * self._stride
+                if idx < 0:
+                    sampled.append(available[0] if available else buf[-1])
+                else:
+                    sampled.append(available[idx])
+
+            item[f"{cam_key}_history"] = sampled
+
+        return item
+
+    def __len__(self):
+        return len(self._dataset)
+
+
+def create_behavior_dataset(data_config: _config.DataConfig, action_horizon: int, video_memory_frames: int = 1, video_memory_stride_s: float = 1.0) -> Dataset:
     """Create a dataset for training."""
     from behavior.learning.datas.dataset import BehaviorLeRobotDataset
 
@@ -153,6 +224,12 @@ def create_behavior_dataset(data_config: _config.DataConfig, action_horizon: int
 
     # fixed prompt hard coding
     dataset = TransformedDataset(dataset, [_transforms.PromptFromLeRobotItem()])
+
+    # MEM: wrap with video memory buffer if K > 1
+    if video_memory_frames > 1:
+        fps = 30  # B1K dataset FPS
+        stride_frames = max(1, int(video_memory_stride_s * fps))
+        dataset = VideoMemoryDataset(dataset, num_frames=video_memory_frames, stride=stride_frames)
 
     return dataset
 
@@ -226,6 +303,8 @@ def create_behavior_data_loader(
     skip_norm_stats: bool = False,
     seed_shift: int = 0,
 ) -> DataLoader[tuple[_model.Observation, _model.Actions]]:
+    vm_frames = getattr(config.model, "video_memory_frames", 1)
+    vm_stride = getattr(config.model, "video_memory_stride_s", 1.0)
     if isinstance(config.data, list):
         data_configs = [config_.create(config.assets_dirs, config.model) for config_ in config.data]
         dataset = create_multi_behavior_dataset(
@@ -236,7 +315,7 @@ def create_behavior_data_loader(
         data_config = data_configs[0]
     else:
         data_config = config.data.create(config.assets_dirs, config.model)
-        dataset = create_behavior_dataset(data_config, action_horizon=config.model.action_horizon)
+        dataset = create_behavior_dataset(data_config, action_horizon=config.model.action_horizon, video_memory_frames=vm_frames, video_memory_stride_s=vm_stride)
 
     dataset = transform_dataset(dataset, data_config, skip_norm_stats=skip_norm_stats)
 
@@ -275,6 +354,8 @@ def create_torch_behavior_data_loader(
             execute in the main process.
         seed: The seed to use for shuffling the data.
     """
+    vm_frames = getattr(config.model, "video_memory_frames", 1)
+    vm_stride = getattr(config.model, "video_memory_stride_s", 1.0)
     if isinstance(config.data, list):
         data_configs = [config_.create(config.assets_dirs, config.model) for config_ in config.data]
         dataset = create_multi_behavior_dataset(
@@ -285,7 +366,7 @@ def create_torch_behavior_data_loader(
         data_config = data_configs[0]
     else:
         data_config = config.data.create(config.assets_dirs, config.model)
-        dataset = create_behavior_dataset(data_config, action_horizon=config.model.action_horizon)
+        dataset = create_behavior_dataset(data_config, action_horizon=config.model.action_horizon, video_memory_frames=vm_frames, video_memory_stride_s=vm_stride)
 
     dataset = transform_dataset(dataset, data_config, skip_norm_stats=skip_norm_stats)
 

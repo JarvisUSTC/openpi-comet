@@ -121,10 +121,24 @@ class Observation(Generic[ArrayT]):
             raise ValueError("tokenized_prompt and tokenized_prompt_mask must be provided together.")
         # If images are uint8, convert them to [-1, 1] float32.
         for key in data["image"]:
-            if data["image"][key].dtype == np.uint8:
-                data["image"][key] = data["image"][key].astype(np.float32) / 255.0 * 2.0 - 1.0
-            elif hasattr(data["image"][key], "dtype") and data["image"][key].dtype == torch.uint8:
-                data["image"][key] = data["image"][key].to(torch.float32).permute(0, 3, 1, 2) / 255.0 * 2.0 - 1.0
+            img = data["image"][key]
+            if img.dtype == np.uint8:
+                # MEM: handle [B, K, H, W, C] multi-frame images
+                if img.ndim == 5:
+                    B, K, H, W, C = img.shape
+                    img = img.reshape(B * K, H, W, C).astype(np.float32) / 255.0 * 2.0 - 1.0
+                else:
+                    img = img.astype(np.float32) / 255.0 * 2.0 - 1.0
+                data["image"][key] = img
+            elif hasattr(img, "dtype") and img.dtype == torch.uint8:
+                img = img.to(torch.float32)
+                # MEM: handle [B, K, H, W, C] multi-frame images
+                if img.ndim == 5:
+                    B, K, H, W, C = img.shape
+                    img = img.reshape(B * K, H, W, C).permute(0, 3, 1, 2) / 255.0 * 2.0 - 1.0
+                else:
+                    img = img.permute(0, 3, 1, 2) / 255.0 * 2.0 - 1.0
+                data["image"][key] = img
         return cls(
             images=data["image"],
             image_masks=data["image_mask"],

@@ -189,19 +189,26 @@ class PI0Pytorch(nn.Module):
         """Embed images with SigLIP and language tokens with embedding layer to prepare
         for PaliGemma transformer processing.
         """
+        num_frames = getattr(self.config, "video_memory_frames", 1)
         embs = []
         pad_masks = []
         att_masks = []
 
         # Process images
         for img, img_mask in zip(images, img_masks, strict=True):
+            K = num_frames
 
-            def image_embed_func(img):
-                return self.paligemma_with_expert.embed_image(img)
+            def image_embed_func(img, _K=K):
+                return self.paligemma_with_expert.embed_image(img, num_frames=_K)
 
             img_emb = self._apply_checkpoint(image_embed_func, img)
+            # img_emb: [B, n, d] (history frames already discarded by SigLIP)
 
             bsize, num_img_embs = img_emb.shape[:2]
+
+            # When K>1, img_mask may be [B*K] — reduce to [B] by taking every K-th
+            if K > 1 and img_mask.shape[0] == bsize * K:
+                img_mask = img_mask[::K]
 
             embs.append(img_emb)
             pad_masks.append(img_mask[:, None].expand(bsize, num_img_embs))

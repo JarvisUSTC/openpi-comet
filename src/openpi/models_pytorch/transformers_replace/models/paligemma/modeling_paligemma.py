@@ -229,17 +229,18 @@ class PaliGemmaModel(PaliGemmaPreTrainedModel):
 
         return causal_mask
 
-    def get_image_features(self, pixel_values: torch.FloatTensor):
+    def get_image_features(self, pixel_values: torch.FloatTensor, num_frames: int = 1):
         """
         Obtains image last hidden states from the vision tower and apply multimodal projection.
 
         Args:
             pixel_values (`torch.FloatTensor]` of shape `(batch_size, channels, height, width)`)
                The tensors corresponding to the input images.
+            num_frames (`int`): Number of video frames (MEM). 1 = original behavior.
         Returns:
             image_features (`torch.Tensor`): Image feature tensor of shape `(num_images, image_length, embed_dim)`).
         """
-        image_outputs = self.vision_tower(pixel_values)
+        image_outputs = self.vision_tower(pixel_values, num_frames=num_frames)
         selected_image_feature = image_outputs.last_hidden_state
         image_features = self.multi_modal_projector(selected_image_feature)
         return image_features
@@ -410,8 +411,8 @@ class PaliGemmaForConditionalGeneration(PaliGemmaPreTrainedModel, GenerationMixi
     def get_decoder(self):
         return self.model.get_decoder()
 
-    def get_image_features(self, pixel_values):
-        return self.model.get_image_features(pixel_values)
+    def get_image_features(self, pixel_values, num_frames: int = 1):
+        return self.model.get_image_features(pixel_values, num_frames=num_frames)
 
     # Make modules available throught conditional class for BC
     @property

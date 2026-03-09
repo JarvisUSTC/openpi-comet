@@ -303,10 +303,9 @@ class LeRobotB1KDataConfig(DataConfigFactory):
             ]
         )
 
-        # Prepare data for policy training
-        # Convert images to uint8 numpy arrays, add masks
+        vm_frames = getattr(model_config, "video_memory_frames", 1)
         data_transforms = _transforms.Group(
-            inputs=[b1k_policy.B1kInputs(action_dim=model_config.action_dim, model_type=model_config.model_type)],
+            inputs=[b1k_policy.B1kInputs(action_dim=model_config.action_dim, model_type=model_config.model_type, video_memory_frames=vm_frames)],
             outputs=[b1k_policy.B1kOutputs(action_dim=23)],
         )
 
@@ -323,7 +322,6 @@ class LeRobotB1KDataConfig(DataConfigFactory):
                 outputs=[_transforms.AbsoluteActions(delta_action_mask)],
             )
 
-        # Model transforms include things like tokenizing the prompt and action targets
         model_transforms = ModelTransformFactory(
             rearrange_action_indices=self.rearrange_action_indices,
             model_delta_action_mask=self.model_delta_action_mask,
@@ -739,6 +737,34 @@ _CONFIGS = [
             decay_steps=50_000,
         ),
         freeze_filter=pi0_config.Pi0Config(pi05=True, action_horizon=32).get_freeze_filter(),
+        ema_decay=None,
+        assets_base_dir="./outputs/assets",
+        checkpoint_base_dir=".",
+        num_workers=8,
+        batch_size=8 * 32,
+    ),
+    # 1b. MEM (video memory) pretrain config
+    TrainConfig(
+        name="pi05_b1k-pt50_mem_K6_cs32_bs64_lr2.5e-5_step50k",
+        exp_name="openpi",
+        project_name="B1K",
+        model=pi0_config.Pi0Config(pi05=True, action_horizon=32, video_memory_frames=6, video_memory_stride_s=1.0),
+        data=LeRobotB1KDataConfig(
+            repo_id="behavior-1k/2025-challenge-demos",
+            base_config=DataConfig(
+                prompt_from_task=True,
+                episodes_index=list(range(200)),
+                behavior_dataset_root="../DATASETS/behavior/2025-challenge-demos",
+                fine_grained_level=0,
+            ),
+        ),
+        weight_loader=weight_loaders.CheckpointWeightLoader("gs://openpi-assets/checkpoints/pi05_base/params"),
+        num_train_steps=50_000,
+        lr_schedule=_optimizer.CosineDecaySchedule(
+            peak_lr=2.5e-5,
+            decay_steps=50_000,
+        ),
+        freeze_filter=pi0_config.Pi0Config(pi05=True, action_horizon=32, video_memory_frames=6).get_freeze_filter(),
         ema_decay=None,
         assets_base_dir="./outputs/assets",
         checkpoint_base_dir=".",
