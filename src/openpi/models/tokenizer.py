@@ -78,12 +78,15 @@ class FASTTokenizer:
     def __init__(self, max_len: int = 256, fast_tokenizer_path: str = "physical-intelligence/fast"):
         self._max_len = max_len
 
+        # 支持离线：环境变量 OPENPI_FAST_TOKENIZER_PATH 指向本地目录时不再访问 HuggingFace
+        fast_tokenizer_path = os.environ.get("OPENPI_FAST_TOKENIZER_PATH", fast_tokenizer_path)
+
         # Download base PaliGemma tokenizer
         path = download.maybe_download("gs://big_vision/paligemma_tokenizer.model", gs={"token": "anon"})
         with path.open("rb") as f:
             self._paligemma_tokenizer = sentencepiece.SentencePieceProcessor(model_proto=f.read())
 
-        # Instantiate FAST tokenizer
+        # Instantiate FAST tokenizer (local path or HuggingFace repo id)
         self._fast_tokenizer = AutoProcessor.from_pretrained(fast_tokenizer_path, trust_remote_code=True)
         self._fast_skip_tokens = 128  # Skip last 128 tokens in PaliGemma vocab since they are special tokens
 

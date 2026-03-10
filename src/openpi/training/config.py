@@ -186,9 +186,11 @@ class ModelTransformFactory(GroupFactory):
                     tokenizer_cls = getattr(
                         model_config, "fast_model_tokenizer", _tokenizer.FASTTokenizer
                     ) or _tokenizer.FASTTokenizer
-                    tokenizer_kwargs = getattr(
-                        model_config, "fast_model_tokenizer_kwargs", None
-                    ) or {}
+                    tokenizer_kwargs = dict(
+                        getattr(model_config, "fast_model_tokenizer_kwargs", None) or {}
+                    )
+                    if getattr(model_config, "fast_tokenizer_path", None) is not None:
+                        tokenizer_kwargs["fast_tokenizer_path"] = model_config.fast_tokenizer_path
                     fast_tokenizer = tokenizer_cls(model_config.max_token_len, **tokenizer_kwargs)
                     return _transforms.Group(
                         inputs=[
@@ -223,9 +225,11 @@ class ModelTransformFactory(GroupFactory):
                     if model_config.fast_model_tokenizer is None
                     else model_config.fast_model_tokenizer
                 )
-                tokenizer_kwargs = (
+                tokenizer_kwargs = dict(
                     {} if model_config.fast_model_tokenizer_kwargs is None else model_config.fast_model_tokenizer_kwargs
                 )
+                if getattr(model_config, "fast_tokenizer_path", None) is not None:
+                    tokenizer_kwargs["fast_tokenizer_path"] = model_config.fast_tokenizer_path
                 return _transforms.Group(
                     inputs=[
                         *meta_input_transforms,
@@ -643,6 +647,7 @@ def eps_index_fn(*indexs):
 # Use `get_config` if you need to get a config by name in your code.
 _CONFIGS = [
     # 0. Base Model Configs
+    # Knowledge Insulation (KI): π0.5 + KI, backbone 用 FAST 离散 action tokens 训练，action expert 梯度不回传
     TrainConfig(
         name="pi05_b1k_ki",
         exp_name="openpi_ki",
@@ -892,6 +897,43 @@ _CONFIGS = [
         freeze_filter=pi0_config.Pi0Config(pi05=True, action_horizon=32).get_freeze_filter(),
         ema_decay=None,
         checkpoint_base_dir="./outputs/checkpoints/pi05_b1k-all_skills",
+        num_workers=8,
+        batch_size=8 * 32,
+    ),
+    # Knowledge Insulation 专用配置（与 pi05_b1k_ki 相同，便于脚本与文档引用）
+    TrainConfig(
+        name="pi05_b1k-knowledge_insulation-all_skills",
+        exp_name="openpi_knowledge_insulation-all_skills",
+        project_name="B1K",
+        model=pi0_config.Pi0Config(pi05=True, action_horizon=32, knowledge_insulation=True),
+        data=LeRobotB1KDataConfig(
+            repo_id="behavior-1k/2025-challenge-demos",
+            base_config=DataConfig(
+                prompt_from_task=True,
+                behavior_dataset_root="../DATASETS/behavior/2025-challenge-demos",
+                # Train/val split: these are PER-TASK positional episode indices (not global episode ids).
+                episodes_index=list(range(0, 180)),
+                fine_grained_level=1,  # 0, 1, 2
+            ),
+        ),
+        weight_loader=weight_loaders.CheckpointWeightLoader("/root/Models/pi05_base/params"),
+        num_train_steps=50_000,
+        lr_schedule=_optimizer.CosineDecaySchedule(
+            peak_lr=2.5e-5,
+            decay_steps=50_000,
+        ),
+        # Keep train logging reasonably frequent; run validation less often to limit overhead.
+        log_interval=100,
+        save_interval=5000,
+        val_log_interval=100,
+        val_num_batches=10,
+        val_batch_size=2 * 32,
+        val_episodes_index=list(range(180, 200)),
+        freeze_filter=pi0_config.Pi0Config(
+            pi05=True, action_horizon=32, knowledge_insulation=True
+        ).get_freeze_filter(),
+        ema_decay=None,
+        checkpoint_base_dir="./outputs/checkpoints/pi05_b1k-ki-all_skills",
         num_workers=8,
         batch_size=8 * 32,
     ),

@@ -41,6 +41,10 @@ class Pi0Config(_model.BaseModelConfig):
     # action expert with flow-matching, with stop_gradient from action expert to backbone.
     knowledge_insulation: bool = False
 
+    # 本地 FAST tokenizer 路径（无外网时使用）。也可用环境变量 OPENPI_FAST_TOKENIZER_PATH。
+    # 需包含 config.json 等，与 HuggingFace physical-intelligence/fast 目录结构一致。
+    fast_tokenizer_path: str | None = None
+
     def __post_init__(self):
         if self.max_token_len is None:
             object.__setattr__(self, "max_token_len", 200 if self.pi05 else 48)
