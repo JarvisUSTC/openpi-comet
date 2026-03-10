@@ -147,14 +147,15 @@ def build_orchestrator_levels_from_annotations(
         return output_data
 
     def _parse_frame_duration(fd) -> tuple[int, int] | None:
-        """Parse frame_duration as [start, end] or [[start, end]]; return (start, end) or None."""
+        """Parse frame_duration as [start, end]; return (start, end) or None.
+        Multi-segment format like [[0,50],[100,150]] is not supported and returns None (will be filtered out).
+        """
         if fd is None or not isinstance(fd, (list, tuple)) or len(fd) < 2:
             return None
         a, b = fd[0], fd[1]
-        if isinstance(a, (list, tuple)):
-            a = a[0] if len(a) > 0 else 0
-        if isinstance(b, (list, tuple)):
-            b = b[0] if len(b) > 0 else 0
+        # 多段格式 [[0,50],[100,150]] 直接过滤：首元素是 list 表示多段，不解析
+        if isinstance(a, (list, tuple)) or isinstance(b, (list, tuple)):
+            return None
         try:
             return int(a), int(b)
         except (TypeError, ValueError):
@@ -164,6 +165,9 @@ def build_orchestrator_levels_from_annotations(
     for i, s in enumerate(skill_annotation):
         task_text = format_skill_prompt(s)
         parsed = _parse_frame_duration(s.get("frame_duration")) if "frame_duration" in s else None
+        # 有 frame_duration 但解析为 None（多段或无效）时跳过该 skill，不加入 orchestrator
+        if "frame_duration" in s and parsed is None:
+            continue
         if parsed is not None:
             start_f, end_f = parsed
             end_frame = min(end_f - 1, episode_len - 1) if end_f > 0 else episode_len - 1
@@ -181,6 +185,10 @@ def build_orchestrator_levels_from_annotations(
             "start_frame": start_frame,
             "end_frame": end_frame,
         })
+    # 若所有 skill 均被过滤（如均为多段 frame_duration），则 level 1/2 退化为整段 episode
+    if not output_data[1]:
+        output_data[1] = list(output_data[0])
+        output_data[2] = list(output_data[0])
     output_data[3] = list(output_data[2])
     return output_data
 
