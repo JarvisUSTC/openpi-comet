@@ -102,12 +102,13 @@ def init_wandb(config: _config.TrainConfig, *, resuming: bool, enabled: bool = T
 
     if resuming:
         run_id = (ckpt_dir / "wandb_id.txt").read_text().strip()
-        wandb.init(id=run_id, resume="must", project=config.project_name)
+        wandb.init(id=run_id, resume="must", project=config.project_name, entity="haoranjia66-university-of-waterloo")
     else:
         wandb.init(
             name=config.exp_name,
             config=dataclasses.asdict(config),
             project=config.project_name,
+            entity="haoranjia66-university-of-waterloo",
         )
         (ckpt_dir / "wandb_id.txt").write_text(wandb.run.id)
 
@@ -386,7 +387,9 @@ def train_loop(config: _config.TrainConfig):
     )
 
     # Pass the original batch size to data loader - it will handle DDP splitting internally
+    logging.info("[DEBUG] [1/6] Building datasets...")
     loader, data_config = build_datasets(config)
+    logging.info("[DEBUG] [1/6] Datasets built OK.")
 
     # # Log sample images to wandb on first batch
     # if is_main and config.wandb_enabled and not resuming:
@@ -436,7 +439,13 @@ def train_loop(config: _config.TrainConfig):
         # Update dtype to match pytorch_training_precision
         object.__setattr__(model_cfg, "dtype", config.pytorch_training_precision)
 
-    model = openpi.models_pytorch.pi0_pytorch.PI0Pytorch(model_cfg).to(device)
+    logging.info("[DEBUG] [2/6] Creating PI0Pytorch model on CPU...")
+    _t0 = time.time()
+    model = openpi.models_pytorch.pi0_pytorch.PI0Pytorch(model_cfg)
+    logging.info("[DEBUG] [2/6] Model created on CPU in %.1fs, moving to %s ...", time.time() - _t0, device)
+    _t0 = time.time()
+    model = model.to(device)
+    logging.info("[DEBUG] [2/6] Model moved to device in %.1fs.", time.time() - _t0)
 
     if hasattr(model, "gradient_checkpointing_enable"):
         enable_gradient_checkpointing = True
@@ -460,6 +469,8 @@ def train_loop(config: _config.TrainConfig):
         logging.info("Enabled memory optimizations for 8+ GPU training")
 
     if use_ddp:
+        logging.info("[DEBUG] [3/6] Wrapping model with DDP...")
+        _t0 = time.time()
         model = torch.nn.parallel.DistributedDataParallel(
             model,
             device_ids=[device.index] if device.type == "cuda" else None,
@@ -467,8 +478,12 @@ def train_loop(config: _config.TrainConfig):
             gradient_as_bucket_view=True,  # Enable for memory efficiency
             static_graph=world_size >= 8,  # Enable for 8+ GPUs
         )
+        logging.info("[DEBUG] [3/6] DDP wrapped in %.1fs.", time.time() - _t0)
+    else:
+        logging.info("[DEBUG] [3/6] Single GPU, skipping DDP.")
 
     # Load weights from weight_loader if specified (for fine-tuning)
+    logging.info("[DEBUG] [4/6] pytorch_weight_path=%s", config.pytorch_weight_path)
     if config.pytorch_weight_path is not None:
         logging.info(f"Loading weights from: {config.pytorch_weight_path}")
 
@@ -485,6 +500,7 @@ def train_loop(config: _config.TrainConfig):
     end_lr = config.lr_schedule.decay_lr
 
     # Create optimizer with config parameters
+    logging.info("[DEBUG] [5/6] Creating optimizer...")
     optim = torch.optim.AdamW(
         model.parameters(),
         lr=peak_lr,
@@ -492,6 +508,7 @@ def train_loop(config: _config.TrainConfig):
         eps=config.optimizer.eps,
         weight_decay=config.optimizer.weight_decay,
     )
+    logging.info("[DEBUG] [5/6] Optimizer created.")
 
     # Load checkpoint if resuming
     global_step = 0
@@ -538,12 +555,20 @@ def train_loop(config: _config.TrainConfig):
         else None
     )
 
+    logging.info("[DEBUG] [6/6] Entering training loop, fetching first batch...")
+    _t0 = time.time()
+    _first_batch = True
+
     while global_step < config.num_train_steps:
         # Set epoch for distributed training
         if use_ddp and hasattr(loader, "set_epoch"):
             loader.set_epoch(global_step // len(loader))
 
         for observation, actions in loader:
+            if _first_batch:
+                logging.info("[DEBUG] [6/6] First batch fetched in %.1fs. Training started!", time.time() - _t0)
+                _first_batch = False
+
             # Check if we've reached the target number of steps
             if global_step >= config.num_train_steps:
                 break
@@ -597,11 +622,17 @@ def train_loop(config: _config.TrainConfig):
                     param.grad.detach_()
                     param.grad = None
 
+            # Aggregate loss across all GPUs for more accurate logging
+            reduced_loss = loss.detach().clone()
+            if use_ddp:
+                torch.distributed.all_reduce(reduced_loss)
+                reduced_loss = reduced_loss / torch.distributed.get_world_size()
+
             # Collect stats
             if is_main:
                 infos.append(
                     {
-                        "loss": loss.item(),
+                        "loss": reduced_loss.item(),
                         "learning_rate": optim.param_groups[0]["lr"],
                         "grad_norm": float(grad_norm) if isinstance(grad_norm, torch.Tensor) else grad_norm,
                     }

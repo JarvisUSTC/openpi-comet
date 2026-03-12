@@ -167,6 +167,7 @@ class PI0Pytorch(nn.Module):
             observation.tokenized_prompt,
             observation.tokenized_prompt_mask,
             observation.state,
+            getattr(observation, "temporal_mask", None),
         )
 
     def sample_noise(self, shape, device):
@@ -184,7 +185,7 @@ class PI0Pytorch(nn.Module):
         return time.to(dtype=torch.float32, device=device)
 
     def embed_prefix(
-        self, images, img_masks, lang_tokens, lang_masks
+        self, images, img_masks, lang_tokens, lang_masks, *, temporal_mask=None
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         """Embed images with SigLIP and language tokens with embedding layer to prepare
         for PaliGemma transformer processing.
@@ -198,8 +199,8 @@ class PI0Pytorch(nn.Module):
         for img, img_mask in zip(images, img_masks, strict=True):
             K = num_frames
 
-            def image_embed_func(img, _K=K):
-                return self.paligemma_with_expert.embed_image(img, num_frames=_K)
+            def image_embed_func(img, _K=K, _tm=temporal_mask):
+                return self.paligemma_with_expert.embed_image(img, num_frames=_K, temporal_mask=_tm)
 
             img_emb = self._apply_checkpoint(image_embed_func, img)
             # img_emb: [B, n, d] (history frames already discarded by SigLIP)
@@ -322,7 +323,7 @@ class PI0Pytorch(nn.Module):
 
     def forward(self, observation, actions, noise=None, time=None) -> Tensor:
         """Do a full training forward pass and compute the loss (batch_size x num_steps x num_motors)"""
-        images, img_masks, lang_tokens, lang_masks, state = self._preprocess_observation(observation, train=True)
+        images, img_masks, lang_tokens, lang_masks, state, temporal_mask = self._preprocess_observation(observation, train=True)
 
         if noise is None:
             noise = self.sample_noise(actions.shape, actions.device)
@@ -334,7 +335,7 @@ class PI0Pytorch(nn.Module):
         x_t = time_expanded * noise + (1 - time_expanded) * actions
         u_t = noise - actions
 
-        prefix_embs, prefix_pad_masks, prefix_att_masks = self.embed_prefix(images, img_masks, lang_tokens, lang_masks)
+        prefix_embs, prefix_pad_masks, prefix_att_masks = self.embed_prefix(images, img_masks, lang_tokens, lang_masks, temporal_mask=temporal_mask)
         suffix_embs, suffix_pad_masks, suffix_att_masks, adarms_cond = self.embed_suffix(state, x_t, time)
         if (
             self.paligemma_with_expert.paligemma.language_model.layers[0].self_attn.q_proj.weight.dtype
@@ -387,9 +388,9 @@ class PI0Pytorch(nn.Module):
             actions_shape = (bsize, self.config.action_horizon, self.config.action_dim)
             noise = self.sample_noise(actions_shape, device)
 
-        images, img_masks, lang_tokens, lang_masks, state = self._preprocess_observation(observation, train=False)
+        images, img_masks, lang_tokens, lang_masks, state, temporal_mask = self._preprocess_observation(observation, train=False)
 
-        prefix_embs, prefix_pad_masks, prefix_att_masks = self.embed_prefix(images, img_masks, lang_tokens, lang_masks)
+        prefix_embs, prefix_pad_masks, prefix_att_masks = self.embed_prefix(images, img_masks, lang_tokens, lang_masks, temporal_mask=temporal_mask)
         prefix_att_2d_masks = make_att_2d_masks(prefix_pad_masks, prefix_att_masks)
         prefix_position_ids = torch.cumsum(prefix_pad_masks, dim=1) - 1
 

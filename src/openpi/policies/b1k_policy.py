@@ -173,10 +173,11 @@ class B1kInputs(transforms.DataTransformFn):
         wrist_image_right = _parse_image(data["observation/wrist_image_right"])
 
         # MEM: stack history frames if available
+        temporal_mask = None
         if K > 1:
-            base_image = _stack_history_frames(data, "observation/egocentric_camera", base_image, K)
-            wrist_image_left = _stack_history_frames(data, "observation/wrist_image_left", wrist_image_left, K)
-            wrist_image_right = _stack_history_frames(data, "observation/wrist_image_right", wrist_image_right, K)
+            base_image, temporal_mask = _stack_history_frames(data, "observation/egocentric_camera", base_image, K)
+            wrist_image_left, _ = _stack_history_frames(data, "observation/wrist_image_left", wrist_image_left, K)
+            wrist_image_right, _ = _stack_history_frames(data, "observation/wrist_image_right", wrist_image_right, K)
 
         meta_images, meta_image_names = [], []
 
@@ -219,6 +220,8 @@ class B1kInputs(transforms.DataTransformFn):
 
         if self.depth_as_pcd:
             inputs["pcd_xyz"] = pcd_xyz
+        if temporal_mask is not None:
+            inputs["temporal_mask"] = temporal_mask
         return inputs
 
 
@@ -230,22 +233,33 @@ _REPACK_TO_RAW = {
 }
 
 
-def _stack_history_frames(data: dict, key: str, current_frame: np.ndarray, K: int) -> np.ndarray:
-    """Stack K frames: K-1 history + 1 current. Returns [K, H, W, C].
+def _stack_history_frames(data: dict, key: str, current_frame: np.ndarray, K: int) -> tuple[np.ndarray, np.ndarray]:
+    """Stack K frames: K-1 history + 1 current. Returns ([K, H, W, C], [K] bool mask).
 
     Looks for history frames in data using both repacked and raw key conventions.
     If not available, repeats the current frame K times.
+    The mask indicates which frames are valid (True) vs padded (False).
     """
-    # Try repacked key first, then raw key
     history = None
+    valid_flags = None
     for candidate in (f"{key}_history", f"{_REPACK_TO_RAW.get(key, key)}_history"):
         if candidate in data and len(data[candidate]) >= K - 1:
             history = [_parse_image(f) for f in data[candidate][-(K - 1):]]
+            valid_key = f"{candidate}_valid"
+            if valid_key in data:
+                valid_flags = list(data[valid_key][-(K - 1):])
             break
 
     if history is not None:
-        return np.stack(history + [current_frame], axis=0)  # [K, H, W, C]
-    return np.stack([current_frame] * K, axis=0)  # [K, H, W, C]
+        frames = np.stack(history + [current_frame], axis=0)
+        if valid_flags is not None:
+            mask = np.array(valid_flags + [True], dtype=np.bool_)
+        else:
+            mask = np.ones(K, dtype=np.bool_)
+        return frames, mask
+    frames = np.stack([current_frame] * K, axis=0)
+    mask = np.array([False] * (K - 1) + [True], dtype=np.bool_)
+    return frames, mask
 
 
 @dataclasses.dataclass(frozen=True)

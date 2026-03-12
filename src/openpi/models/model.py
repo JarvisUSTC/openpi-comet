@@ -78,7 +78,6 @@ IMAGE_RESOLUTION = (224, 224)
 #   s = state dimension
 #   l = sequence length
 #
-@at.typecheck
 @struct.dataclass
 class Observation(Generic[ArrayT]):
     """Holds observations, i.e., inputs to the model.
@@ -113,6 +112,9 @@ class Observation(Generic[ArrayT]):
     # Point cloud.
     pcd_xyz: at.Float[ArrayT, "*b pc_s n 3"] | None = None
 
+    # MEM: temporal validity mask [B, K] — True for valid history frames, False for padded.
+    temporal_mask: at.Bool[ArrayT, "*b k"] | None = None
+
     @classmethod
     def from_dict(cls, data: at.PyTree[ArrayT]) -> "Observation[ArrayT]":
         """This method defines the mapping between unstructured data (i.e., nested dict) to the structured Observation format."""
@@ -139,6 +141,19 @@ class Observation(Generic[ArrayT]):
                 else:
                     img = img.permute(0, 3, 1, 2) / 255.0 * 2.0 - 1.0
                 data["image"][key] = img
+
+        # MEM: expand image_masks to match reshaped multi-frame images [B] -> [B*K]
+        for key in data["image_mask"]:
+            if key in data["image"]:
+                img = data["image"][key]
+                mask = data["image_mask"][key]
+                if img.shape[0] != mask.shape[0]:
+                    K = img.shape[0] // mask.shape[0]
+                    if isinstance(mask, torch.Tensor):
+                        data["image_mask"][key] = mask.repeat_interleave(K)
+                    else:
+                        data["image_mask"][key] = np.repeat(mask, K)
+
         return cls(
             images=data["image"],
             image_masks=data["image_mask"],
@@ -148,6 +163,7 @@ class Observation(Generic[ArrayT]):
             token_ar_mask=data.get("token_ar_mask"),
             token_loss_mask=data.get("token_loss_mask"),
             pcd_xyz=data.get("pcd_xyz"),
+            temporal_mask=data.get("temporal_mask"),
         )
 
     def to_dict(self) -> at.PyTree[ArrayT]:

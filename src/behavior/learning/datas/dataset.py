@@ -342,34 +342,53 @@ class BehaviorLeRobotDataset(LeRobotDataset):
             self.stats = aggregate_stats(episodes_stats)
 
         # Load actual data
+        import time as _time
+        logger.info("[DEBUG-DS] Checking episode file paths...")
+        _t0 = _time.time()
         try:
             if force_cache_sync:
                 raise FileNotFoundError
             for fpath in self.get_episodes_file_paths():
                 assert (self.root / fpath).is_file(), f"Missing file: {self.root / fpath}"
+            logger.info("[DEBUG-DS] File check done in %.1fs, loading HF dataset...", _time.time() - _t0)
+            _t0 = _time.time()
             self.hf_dataset = self.load_hf_dataset()
+            logger.info("[DEBUG-DS] HF dataset loaded in %.1fs.", _time.time() - _t0)
         except (AssertionError, FileNotFoundError, NotADirectoryError) as e:
             if local_only:
                 raise e
             self.revision = get_safe_version(self.repo_id, self.revision)
             self.download_episodes(download_videos)
+            logger.info("[DEBUG-DS] Downloaded, loading HF dataset...")
+            _t0 = _time.time()
             self.hf_dataset = self.load_hf_dataset()
+            logger.info("[DEBUG-DS] HF dataset loaded in %.1fs.", _time.time() - _t0)
 
+        logger.info("[DEBUG-DS] Building episode_data_index...")
+        _t0 = _time.time()
         self.episode_data_index = get_episode_data_index(self.meta.episodes, self.episodes)
+        logger.info("[DEBUG-DS] episode_data_index done in %.1fs.", _time.time() - _t0)
 
         # Check timestamps
         if check_timestamp_sync:
+            logger.info("[DEBUG-DS] Checking timestamps sync...")
+            _t0 = _time.time()
             timestamps = th.stack(self.hf_dataset["timestamp"]).numpy()
             episode_indices = th.stack(self.hf_dataset["episode_index"]).numpy()
             ep_data_index_np = {k: t.numpy() for k, t in self.episode_data_index.items()}
             check_timestamps_sync(timestamps, episode_indices, ep_data_index_np, self.fps, self.tolerance_s)
+            logger.info("[DEBUG-DS] Timestamps sync done in %.1fs.", _time.time() - _t0)
+        else:
+            logger.info("[DEBUG-DS] Skipping timestamp sync check.")
 
         # Setup delta_indices
         if self.delta_timestamps is not None:
             check_delta_timestamps(self.delta_timestamps, self.fps, self.tolerance_s)
             self.delta_indices = get_delta_indices(self.delta_timestamps, self.fps)
 
+        logger.info("[DEBUG-DS] Preparing task (fine_grained_level=%d)...", fine_grained_level)
         self.prepare_task(fine_grained_level)
+        logger.info("[DEBUG-DS] Dataset init complete.")
 
         self.omnigibson_mapping = {ep_idx: defaultdict(dict) for ep_idx in self.episodes}
 

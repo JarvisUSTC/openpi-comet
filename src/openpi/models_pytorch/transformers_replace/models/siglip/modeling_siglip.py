@@ -376,6 +376,7 @@ def temporal_causal_attention(
     x: torch.Tensor,
     num_frames: int,
     num_heads: int,
+    temporal_mask: torch.Tensor | None = None,
 ) -> torch.Tensor:
     """Causal temporal self-attention across frames at each patch position.
 
@@ -387,6 +388,7 @@ def temporal_causal_attention(
         x: [B*K, n, d] — hidden states for all frames.
         num_frames: K — number of frames.
         num_heads: number of attention heads.
+        temporal_mask: optional [B, K] bool tensor. True = valid frame, False = padded.
 
     Returns:
         Residual delta of shape [B*K, n, d]. Zero when K=1.
@@ -417,9 +419,20 @@ def temporal_causal_attention(
 
     # Causal mask: each frame can only attend to itself and earlier frames
     causal_mask = torch.triu(torch.ones(K, K, device=x.device, dtype=torch.bool), diagonal=1)
-    attn = attn.masked_fill(causal_mask[None, None, :, :], float("-inf"))
+
+    # Combine causal mask with temporal validity mask
+    if temporal_mask is not None:
+        # temporal_mask: [B, K] True=valid, False=padded
+        # Block attention TO padded frames: [B, K] -> [B*n, 1, 1, K]
+        padding_mask = ~temporal_mask  # [B, K], True where padded
+        padding_mask = padding_mask.unsqueeze(1).expand(B, n, K).reshape(B * n, K)
+        padding_mask = padding_mask[:, None, None, :]  # [B*n, 1, 1, K]
+        attn = attn.masked_fill(causal_mask[None, None, :, :] | padding_mask, float("-inf"))
+    else:
+        attn = attn.masked_fill(causal_mask[None, None, :, :], float("-inf"))
 
     attn = torch.softmax(attn, dim=-1)
+    attn = torch.nan_to_num(attn, nan=0.0)
     out = torch.matmul(attn, v_raw)  # [B*n, num_heads, K, head_dim]
 
     # Reshape back: [B*n, num_heads, K, head_dim] -> [B, n, K, d] -> [B, K, n, d] -> [B*K, n, d]
@@ -533,6 +546,7 @@ class SiglipEncoderLayer(GradientCheckpointingLayer):
         output_attentions: Optional[bool] = False,
         num_frames: int = 1,
         layer_idx: int = 0,
+        temporal_mask: torch.Tensor | None = None,
     ) -> tuple[torch.FloatTensor]:
         """
         Args:
@@ -547,6 +561,7 @@ class SiglipEncoderLayer(GradientCheckpointingLayer):
                 Number of video frames (MEM). 1 = single-frame (original behavior).
             layer_idx (`int`):
                 Index of this layer in the encoder stack (MEM temporal attention every 4th layer).
+            temporal_mask: optional [B, K] bool mask for valid frames.
         """
         residual = hidden_states
 
@@ -561,7 +576,8 @@ class SiglipEncoderLayer(GradientCheckpointingLayer):
         # MEM: interleave temporal causal attention every 4th layer (after spatial attn)
         if num_frames > 1 and (layer_idx + 1) % 4 == 0:
             hidden_states = hidden_states + temporal_causal_attention(
-                hidden_states, num_frames=num_frames, num_heads=self.self_attn.num_heads
+                hidden_states, num_frames=num_frames, num_heads=self.self_attn.num_heads,
+                temporal_mask=temporal_mask,
             )
 
         residual = hidden_states
@@ -667,6 +683,7 @@ class SiglipEncoder(nn.Module):
         output_attentions: Optional[bool] = None,
         output_hidden_states: Optional[bool] = None,
         num_frames: int = 1,
+        temporal_mask: torch.Tensor | None = None,
     ) -> BaseModelOutput:
         r"""
         Args:
@@ -711,6 +728,7 @@ class SiglipEncoder(nn.Module):
                 output_attentions=output_attentions,
                 num_frames=num_frames,
                 layer_idx=layer_idx,
+                temporal_mask=temporal_mask,
             )
 
             hidden_states = layer_outputs[0]
@@ -875,6 +893,7 @@ class SiglipVisionTransformer(nn.Module):
         output_hidden_states: Optional[bool] = None,
         interpolate_pos_encoding: Optional[bool] = False,
         num_frames: int = 1,
+        temporal_mask=None,
     ) -> BaseModelOutputWithPooling:
         output_attentions = output_attentions if output_attentions is not None else self.config.output_attentions
         output_hidden_states = (
@@ -891,6 +910,7 @@ class SiglipVisionTransformer(nn.Module):
             output_attentions=output_attentions,
             output_hidden_states=output_hidden_states,
             num_frames=num_frames,
+            temporal_mask=temporal_mask,
         )
 
         last_hidden_state = encoder_outputs.last_hidden_state
@@ -959,6 +979,7 @@ class SiglipVisionModel(SiglipPreTrainedModel):
         output_hidden_states: Optional[bool] = None,
         interpolate_pos_encoding: bool = False,
         num_frames: int = 1,
+        temporal_mask=None,
     ) -> BaseModelOutputWithPooling:
         r"""
         Examples:
@@ -987,6 +1008,7 @@ class SiglipVisionModel(SiglipPreTrainedModel):
             output_hidden_states=output_hidden_states,
             interpolate_pos_encoding=interpolate_pos_encoding,
             num_frames=num_frames,
+            temporal_mask=temporal_mask,
         )
 
 

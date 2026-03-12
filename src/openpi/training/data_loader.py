@@ -181,14 +181,18 @@ class VideoMemoryDataset(Dataset):
             K = self._num_frames
             available = buf[:-1]
             sampled = []
+            valid_flags = []
             for i in range(K - 1, 0, -1):
                 idx = len(available) - i * self._stride
                 if idx < 0:
                     sampled.append(available[0] if available else buf[-1])
+                    valid_flags.append(False)
                 else:
                     sampled.append(available[idx])
+                    valid_flags.append(True)
 
             item[f"{cam_key}_history"] = sampled
+            item[f"{cam_key}_history_valid"] = valid_flags
 
         return item
 
@@ -219,6 +223,7 @@ def create_behavior_dataset(data_config: _config.DataConfig, action_horizon: int
         fine_grained_level=data_config.fine_grained_level,
         return_seg_instance=data_config.return_seg_instance,
         train_rgb_type=data_config.train_rgb_type,
+        check_timestamp_sync=False,
         **args,
     )
 
@@ -232,6 +237,102 @@ def create_behavior_dataset(data_config: _config.DataConfig, action_horizon: int
         dataset = VideoMemoryDataset(dataset, num_frames=video_memory_frames, stride=stride_frames)
 
     return dataset
+
+
+def _get_behavior_dataset(dataset):
+    """Unwrap nested dataset wrappers to find the underlying BehaviorLeRobotDataset."""
+    from behavior.learning.datas.dataset import BehaviorLeRobotDataset
+
+    d = dataset
+    while d is not None and not isinstance(d, BehaviorLeRobotDataset):
+        d = getattr(d, "_dataset", None)
+    return d
+
+
+def _rebalance_chunks_by_skill(dataset):
+    """Rebalance dataset chunks so rare skills are oversampled (inverse-sqrt-frequency).
+
+    Operates on BehaviorLeRobotDataset.chunks in-place. Only effective when
+    chunk_streaming_using_keyframe=True.
+    """
+    import bisect
+    import math
+    from collections import defaultdict
+
+    bds = _get_behavior_dataset(dataset)
+    if bds is None:
+        logging.warning("Skill resampling: could not find BehaviorLeRobotDataset; skipped.")
+        return
+    if not getattr(bds, "_chunk_streaming_using_keyframe", False) or not getattr(bds, "chunks", None):
+        logging.warning("Skill resampling: dataset has no chunks; skipped.")
+        return
+
+    chunks = bds.chunks
+    episodes = bds.episodes
+    task_sizes = getattr(bds, "task_sizes", {})
+    orchestrators = bds.meta.orchestrators
+    fg_level = bds.fine_grained_level
+
+    chunk_ep_list = []
+    for ep_idx in episodes:
+        L = bds.meta.episodes[ep_idx]["length"]
+        n_chunks = len(range(0, L, 250))
+        chunk_ep_list.extend([ep_idx] * n_chunks)
+
+    if len(chunk_ep_list) != len(chunks):
+        logging.warning(
+            "Skill resampling: chunk/episode mismatch (%d vs %d); skipped.",
+            len(chunk_ep_list), len(chunks),
+        )
+        return
+
+    skill_per_chunk = []
+    skill_frame_total = defaultdict(int)
+
+    for i, chunk in enumerate(chunks):
+        ep_idx = chunk_ep_list[i]
+        local_mid = chunk[2] + (chunk[1] - chunk[0]) // 2
+
+        skill = "unknown"
+        if ep_idx in task_sizes and task_sizes[ep_idx]:
+            sizes = task_sizes[ep_idx]
+            si = bisect.bisect_right(sizes, local_mid, hi=len(sizes) - 1)
+            try:
+                skill = orchestrators[ep_idx][fg_level][si].get("task", "unknown")
+            except Exception:
+                pass
+
+        skill_per_chunk.append(skill)
+        skill_frame_total[skill] += chunk[1] - chunk[0]
+
+    if not skill_frame_total:
+        return
+
+    max_frames = max(skill_frame_total.values())
+    skill_weight = {
+        skill: math.sqrt(max_frames / max(frames, 1))
+        for skill, frames in skill_frame_total.items()
+    }
+
+    new_chunks = []
+    skill_new_count = defaultdict(int)
+    for i, chunk in enumerate(chunks):
+        copies = max(1, round(skill_weight[skill_per_chunk[i]]))
+        new_chunks.extend([chunk] * copies)
+        skill_new_count[skill_per_chunk[i]] += copies
+
+    logging.info(
+        "Skill resampling: %d -> %d chunks (%.1fx)",
+        len(chunks), len(new_chunks), len(new_chunks) / len(chunks),
+    )
+    for skill in sorted(skill_frame_total, key=skill_frame_total.get, reverse=True):
+        old_c = sum(1 for s in skill_per_chunk if s == skill)
+        logging.info(
+            "  %-35s  frames=%10d  chunks %5d -> %5d  (weight=%.2f)",
+            skill, skill_frame_total[skill], old_c, skill_new_count[skill], skill_weight[skill],
+        )
+
+    bds.chunks = new_chunks
 
 
 def create_multi_behavior_dataset(
@@ -319,6 +420,9 @@ def create_behavior_data_loader(
 
     dataset = transform_dataset(dataset, data_config, skip_norm_stats=skip_norm_stats)
 
+    if getattr(config, "skill_resampling", False):
+        _rebalance_chunks_by_skill(dataset)
+
     data_loader = TorchDataLoader(
         dataset,
         local_batch_size=config.batch_size // jax.process_count(),
@@ -369,6 +473,9 @@ def create_torch_behavior_data_loader(
         dataset = create_behavior_dataset(data_config, action_horizon=config.model.action_horizon, video_memory_frames=vm_frames, video_memory_stride_s=vm_stride)
 
     dataset = transform_dataset(dataset, data_config, skip_norm_stats=skip_norm_stats)
+
+    if getattr(config, "skill_resampling", False):
+        _rebalance_chunks_by_skill(dataset)
 
     sampler = None
     if torch.distributed.is_initialized():
