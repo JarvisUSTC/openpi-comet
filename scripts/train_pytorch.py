@@ -50,6 +50,70 @@ import openpi.training.data_loader as _data_loader
 _PROMPT_LOG_INTERVAL = 10
 
 
+def _validation_is_enabled(config: _config.TrainConfig) -> bool:
+    if config.val_log_interval <= 0 or config.val_num_batches <= 0:
+        return False
+    return (config.val_repo_id is not None) or (config.val_episodes_index is not None)
+
+
+def _override_factory_for_val(
+    factory: _config.DataConfigFactory, config: _config.TrainConfig
+) -> _config.DataConfigFactory:
+    if config.val_repo_id is not None:
+        factory = dataclasses.replace(factory, repo_id=config.val_repo_id)
+    if config.val_episodes_index is not None:
+        base = factory.base_config or _config.DataConfig()
+        base = dataclasses.replace(base, episodes_index=config.val_episodes_index)
+        factory = dataclasses.replace(factory, base_config=base)
+    return factory
+
+
+def _make_val_config(config: _config.TrainConfig) -> _config.TrainConfig:
+    val_batch_size = config.batch_size if config.val_batch_size is None else config.val_batch_size
+    if isinstance(config.data, list):
+        val_data = [_override_factory_for_val(f, config) for f in config.data]
+    else:
+        val_data = _override_factory_for_val(config.data, config)
+    return dataclasses.replace(config, batch_size=val_batch_size, data=val_data)
+
+
+# Temporal attention params get a larger LR to compensate for gradient
+# attenuation through frozen backbone layers.  Adjust based on wandb
+# grad_ratio logs (expert_grad / temporal_grad).
+_TEMPORAL_LR_MULTIPLIER = 3.0
+
+# Parameter name patterns that should remain trainable (everything else is frozen)
+_TRAINABLE_PATTERNS = (
+    "temporal_attn",     # temporal attention modules in SigLIP
+    "action_in_proj",    # action input projection
+    "action_out_proj",   # action output projection
+    "time_mlp",          # timestep MLP (pi05)
+    "action_time_mlp",   # action+time MLP (pi0)
+    "state_proj",        # state projection (pi0)
+    "gemma_expert",      # action expert
+    "multi_modal_projector",  # vision-to-LM projection (adapt to temporal features)
+)
+
+
+def _freeze_backbone(model, is_main: bool = True):
+    """Freeze all backbone params; only train temporal attention + action head."""
+    raw_model = model.module if isinstance(model, torch.nn.parallel.DistributedDataParallel) else model
+    total, trainable, frozen = 0, 0, 0
+    for name, param in raw_model.named_parameters():
+        total += param.numel()
+        if any(pat in name for pat in _TRAINABLE_PATTERNS):
+            param.requires_grad = True
+            trainable += param.numel()
+        else:
+            param.requires_grad = False
+            frozen += param.numel()
+    if is_main:
+        logging.info(
+            "Parameter freezing: total=%.1fM, trainable=%.1fM (%.1f%%), frozen=%.1fM",
+            total / 1e6, trainable / 1e6, trainable / total * 100, frozen / 1e6,
+        )
+
+
 def _decode_prompt_for_logging(observation, tokenizer: _tokenizer.PaligemmaTokenizer) -> str:
     tokens = observation.tokenized_prompt[0]
     token_mask = getattr(observation, "tokenized_prompt_mask", None)
@@ -159,6 +223,98 @@ def build_datasets(config: _config.TrainConfig):
     return data_loader, data_loader.data_config()
 
 
+def build_val_loader(config: _config.TrainConfig):
+    """Build a validation data loader from the training config."""
+    val_config = _make_val_config(config)
+    val_batch_size = config.batch_size if config.val_batch_size is None else config.val_batch_size
+    val_loader = _data_loader.create_torch_behavior_data_loader(
+        val_config,
+        action_horizon=config.model.action_horizon,
+        batch_size=val_batch_size,
+        skip_norm_stats=False,
+        shuffle=False,
+        num_workers=0,
+        seed=config.seed + 1000,
+    )
+    return val_loader
+
+
+def reset_val_loader(val_loader):
+    """Reset the streaming dataset pointer and VideoMemoryDataset buffer so
+    that every validation pass reads exactly the same data."""
+    from behavior.learning.datas.dataset import BehaviorLeRobotDataset
+
+    def _unwrap(ds):
+        """Recursively unwrap dataset wrappers, resetting each layer."""
+        if isinstance(ds, _data_loader.VideoMemoryDataset):
+            ds._buffers.clear()
+            ds._last_frame_idx.clear()
+            ds._stats_total = 0
+            ds._stats_valid = 0
+            _unwrap(ds._dataset)
+        elif isinstance(ds, BehaviorLeRobotDataset):
+            if hasattr(ds, "_active_chunks") and ds._active_chunks:
+                ds.current_streaming_chunk_idx = 0
+                ds.current_streaming_frame_idx = ds._active_chunks[0][0]
+                ds._should_obs_loaders_reload = True
+        elif hasattr(ds, "_dataset"):
+            _unwrap(ds._dataset)
+
+    torch_ds = val_loader._data_loader.torch_loader.dataset
+    _unwrap(torch_ds)
+
+
+@torch.no_grad()
+def validate(model, val_loader, device, config):
+    """Run validation and return a dict of metrics."""
+    raw_model = model.module if isinstance(model, torch.nn.parallel.DistributedDataParallel) else model
+    was_training = raw_model.training
+    raw_model.eval()
+
+    flow_losses = []
+    action_mses = []
+    action_maes = []
+    action_cosine_sims = []
+    first_action_mses = []
+
+    for batch_idx, (observation, actions) in enumerate(val_loader):
+        if batch_idx >= config.val_num_batches:
+            break
+
+        observation = jax.tree.map(lambda x: x.to(device), observation)
+        actions = actions.to(torch.float32).to(device)
+
+        per_element_loss = raw_model(observation, actions)
+        flow_losses.append(per_element_loss.mean().item())
+
+        pred_actions = raw_model.sample_actions(device, observation, num_steps=config.val_denoise_steps)
+
+        action_error = pred_actions - actions
+        action_mses.append(torch.mean(action_error**2).item())
+        action_maes.append(torch.mean(torch.abs(action_error)).item())
+
+        pred_flat = pred_actions.reshape(pred_actions.shape[0], -1)
+        gt_flat = actions.reshape(actions.shape[0], -1)
+        cos_sim = torch.sum(pred_flat * gt_flat, dim=-1) / (
+            torch.norm(pred_flat, dim=-1) * torch.norm(gt_flat, dim=-1) + 1e-8
+        )
+        action_cosine_sims.append(cos_sim.mean().item())
+
+        first_action_mses.append(torch.mean((pred_actions[:, 0] - actions[:, 0]) ** 2).item())
+
+    if was_training:
+        raw_model.train()
+
+    return {
+        "val_loss": float(np.mean(flow_losses)),
+        "val/flow_loss": float(np.mean(flow_losses)),
+        "val/action_mse": float(np.mean(action_mses)),
+        "val/action_mae": float(np.mean(action_maes)),
+        "val/action_cosine_sim": float(np.mean(action_cosine_sims)),
+        "val/first_action_mse": float(np.mean(first_action_mses)),
+    }
+
+
 def get_model_state_dict(model):
     """Get state dict from model, handling DDP wrapper."""
     return (
@@ -252,7 +408,7 @@ def load_checkpoint(model, optimizer, checkpoint_dir, device):
 
         if safetensors_path.exists():
             model_to_load = model.module if isinstance(model, torch.nn.parallel.DistributedDataParallel) else model
-            safetensors.torch.load_model(model_to_load, safetensors_path, device=str(device))
+            safetensors.torch.load_model(model_to_load, safetensors_path, device=str(device), strict=False)
             logging.info("Loaded model state from safetensors format")
         else:
             raise FileNotFoundError(f"No model checkpoint found at {ckpt_dir}")
@@ -488,10 +644,27 @@ def train_loop(config: _config.TrainConfig):
         logging.info(f"Loading weights from: {config.pytorch_weight_path}")
 
         model_path = os.path.join(config.pytorch_weight_path, "model.safetensors")
-        safetensors.torch.load_model(
-            (model.module if isinstance(model, torch.nn.parallel.DistributedDataParallel) else model), model_path
-        )
+        model_to_load = model.module if isinstance(model, torch.nn.parallel.DistributedDataParallel) else model
+        missing, unexpected = safetensors.torch.load_model(model_to_load, model_path, strict=False)
+        if missing:
+            logging.info(f"Missing keys (new temporal modules, expected): {len(missing)} keys")
+            for k in missing[:10]:
+                logging.info(f"  {k}")
+        if unexpected:
+            logging.warning(f"Unexpected keys in checkpoint: {unexpected}")
         logging.info(f"Loaded PyTorch weights from {config.pytorch_weight_path}")
+
+    # Initialize temporal Q/K/V from pretrained spatial attention weights.
+    # Must happen AFTER loading pretrained weights so we clone real values, not random init.
+    raw_model = model.module if isinstance(model, torch.nn.parallel.DistributedDataParallel) else model
+    siglip_encoder = raw_model.paligemma_with_expert.paligemma.vision_tower.vision_model.encoder
+    if hasattr(siglip_encoder, "_init_temporal_from_spatial") and len(siglip_encoder.temporal_attns) > 0:
+        siglip_encoder._init_temporal_from_spatial()
+        if is_main:
+            logging.info("Initialized temporal out_proj from pretrained spatial attention weights (Q/K/V shared)")
+
+    # Freeze backbone, only train temporal attention + action expert + projections
+    _freeze_backbone(model, is_main)
 
     # Optimizer + learning rate schedule from config
     warmup_steps = config.lr_schedule.warmup_steps
@@ -499,11 +672,25 @@ def train_loop(config: _config.TrainConfig):
     decay_steps = config.lr_schedule.decay_steps
     end_lr = config.lr_schedule.decay_lr
 
-    # Create optimizer with config parameters
+    # Split trainable parameters into two groups for independent gradient handling
     logging.info("[DEBUG] [5/6] Creating optimizer...")
+    temporal_params = [p for n, p in model.named_parameters()
+                       if p.requires_grad and "temporal_attn" in n]
+    expert_params = [p for n, p in model.named_parameters()
+                     if p.requires_grad and "temporal_attn" not in n]
+    if is_main:
+        temporal_numel = sum(p.numel() for p in temporal_params)
+        expert_numel = sum(p.numel() for p in expert_params)
+        logging.info(
+            "Parameter groups: temporal=%.1fM (%d params), expert=%.1fM (%d params)",
+            temporal_numel / 1e6, len(temporal_params),
+            expert_numel / 1e6, len(expert_params),
+        )
     optim = torch.optim.AdamW(
-        model.parameters(),
-        lr=peak_lr,
+        [
+            {"params": expert_params, "lr": peak_lr},
+            {"params": temporal_params, "lr": peak_lr},
+        ],
         betas=(config.optimizer.b1, config.optimizer.b2),
         eps=config.optimizer.eps,
         weight_decay=config.optimizer.weight_decay,
@@ -538,7 +725,7 @@ def train_loop(config: _config.TrainConfig):
         )
         logging.info(f"Memory optimizations: gradient_checkpointing={enable_gradient_checkpointing}")
         logging.info(
-            f"LR schedule: warmup={warmup_steps}, peak_lr={peak_lr:.2e}, decay_steps={decay_steps}, end_lr={end_lr:.2e}"
+            f"LR schedule: warmup={warmup_steps}, peak_lr={peak_lr:.2e}, decay_steps={decay_steps}, end_lr={end_lr:.2e}, temporal_lr_mult={_TEMPORAL_LR_MULTIPLIER}x"
         )
         logging.info(
             f"Optimizer: {type(config.optimizer).__name__}, weight_decay={config.optimizer.weight_decay}, clip_norm={config.optimizer.clip_gradient_norm}"
@@ -547,6 +734,18 @@ def train_loop(config: _config.TrainConfig):
         logging.info(f"Training precision: {model_cfg.dtype}")
 
     prompt_tokenizer = _tokenizer.PaligemmaTokenizer(config.model.max_token_len) if is_main else None
+
+    val_loader = None
+    if is_main and _validation_is_enabled(config):
+        val_loader = build_val_loader(config)
+        logging.info(
+            "Validation enabled: val_repo_id=%s val_episodes_index=%s val_batch_size=%s val_num_batches=%s val_log_interval=%s",
+            config.val_repo_id,
+            config.val_episodes_index,
+            config.val_batch_size,
+            config.val_num_batches,
+            config.val_log_interval,
+        )
 
     # Training loop - iterate until we reach num_train_steps
     pbar = (
@@ -583,14 +782,34 @@ def train_loop(config: _config.TrainConfig):
                 except Exception:
                     logging.exception("Failed to decode/log prompt at step=%s", global_step)
 
+            is_val_step = (global_step % config.val_log_interval == 0) and _validation_is_enabled(config)
+            if is_val_step:
+                if val_loader is not None:
+                    try:
+                        reset_val_loader(val_loader)
+                        val_metrics = validate(model, val_loader, device, config)
+                        metrics_str = ", ".join(f"{k}={v:.4f}" for k, v in val_metrics.items() if not k.startswith("val/"))
+                        if pbar is not None:
+                            pbar.write(f"Step {global_step}: {metrics_str}")
+                        else:
+                            logging.info("Step %s: %s", global_step, metrics_str)
+                        if config.wandb_enabled:
+                            wandb.log(val_metrics, step=global_step)
+                    except Exception:
+                        logging.exception("Validation failed at step=%s", global_step)
+                if use_ddp:
+                    dist.barrier()
+
             # The unified data loader returns (observation, actions) tuple
             observation = jax.tree.map(lambda x: x.to(device), observation)  # noqa: PLW2901
             actions = actions.to(torch.float32)  # noqa: PLW2901
             actions = actions.to(device)  # noqa: PLW2901
 
-            # Update LR
-            for pg in optim.param_groups:
-                pg["lr"] = lr_schedule(global_step)
+            # Update LR — temporal group gets a higher LR to compensate for
+            # gradient attenuation through the frozen backbone.
+            base_lr = lr_schedule(global_step)
+            optim.param_groups[0]["lr"] = base_lr                              # expert
+            optim.param_groups[1]["lr"] = base_lr * _TEMPORAL_LR_MULTIPLIER    # temporal
 
             # Forward pass
             losses = model(observation, actions)
@@ -609,8 +828,11 @@ def train_loop(config: _config.TrainConfig):
             if global_step < 5 and is_main and torch.cuda.is_available():
                 log_memory_usage(device, global_step, "after_backward")
 
-            # Gradient clipping
-            grad_norm = torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=config.optimizer.clip_gradient_norm)
+            # Grouped gradient clipping — temporal and expert clipped independently
+            _clip_norm = config.optimizer.clip_gradient_norm
+            expert_grad_norm = torch.nn.utils.clip_grad_norm_(expert_params, max_norm=_clip_norm)
+            temporal_grad_norm = torch.nn.utils.clip_grad_norm_(temporal_params, max_norm=_clip_norm)
+            grad_norm = (expert_grad_norm ** 2 + temporal_grad_norm ** 2) ** 0.5
 
             # Optimizer step
             optim.step()
@@ -635,6 +857,8 @@ def train_loop(config: _config.TrainConfig):
                         "loss": reduced_loss.item(),
                         "learning_rate": optim.param_groups[0]["lr"],
                         "grad_norm": float(grad_norm) if isinstance(grad_norm, torch.Tensor) else grad_norm,
+                        "expert_grad_norm": float(expert_grad_norm) if isinstance(expert_grad_norm, torch.Tensor) else expert_grad_norm,
+                        "temporal_grad_norm": float(temporal_grad_norm) if isinstance(temporal_grad_norm, torch.Tensor) else temporal_grad_norm,
                     }
                 )
 
@@ -645,18 +869,24 @@ def train_loop(config: _config.TrainConfig):
                 avg_loss = sum(info["loss"] for info in infos) / len(infos)
                 avg_lr = sum(info["learning_rate"] for info in infos) / len(infos)
 
-                avg_grad_norm = None
-                if any("grad_norm" in info for info in infos):
-                    vals = [
-                        info["grad_norm"] for info in infos if "grad_norm" in info and info["grad_norm"] is not None
-                    ]
-                    if len(vals) > 0:
-                        avg_grad_norm = sum(vals) / len(vals)
-                logging.info(
-                    f"step={global_step} loss={avg_loss:.4f} lr={avg_lr:.2e} grad_norm={avg_grad_norm:.2f} time={elapsed:.1f}s"
-                    if avg_grad_norm is not None
-                    else f"step={global_step} loss={avg_loss:.4f} lr={avg_lr:.2e} time={elapsed:.1f}s"
-                )
+                def _avg_key(key):
+                    vals = [info[key] for info in infos if key in info and info[key] is not None]
+                    return sum(vals) / len(vals) if vals else None
+
+                avg_grad_norm = _avg_key("grad_norm")
+                avg_expert_grad = _avg_key("expert_grad_norm")
+                avg_temporal_grad = _avg_key("temporal_grad_norm")
+                grad_ratio = (avg_expert_grad / max(avg_temporal_grad, 1e-8)) if avg_expert_grad and avg_temporal_grad else None
+
+                parts = [f"step={global_step}", f"loss={avg_loss:.4f}", f"lr={avg_lr:.2e}"]
+                if avg_grad_norm is not None:
+                    parts.append(f"grad={avg_grad_norm:.2f}")
+                if avg_expert_grad is not None and avg_temporal_grad is not None:
+                    parts.append(f"expert_g={avg_expert_grad:.3f}")
+                    parts.append(f"temporal_g={avg_temporal_grad:.4f}")
+                    parts.append(f"ratio={grad_ratio:.0f}x")
+                parts.append(f"time={elapsed:.1f}s")
+                logging.info(" ".join(parts))
 
                 # Log to wandb
                 if config.wandb_enabled and len(infos) > 0:
@@ -668,6 +898,12 @@ def train_loop(config: _config.TrainConfig):
                     }
                     if avg_grad_norm is not None:
                         log_payload["grad_norm"] = avg_grad_norm
+                    if avg_expert_grad is not None:
+                        log_payload["expert_grad_norm"] = avg_expert_grad
+                    if avg_temporal_grad is not None:
+                        log_payload["temporal_grad_norm"] = avg_temporal_grad
+                    if grad_ratio is not None:
+                        log_payload["grad_ratio"] = grad_ratio
                     wandb.log(log_payload, step=global_step)
 
                 start_time = time.time()

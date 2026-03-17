@@ -282,7 +282,11 @@ class BaseModelConfig(abc.ABC):
     def load_pytorch(self, train_config, weight_path: str):
         logger.info(f"train_config: {train_config}")
         model = pi0_pytorch.PI0Pytorch(config=train_config.model)
-        safetensors.torch.load_model(model, weight_path)
+        missing, unexpected = safetensors.torch.load_model(model, weight_path, strict=False)
+        if missing:
+            logger.info(f"load_pytorch: {len(missing)} missing keys (new temporal modules, will use init)")
+        if unexpected:
+            logger.warning(f"load_pytorch: {len(unexpected)} unexpected keys: {unexpected[:5]}")
         return model
 
     @abc.abstractmethod

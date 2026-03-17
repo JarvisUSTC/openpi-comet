@@ -28,6 +28,7 @@ import time
 
 import numpy as np
 import torch
+from torch import nn
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "src"))
 
@@ -212,11 +213,17 @@ def run_step3(args):
     print("\n  Test 2: K=1 时 temporal attention 输出为 0")
     try:
         from transformers.models.siglip.modeling_siglip import (
-            temporal_causal_attention,
+            TemporalCausalAttentionModule,
         )
+        from transformers.models.siglip.configuration_siglip import SiglipVisionConfig
+
+        cfg = SiglipVisionConfig(hidden_size=1152, num_attention_heads=16)
+        module = TemporalCausalAttentionModule(cfg)
+        module.eval()
 
         x = torch.randn(2, 256, 1152)  # [B*1, n, d]
-        out = temporal_causal_attention(x, num_frames=1, num_heads=16)
+        with torch.no_grad():
+            out = module(x, num_frames=1)
         assert torch.allclose(out, torch.zeros_like(out), atol=1e-5), \
             f"K=1 时输出不为 0, max abs = {out.abs().max().item()}"
         print("    ✅ 通过")
@@ -227,9 +234,19 @@ def run_step3(args):
     # --- Test 3: 输出 shape 正确 ---
     print("\n  Test 3: 输出 shape 正确")
     try:
+        from transformers.models.siglip.modeling_siglip import (
+            TemporalCausalAttentionModule,
+        )
+        from transformers.models.siglip.configuration_siglip import SiglipVisionConfig
+
+        cfg = SiglipVisionConfig(hidden_size=1152, num_attention_heads=16)
+        module = TemporalCausalAttentionModule(cfg)
+        module.eval()
+
         B, K, n, d = 2, 6, 256, 1152
         x = torch.randn(B * K, n, d)
-        out = temporal_causal_attention(x, num_frames=K, num_heads=16)
+        with torch.no_grad():
+            out = module(x, num_frames=K)
         assert out.shape == (B * K, n, d), f"Shape 错误: {out.shape}"
         print("    ✅ 通过")
         passed += 1
@@ -239,19 +256,31 @@ def run_step3(args):
     # --- Test 4: 因果性——修改未来帧不影响过去帧 ---
     print("\n  Test 4: 因果性 (修改未来帧不影响过去帧)")
     try:
-        B, K, n, d = 1, 4, 64, 1152  # 用小 n 加速
+        from transformers.models.siglip.modeling_siglip import (
+            TemporalCausalAttentionModule,
+        )
+        from transformers.models.siglip.configuration_siglip import SiglipVisionConfig
+
+        cfg = SiglipVisionConfig(hidden_size=1152, num_attention_heads=16)
+        module = TemporalCausalAttentionModule(cfg)
+        # out_proj is zero-init by design; set to non-zero to test causality
+        torch.manual_seed(777)
+        nn.init.xavier_uniform_(module.out_proj.weight)
+        module.eval()
+
+        B, K, n, d = 1, 4, 64, 1152
         torch.manual_seed(123)
         x = torch.randn(B * K, n, d)
-        out1 = temporal_causal_attention(x.clone(), num_frames=K, num_heads=16)
+        with torch.no_grad():
+            out1 = module(x.clone(), num_frames=K)
 
         x_modified = x.clone()
-        x_modified[-1] = torch.randn(n, d)  # 修改最后一帧（当前帧）
-        out2 = temporal_causal_attention(x_modified, num_frames=K, num_heads=16)
+        x_modified[-1] = torch.randn(n, d)
+        with torch.no_grad():
+            out2 = module(x_modified, num_frames=K)
 
-        # 前 3 帧的输出不应变化
         assert torch.allclose(out1[:3], out2[:3], atol=1e-5), \
             f"因果性违反: 前 3 帧 max diff = {(out1[:3] - out2[:3]).abs().max().item()}"
-        # 最后一帧的输出应该变化
         assert not torch.allclose(out1[-1:], out2[-1:], atol=1e-3), \
             "最后一帧应该变化但没变"
         print("    ✅ 通过")
@@ -328,10 +357,14 @@ def run_step4(args):
         print(f"    ❌ 失败: {e}")
 
     # --- Test C: 同一图重复 K 次，输出应接近单帧 ---
-    print("\n  Test C: 同一图重复 K 次 vs 单帧")
+    # NOTE: Must call _init_temporal_from_spatial to zero out_proj, because
+    # HuggingFace post_init() overwrites __init__'s zero-init with lecun_normal_.
+    print("\n  Test C: 同一图重复 K 次 vs 单帧 (需先 _init_temporal_from_spatial)")
     try:
         config = pi0_config.Pi0Config(pi05=True, action_horizon=32, video_memory_frames=6)
         model = _load_model_with_saved_weights(config)
+        siglip_encoder = model.paligemma_with_expert.paligemma.vision_tower.vision_model.encoder
+        siglip_encoder._init_temporal_from_spatial()
 
         B, K = 1, 6
         torch.manual_seed(99)

@@ -147,14 +147,14 @@ def build_orchestrator_levels_from_annotations(
         return output_data
 
     def _parse_frame_duration(fd) -> tuple[int, int] | None:
-        """Parse frame_duration as [start, end] or [[start, end]]; return (start, end) or None."""
+        """Parse frame_duration as [start, end]; return (start, end) or None.
+        Multi-segment format like [[0,50],[100,150]] is not supported and returns None (will be filtered out).
+        """
         if fd is None or not isinstance(fd, (list, tuple)) or len(fd) < 2:
             return None
         a, b = fd[0], fd[1]
-        if isinstance(a, (list, tuple)):
-            a = a[0] if len(a) > 0 else 0
-        if isinstance(b, (list, tuple)):
-            b = b[0] if len(b) > 0 else 0
+        if isinstance(a, (list, tuple)) or isinstance(b, (list, tuple)):
+            return None
         try:
             return int(a), int(b)
         except (TypeError, ValueError):
@@ -164,6 +164,8 @@ def build_orchestrator_levels_from_annotations(
     for i, s in enumerate(skill_annotation):
         task_text = format_skill_prompt(s)
         parsed = _parse_frame_duration(s.get("frame_duration")) if "frame_duration" in s else None
+        if "frame_duration" in s and parsed is None:
+            continue
         if parsed is not None:
             start_f, end_f = parsed
             end_frame = min(end_f - 1, episode_len - 1) if end_f > 0 else episode_len - 1
@@ -181,6 +183,9 @@ def build_orchestrator_levels_from_annotations(
             "start_frame": start_frame,
             "end_frame": end_frame,
         })
+    if not output_data[1]:
+        output_data[1] = list(output_data[0])
+        output_data[2] = list(output_data[0])
     output_data[3] = list(output_data[2])
     return output_data
 
@@ -328,8 +333,9 @@ class BehaviorLeRobotDataset(LeRobotDataset):
                 self.current_streaming_chunk_idx = None
                 self.current_streaming_frame_idx = None
             else:
+                self._active_chunks = list(self.chunks)
                 self.current_streaming_chunk_idx = 0
-                self.current_streaming_frame_idx = self.chunks[self.current_streaming_chunk_idx][0]
+                self.current_streaming_frame_idx = self._active_chunks[self.current_streaming_chunk_idx][0]
             self.obs_loaders = dict()
             self._should_obs_loaders_reload = True
         # record the positional index of each episode index within self.episodes
@@ -505,13 +511,21 @@ class BehaviorLeRobotDataset(LeRobotDataset):
             worker_info = get_worker_info()
             worker_id = 0 if worker_info is None else worker_info.id
             num_workers = 1 if worker_info is None else worker_info.num_workers
+            # Use DDP rank/world_size injected by data_loader.py (set before DataLoader
+            # creation in the main process, so it survives pickling to worker processes).
+            rank = getattr(self, "_ddp_rank", 0)
+            world_size = getattr(self, "_ddp_world_size", 1)
+            worker_seed = self.seed + worker_id * world_size + rank
             if not hasattr(self, "_active_chunks") or self._active_chunks is None:
-                indices = list(range(worker_id, len(self.chunks), num_workers))
+                # Distribute chunks across both DDP ranks and DataLoader workers
+                global_worker_id = rank * num_workers + worker_id
+                total_workers = world_size * num_workers
+                indices = list(range(global_worker_id, len(self.chunks), total_workers))
                 worker_chunks = [self.chunks[i] for i in indices]
-                rng = np.random.default_rng(self.seed + worker_id)
+                rng = np.random.default_rng(worker_seed)
                 rng.shuffle(worker_chunks)
                 self._active_chunks = worker_chunks
-            rng = np.random.default_rng(self.seed + worker_id)
+            rng = np.random.default_rng(worker_seed)
             self.current_streaming_chunk_idx = rng.integers(0, len(self._active_chunks)).item()
             self.current_streaming_frame_idx = self._active_chunks[self.current_streaming_chunk_idx][0]
         # Current chunk iterated, move to next chunk

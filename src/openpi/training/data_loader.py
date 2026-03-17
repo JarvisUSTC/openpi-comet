@@ -128,29 +128,43 @@ class FakeDataset(Dataset):
 class VideoMemoryDataset(Dataset):
     """Wraps a dataset to provide K historical frames per camera.
 
-    Maintains a per-episode frame buffer. The returned item contains extra keys
-    like ``{cam_key}_history`` with a list of K-1 historical frames (oldest first).
-    If fewer than K-1 frames are available, the earliest frame is repeated.
+    Maintains a per-episode frame buffer with LRU eviction. The returned item
+    contains extra keys like ``{cam_key}_history`` with a list of K-1 historical
+    frames (oldest first). If fewer than K-1 frames are available, the earliest
+    frame is repeated.
 
-    Works with both raw keys (``observation.images.rgb.head``) and repacked keys
-    (``observation/egocentric_camera``). Specify ``camera_keys`` to control which
-    keys to buffer.
+    NOTE: This relies on the underlying BehaviorLeRobotDataset streaming mode
+    which returns frames sequentially within 250-frame chunks (ignoring the
+    ``idx`` parameter passed by DataLoader). The buffer therefore accumulates
+    correctly within each chunk regardless of DataLoader shuffle settings.
+    At chunk boundaries there is a ~(K-1)*stride frame warm-up where history
+    is partially padded — this is expected and typically covers <5% of frames.
     """
 
-    # Default camera keys (raw B1K dataset keys, before repack)
     _DEFAULT_CAMERA_KEYS = (
         "observation.images.rgb.head",
         "observation.images.rgb.left_wrist",
         "observation.images.rgb.right_wrist",
     )
+    _MAX_EPISODES_CACHED = 32
 
     def __init__(self, dataset: Dataset, num_frames: int, stride: int = 1, camera_keys: Sequence[str] | None = None):
         self._dataset = dataset
         self._num_frames = num_frames
         self._stride = max(1, stride)
         self._camera_keys = camera_keys or self._DEFAULT_CAMERA_KEYS
-        self._buffers: dict[int, dict[str, list]] = {}
+        from collections import OrderedDict
+        self._buffers: "OrderedDict[int, dict[str, list]]" = OrderedDict()
+        self._last_frame_idx: dict[int, int] = {}
         self._max_buffer = (num_frames - 1) * self._stride + 1
+        self._stats_total = 0
+        self._stats_valid = 0
+
+    def _get_frame_idx(self, item) -> int:
+        ts = item.get("timestamp")
+        if ts is not None:
+            return round(float(ts.item() if hasattr(ts, "item") else ts) * 30)
+        return -1
 
     def __getitem__(self, index):
         item = self._dataset[index]
@@ -161,9 +175,23 @@ class VideoMemoryDataset(Dataset):
         if hasattr(ep_idx, "item"):
             ep_idx = ep_idx.item()
 
-        if ep_idx not in self._buffers:
-            self._buffers = {}
+        frame_idx = self._get_frame_idx(item)
+
+        if ep_idx in self._buffers:
+            self._buffers.move_to_end(ep_idx)
+            if ep_idx in self._last_frame_idx and frame_idx >= 0:
+                gap = abs(frame_idx - self._last_frame_idx[ep_idx])
+                if gap > self._stride + 1:
+                    self._buffers[ep_idx] = {}
+        else:
             self._buffers[ep_idx] = {}
+            while len(self._buffers) > self._MAX_EPISODES_CACHED:
+                oldest_key = next(iter(self._buffers))
+                del self._buffers[oldest_key]
+                self._last_frame_idx.pop(oldest_key, None)
+
+        if frame_idx >= 0:
+            self._last_frame_idx[ep_idx] = frame_idx
 
         for cam_key in self._camera_keys:
             if cam_key not in item:
@@ -194,6 +222,16 @@ class VideoMemoryDataset(Dataset):
             item[f"{cam_key}_history"] = sampled
             item[f"{cam_key}_history_valid"] = valid_flags
 
+        self._stats_total += 1
+        if valid_flags and all(valid_flags):
+            self._stats_valid += 1
+        if self._stats_total > 0 and self._stats_total % 5000 == 0:
+            pct = self._stats_valid / self._stats_total * 100
+            logging.info(
+                "VideoMemoryDataset: %d/%d (%.1f%%) samples have full history",
+                self._stats_valid, self._stats_total, pct,
+            )
+
         return item
 
     def __len__(self):
@@ -219,7 +257,7 @@ def create_behavior_dataset(data_config: _config.DataConfig, action_horizon: int
         delta_timestamps={key: [t / 30.0 for t in range(action_horizon)] for key in data_config.action_sequence_keys},
         episodes=data_config.episodes_index,
         chunk_streaming_using_keyframe=True,
-        shuffle=True,
+        shuffle=False,
         fine_grained_level=data_config.fine_grained_level,
         return_seg_instance=data_config.return_seg_instance,
         train_rgb_type=data_config.train_rgb_type,
@@ -436,6 +474,33 @@ def create_behavior_data_loader(
     return DataLoaderImpl(data_config, data_loader)
 
 
+def _inject_ddp_rank(dataset, rank: int, world_size: int) -> None:
+    """Inject DDP rank/world_size into BehaviorLeRobotDataset instances.
+
+    Worker processes spawned by DataLoader don't have torch.distributed
+    initialized, so we store rank info as attributes on the dataset object
+    before the DataLoader pickles it to workers.
+    """
+    from behavior.learning.datas.dataset import BehaviorLeRobotDataset, MultiBehaviorLeRobotDataset
+
+    # Unwrap TransformedDataset layers
+    inner = dataset
+    while hasattr(inner, "_dataset"):
+        inner = inner._dataset
+
+    if isinstance(inner, MultiBehaviorLeRobotDataset):
+        for ds in inner.datasets:
+            sub = ds
+            while hasattr(sub, "_dataset"):
+                sub = sub._dataset
+            if isinstance(sub, BehaviorLeRobotDataset):
+                sub._ddp_rank = rank
+                sub._ddp_world_size = world_size
+    elif isinstance(inner, BehaviorLeRobotDataset):
+        inner._ddp_rank = rank
+        inner._ddp_world_size = world_size
+
+
 def create_torch_behavior_data_loader(
     config: _config.TrainConfig,
     action_horizon: int,
@@ -479,14 +544,20 @@ def create_torch_behavior_data_loader(
 
     sampler = None
     if torch.distributed.is_initialized():
+        rank = torch.distributed.get_rank()
+        world_size = torch.distributed.get_world_size()
         sampler = torch.utils.data.distributed.DistributedSampler(
             dataset,
-            num_replicas=torch.distributed.get_world_size(),
-            rank=torch.distributed.get_rank(),
+            num_replicas=world_size,
+            rank=rank,
             shuffle=shuffle,
             drop_last=True,
         )
-        local_batch_size = batch_size // torch.distributed.get_world_size()
+        local_batch_size = batch_size // world_size
+        # Inject DDP rank into the underlying BehaviorLeRobotDataset so that
+        # worker processes (where torch.distributed is NOT initialized) can
+        # still differentiate data across GPUs.
+        _inject_ddp_rank(dataset, rank, world_size)
     else:
         local_batch_size = batch_size
 

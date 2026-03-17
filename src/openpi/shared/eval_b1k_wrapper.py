@@ -251,14 +251,14 @@ class B1KPolicyWrapper:
         # Separate cleanly from the main task prompt.
         return (prompt.rstrip() + "\n\n" + wm_block).strip()
 
-    def _buffer_frame(self, cam_name: str, frame: np.ndarray) -> list[np.ndarray]:
-        """Buffer a frame and return K-1 history frames (oldest first) for MEM.
+    def _buffer_frame(self, cam_name: str, frame: np.ndarray) -> tuple[list[np.ndarray], list[bool]]:
+        """Buffer a frame and return (K-1 history frames, K-1 valid flags) for MEM.
 
-        Returns empty list if video_memory_frames <= 1.
+        Returns ([], []) if video_memory_frames <= 1.
         """
         K = self.video_memory_frames
         if K <= 1:
-            return []
+            return [], []
 
         if cam_name not in self._frame_buffers:
             self._frame_buffers[cam_name] = deque(maxlen=self._frame_buffer_maxlen)
@@ -267,13 +267,16 @@ class B1KPolicyWrapper:
 
         available = list(buf)[:-1]
         sampled = []
+        valid_flags = []
         for i in range(K - 1, 0, -1):
             idx = len(available) - i * self.video_memory_stride
             if idx < 0:
                 sampled.append(available[0] if available else frame)
+                valid_flags.append(False)
             else:
                 sampled.append(available[idx])
-        return sampled
+                valid_flags.append(True)
+        return sampled, valid_flags
 
     def process_obs(self, obs: dict) -> dict:
         """
@@ -311,13 +314,18 @@ class B1KPolicyWrapper:
 
         # MEM: buffer each camera frame for video memory
         if self.video_memory_frames > 1:
-            head_hist = self._buffer_frame("head", img_obs[0, 0])
-            left_hist = self._buffer_frame("left_wrist", img_obs[0, 1])
-            right_hist = self._buffer_frame("right_wrist", img_obs[0, 2])
+            head_hist, head_valid = self._buffer_frame("head", img_obs[0, 0])
+            left_hist, left_valid = self._buffer_frame("left_wrist", img_obs[0, 1])
+            right_hist, right_valid = self._buffer_frame("right_wrist", img_obs[0, 2])
             processed_obs["_frame_history"] = {
                 "head": head_hist,
                 "left_wrist": left_hist,
                 "right_wrist": right_hist,
+            }
+            processed_obs["_frame_history_valid"] = {
+                "head": head_valid,
+                "left_wrist": left_valid,
+                "right_wrist": right_valid,
             }
 
         if isinstance(obs, dict) and self.prompt_key in obs:
@@ -349,12 +357,17 @@ class B1KPolicyWrapper:
             "prompt": prompt,
         }
 
-        # MEM: attach frame history from process_obs
+        # MEM: attach frame history + valid flags from process_obs
         if self.video_memory_frames > 1 and "_frame_history" in nbatch:
             fh = nbatch["_frame_history"]
             batch["observation/egocentric_camera_history"] = fh["head"]
             batch["observation/wrist_image_left_history"] = fh["left_wrist"]
             batch["observation/wrist_image_right_history"] = fh["right_wrist"]
+            if "_frame_history_valid" in nbatch:
+                fv = nbatch["_frame_history_valid"]
+                batch["observation/egocentric_camera_history_valid"] = fv["head"]
+                batch["observation/wrist_image_left_history_valid"] = fv["left_wrist"]
+                batch["observation/wrist_image_right_history_valid"] = fv["right_wrist"]
 
         if self.wm_in_prompt and "working_memory" in nbatch:
             batch["working_memory"] = nbatch["working_memory"]

@@ -64,11 +64,38 @@ class Policy(BasePolicy):
             self._sample_actions = nnx_utils.module_jit(model.sample_actions)
             self._rng = rng or jax.random.key(0)
 
+    _debug_count = 0
+
     @override
     def infer(self, obs: dict, *, noise: np.ndarray | None = None) -> dict:  # type: ignore[misc]
         # Make a copy since transformations may modify the inputs in place.
         inputs = jax.tree.map(lambda x: x, obs)
+
+        do_debug = Policy._debug_count < 3
+        if do_debug:
+            logging.info(f"[DEBUG infer #{Policy._debug_count}] === PRE-TRANSFORM ===")
+            for k, v in obs.items():
+                if isinstance(v, np.ndarray):
+                    logging.info(f"  obs[{k}]: shape={v.shape}, dtype={v.dtype}, min={v.min():.4f}, max={v.max():.4f}")
+                elif isinstance(v, list):
+                    logging.info(f"  obs[{k}]: list len={len(v)}")
+                    if len(v) > 0 and isinstance(v[0], np.ndarray):
+                        logging.info(f"    [0]: shape={v[0].shape}, dtype={v[0].dtype}, min={v[0].min():.4f}, max={v[0].max():.4f}")
+                else:
+                    logging.info(f"  obs[{k}]: {type(v).__name__} = {v}")
+
         inputs = self._input_transform(inputs)
+
+        if do_debug:
+            logging.info(f"[DEBUG infer #{Policy._debug_count}] === POST-TRANSFORM (before batch) ===")
+            for k, v in inputs.items():
+                if isinstance(v, np.ndarray):
+                    logging.info(f"  inputs[{k}]: shape={v.shape}, dtype={v.dtype}, min={v.min():.6f}, max={v.max():.6f}")
+                elif isinstance(v, dict):
+                    for kk, vv in v.items():
+                        if isinstance(vv, np.ndarray):
+                            logging.info(f"  inputs[{k}][{kk}]: shape={vv.shape}, dtype={vv.dtype}, min={vv.min():.6f}, max={vv.max():.6f}")
+
         if not self._is_pytorch_model:
             # Make a batch and convert to jax.Array.
             inputs = jax.tree.map(lambda x: jnp.asarray(x)[np.newaxis, ...], inputs)
@@ -98,7 +125,30 @@ class Policy(BasePolicy):
         else:
             outputs = jax.tree.map(lambda x: np.asarray(x[0, ...]), outputs)
 
+        if do_debug:
+            logging.info(f"[DEBUG infer #{Policy._debug_count}] === RAW MODEL OUTPUT (before output_transform) ===")
+            if "actions" in outputs:
+                a = outputs["actions"]
+                logging.info(f"  actions: shape={a.shape}, dtype={a.dtype}, min={a.min():.6f}, max={a.max():.6f}")
+                logging.info(f"  actions[0,:5]={a[0,:5]}")
+            if "state" in outputs:
+                s = outputs["state"]
+                logging.info(f"  state: shape={s.shape}, min={s.min():.6f}, max={s.max():.6f}")
+
         outputs = self._output_transform(outputs)
+
+        if do_debug:
+            logging.info(f"[DEBUG infer #{Policy._debug_count}] === FINAL OUTPUT (after unnorm) ===")
+            if "actions" in outputs:
+                a = outputs["actions"]
+                logging.info(f"  actions: shape={a.shape}, dtype={a.dtype}, min={a.min():.6f}, max={a.max():.6f}")
+                logging.info(f"  actions[0,:5]={a[0,:5]}")
+                logging.info(f"  actions[0,-2:]={a[0,-2:]}  (grippers)")
+                logging.info(f"  === base actions across 32 steps (dim 0,1,2) ===")
+                for t in range(min(a.shape[0], 32)):
+                    logging.info(f"    t={t:2d}: base=[{a[t,0]:+.4f}, {a[t,1]:+.4f}, {a[t,2]:+.4f}]  trunk0={a[t,3]:+.4f}")
+            Policy._debug_count += 1
+
         outputs["policy_timing"] = {
             "infer_ms": model_time * 1000,
         }
