@@ -2,6 +2,7 @@ import dataclasses
 import functools
 import logging
 import platform
+import time
 from typing import Any
 
 import etils.epath as epath
@@ -28,6 +29,112 @@ import openpi.training.utils as training_utils
 import openpi.training.weight_loaders as _weight_loaders
 
 _PROMPT_LOG_INTERVAL = 10
+
+
+def _count_array_elements_and_bytes(x: Any) -> tuple[int, int]:
+    if isinstance(x, jax.ShapeDtypeStruct):
+        shape = x.shape
+        dtype = np.dtype(x.dtype)
+    elif hasattr(x, "shape") and hasattr(x, "dtype"):
+        shape = x.shape
+        dtype = np.dtype(x.dtype)
+    else:
+        return 0, 0
+    numel = int(np.prod(shape)) if len(shape) > 0 else 1
+    return numel, numel * int(dtype.itemsize)
+
+
+def _count_params_in_state(state: nnx.State) -> tuple[int, int, dict[str, int]]:
+    """Returns (num_params, num_bytes, path->num_params)."""
+    flat = traverse_util.flatten_dict(state.to_pure_dict())
+    num_params = 0
+    num_bytes = 0
+    per_path: dict[str, int] = {}
+    for key, value in flat.items():
+        path = "/".join(str(p) for p in key)
+        n, b = _count_array_elements_and_bytes(value)
+        num_params += n
+        num_bytes += b
+        if n:
+            per_path[path] = n
+    return num_params, num_bytes, per_path
+
+
+def _log_trainable_params_summary(config: _config.TrainConfig, state: training_utils.TrainState) -> None:
+    total_n, total_b, _ = _count_params_in_state(state.params)
+    trainable_state = state.params.filter(config.trainable_filter)
+    train_n, train_b, train_paths = _count_params_in_state(trainable_state)
+
+    lora_n = sum(n for p, n in train_paths.items() if "lora" in p.lower())
+    lora_frac = (lora_n / train_n) if train_n else 0.0
+    frac = (train_n / total_n) if total_n else 0.0
+
+    logging.info(
+        "Params: trainable=%s (%.3f%%) total=%s | trainable_bytes=%.2f GiB total_bytes=%.2f GiB | trainable_lora_coverage=%.1f%%",
+        f"{train_n:,}",
+        100.0 * frac,
+        f"{total_n:,}",
+        train_b / (1024**3),
+        total_b / (1024**3),
+        100.0 * lora_frac,
+    )
+
+    largest = sorted(train_paths.items(), key=lambda kv: kv[1], reverse=True)[:15]
+    if largest:
+        logging.info("Largest trainable params (top 15):")
+        for path, n in largest:
+            logging.info("  %s: %s", path, f'{n:,}')
+
+    if "lora" in getattr(config.model, "paligemma_variant", "").lower() or "lora" in getattr(
+        config.model, "action_expert_variant", ""
+    ).lower():
+        if frac > 0.10:
+            logging.warning(
+                "Trainable parameter fraction looks high for LoRA training (%.2f%%). Check `freeze_filter`.",
+                100.0 * frac,
+            )
+
+    try:
+        wandb.log(
+            {
+                "params/total": int(total_n),
+                "params/trainable": int(train_n),
+                "params/trainable_fraction": float(frac),
+                "params/trainable_lora_coverage": float(lora_frac),
+                "params/total_gib": float(total_b / (1024**3)),
+                "params/trainable_gib": float(train_b / (1024**3)),
+            },
+            step=int(jax.device_get(state.step)),
+        )
+    except Exception:
+        logging.exception("Failed to log params summary to wandb")
+
+
+def _make_frozen_spotcheck(
+    config: _config.TrainConfig, state: training_utils.TrainState, *, max_tensors: int = 5, max_numel: int = 2048
+) -> list[tuple[tuple[Any, ...], str, np.ndarray]]:
+    """Captures a few small frozen tensors so we can verify frozen weights stay unchanged."""
+    if config.freeze_filter is nnx.Nothing or getattr(getattr(config.freeze_filter, "__class__", None), "__name__", "") == "Nothing":
+        return []
+
+    frozen_state = state.params.filter(config.freeze_filter)
+    flat = traverse_util.flatten_dict(frozen_state.to_pure_dict())
+    chosen: list[tuple[tuple[Any, ...], str, np.ndarray]] = []
+    for key, value in flat.items():
+        n, _b = _count_array_elements_and_bytes(value)
+        if n <= 0 or n > max_numel:
+            continue
+        path = "/".join(str(p) for p in key)
+        baseline = np.array(jax.device_get(value))
+        chosen.append((key, path, baseline))
+        if len(chosen) >= max_tensors:
+            break
+
+    if chosen:
+        logging.info("Frozen spotcheck tensors (n=%d, max_numel=%d):", len(chosen), max_numel)
+        for _key, path, base in chosen:
+            logging.info("  %s: shape=%s dtype=%s", path, base.shape, base.dtype)
+    return chosen
 
 
 def _decode_prompt_for_logging(observation: Any, tokenizer: _tokenizer.PaligemmaTokenizer) -> str:
@@ -273,9 +380,16 @@ def train_step(
             lambda _, x: x.value.ndim > 1,
         ),
     )
+    trainable_param_norm = optax.global_norm(params)
+    update_norm = optax.global_norm(updates)
+    grad_norm = optax.global_norm(grads)
     info = {
         "loss": loss,
-        "grad_norm": optax.global_norm(grads),
+        "grad_norm": grad_norm,
+        "update_norm": update_norm,
+        "trainable_param_norm": trainable_param_norm,
+        "grad_to_param": grad_norm / (trainable_param_norm + 1e-8),
+        "update_to_param": update_norm / (trainable_param_norm + 1e-8),
         "param_norm": optax.global_norm(kernel_params),
     }
     return new_state, info
@@ -333,12 +447,25 @@ def main(config: _config.TrainConfig):
     if resuming:
         train_state = _checkpoints.restore_state(checkpoint_manager, train_state, data_loader)
 
+    try:
+        _log_trainable_params_summary(config, train_state)
+    except Exception:
+        logging.exception("Failed to compute/log trainable params summary")
+
+    frozen_spotcheck = []
+    try:
+        frozen_spotcheck = _make_frozen_spotcheck(config, train_state)
+    except Exception:
+        logging.exception("Failed to initialize frozen spotcheck")
+
     ptrain_step = jax.jit(
         functools.partial(train_step, config),
         in_shardings=(replicated_sharding, train_state_sharding, data_sharding),
         out_shardings=(train_state_sharding, replicated_sharding),
         donate_argnums=(1,),
     )
+
+    lr_schedule = config.lr_schedule.create()
 
     val_loader = None
     peval_step = None
@@ -374,6 +501,9 @@ def main(config: _config.TrainConfig):
     )
 
     infos = []
+    data_time_accum_s = 0.0
+    last_log_t = time.perf_counter()
+    last_log_step = start_step
     for step in pbar:
         if prompt_tokenizer is not None and (step % _PROMPT_LOG_INTERVAL == 0):
             try:
@@ -405,11 +535,61 @@ def main(config: _config.TrainConfig):
         if step % config.log_interval == 0:
             stacked_infos = common_utils.stack_forest(infos)
             reduced_info = jax.device_get(jax.tree.map(jnp.mean, stacked_infos))
+            jax.block_until_ready(train_state.step)
+
+            now = time.perf_counter()
+            interval_steps = (step - last_log_step) + 1
+            interval_s = now - last_log_t
+            time_per_step_s = interval_s / max(interval_steps, 1)
+            steps_per_sec = interval_steps / max(interval_s, 1e-9)
+
+            data_time_per_step_s = data_time_accum_s / max(interval_steps, 1)
+            data_fraction = data_time_per_step_s / max(time_per_step_s, 1e-9)
+            lr = float(jax.device_get(lr_schedule(step)))
+
+            reduced_info = dict(reduced_info)
+            reduced_info.update(
+                {
+                    "lr": lr,
+                    "time/step_s": float(time_per_step_s),
+                    "time/steps_per_sec": float(steps_per_sec),
+                    "time/examples_per_sec": float(steps_per_sec * config.batch_size),
+                    "time/data_time_s": float(data_time_per_step_s),
+                    "time/data_fraction": float(data_fraction),
+                }
+            )
+
+            if frozen_spotcheck:
+                try:
+                    frozen_flat = traverse_util.flatten_dict(train_state.params.filter(config.freeze_filter).to_pure_dict())
+                    max_abs = 0.0
+                    for key, _path, base in frozen_spotcheck:
+                        cur = np.array(jax.device_get(frozen_flat[key]))
+                        max_abs = max(max_abs, float(np.max(np.abs(cur - base))))
+                    reduced_info["frozen/spotcheck_max_abs_diff"] = max_abs
+                except Exception:
+                    logging.exception("Frozen spotcheck failed at step=%s", step)
+
+            try:
+                ms = jax.devices()[0].memory_stats()
+                if isinstance(ms, dict):
+                    if "bytes_in_use" in ms:
+                        reduced_info["memory/bytes_in_use_gib"] = float(ms["bytes_in_use"] / (1024**3))
+                    if "peak_bytes_in_use" in ms:
+                        reduced_info["memory/peak_bytes_in_use_gib"] = float(ms["peak_bytes_in_use"] / (1024**3))
+            except Exception:
+                pass
+
             info_str = ", ".join(f"{k}={v:.4f}" for k, v in reduced_info.items())
             pbar.write(f"Step {step}: {info_str}")
             wandb.log(reduced_info, step=step)
             infos = []
+            data_time_accum_s = 0.0
+            last_log_t = now
+            last_log_step = step + 1
+        data_t0 = time.perf_counter()
         batch = next(data_iter)
+        data_time_accum_s += time.perf_counter() - data_t0
 
         if (step % config.save_interval == 0 and step > start_step) or step == config.num_train_steps - 1:
             _checkpoints.save_state(checkpoint_manager, train_state, data_loader, step)

@@ -50,6 +50,49 @@ import openpi.training.data_loader as _data_loader
 _PROMPT_LOG_INTERVAL = 10
 
 
+def _log_trainable_params_summary_pytorch(model, *, step: int) -> None:
+    raw_model = model.module if isinstance(model, torch.nn.parallel.DistributedDataParallel) else model
+    total_n = 0
+    train_n = 0
+    train_paths: list[tuple[str, int]] = []
+    for name, p in raw_model.named_parameters():
+        n = int(p.numel())
+        total_n += n
+        if p.requires_grad:
+            train_n += n
+            train_paths.append((name, n))
+
+    frac = (train_n / total_n) if total_n else 0.0
+    lora_n = sum(n for name, n in train_paths if "lora" in name.lower())
+    lora_cov = (lora_n / train_n) if train_n else 0.0
+
+    logging.info(
+        "Params: trainable=%s (%.3f%%) total=%s | trainable_lora_coverage=%.1f%%",
+        f"{train_n:,}",
+        100.0 * frac,
+        f"{total_n:,}",
+        100.0 * lora_cov,
+    )
+    largest = sorted(train_paths, key=lambda kv: kv[1], reverse=True)[:15]
+    if largest:
+        logging.info("Largest trainable params (top 15):")
+        for name, n in largest:
+            logging.info("  %s: %s", name, f"{n:,}")
+
+    try:
+        wandb.log(
+            {
+                "params/total": int(total_n),
+                "params/trainable": int(train_n),
+                "params/trainable_fraction": float(frac),
+                "params/trainable_lora_coverage": float(lora_cov),
+            },
+            step=step,
+        )
+    except Exception:
+        logging.exception("Failed to log params summary to wandb")
+
+
 def _validation_is_enabled(config: _config.TrainConfig) -> bool:
     if config.val_log_interval <= 0 or config.val_num_batches <= 0:
         return False
@@ -562,6 +605,9 @@ def train_loop(config: _config.TrainConfig):
             static_graph=world_size >= 8,  # Enable for 8+ GPUs
         )
 
+    if is_main and config.wandb_enabled:
+        _log_trainable_params_summary_pytorch(model, step=0)
+
     # Load weights from weight_loader if specified (for fine-tuning)
     if config.pytorch_weight_path is not None:
         logging.info(f"Loading weights from: {config.pytorch_weight_path}")
@@ -727,6 +773,8 @@ def train_loop(config: _config.TrainConfig):
                 )
 
             if is_main and (global_step % config.log_interval == 0):
+                if torch.cuda.is_available():
+                    torch.cuda.synchronize(device)
                 elapsed = time.time() - start_time
 
                 # Average stats over log interval
@@ -748,14 +796,30 @@ def train_loop(config: _config.TrainConfig):
 
                 # Log to wandb
                 if config.wandb_enabled and len(infos) > 0:
+                    steps_per_sec = config.log_interval / max(elapsed, 1e-9)
+                    examples_per_sec = steps_per_sec * config.batch_size
                     log_payload = {
                         "loss": avg_loss,
                         "learning_rate": avg_lr,
                         "step": global_step,
-                        "time_per_step": elapsed / config.log_interval,
+                        "time/step_s": elapsed / config.log_interval,
+                        "time/steps_per_sec": steps_per_sec,
+                        "time/examples_per_sec": examples_per_sec,
                     }
                     if avg_grad_norm is not None:
                         log_payload["grad_norm"] = avg_grad_norm
+                    if torch.cuda.is_available():
+                        log_payload.update(
+                            {
+                                "memory/allocated_gib": float(
+                                    torch.cuda.memory_allocated(device) / (1024**3)
+                                ),
+                                "memory/reserved_gib": float(torch.cuda.memory_reserved(device) / (1024**3)),
+                                "memory/max_allocated_gib": float(
+                                    torch.cuda.max_memory_allocated(device) / (1024**3)
+                                ),
+                            }
+                        )
                     wandb.log(log_payload, step=global_step)
 
                 start_time = time.time()

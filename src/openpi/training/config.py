@@ -20,6 +20,7 @@ import openpi.models.tokenizer as _tokenizer
 import openpi.policies.b1k_policy as b1k_policy
 import openpi.shared.download as _download
 import openpi.shared.normalize as _normalize
+import openpi.shared.nnx_utils as nnx_utils
 import openpi.training.optimizer as _optimizer
 import openpi.training.weight_loaders as weight_loaders
 import openpi.transforms as _transforms
@@ -337,6 +338,22 @@ class LeRobotB1KDataConfig(DataConfigFactory):
             action_sequence_keys=self.action_sequence_keys,
             use_quantile_norm=True,
         )
+
+
+@dataclasses.dataclass(frozen=True)
+class LeRobotB1KSkillDataConfig(LeRobotB1KDataConfig):
+    """LeRobotB1KDataConfig with exposed `skill_list` CLI override.
+
+    `DataConfigFactory.base_config` is suppressed from the tyro CLI, so we expose `skill_list` here
+    to support per-skill (or multi-skill) LoRA training via `--data.skill-list "skill:weight" ...`.
+    """
+
+    skill_list: list[str] = dataclasses.field(default_factory=lambda: ["all"])
+
+    @override
+    def create(self, assets_dirs: pathlib.Path, model_config: _model.BaseModelConfig) -> DataConfig:
+        data_config = super().create(assets_dirs, model_config)
+        return dataclasses.replace(data_config, skill_list=self.skill_list)
 
 
 @dataclasses.dataclass(frozen=True)
@@ -845,6 +862,51 @@ _CONFIGS = [
         freeze_filter=pi0_config.Pi0Config(pi05=True, action_horizon=32).get_freeze_filter(),
         ema_decay=None,
         checkpoint_base_dir="./outputs/checkpoints/pi05_b1k-all_skills",
+        num_workers=8,
+        batch_size=8 * 32,
+    ),
+    TrainConfig(
+        # LoRA fine-tune (skill-filtered). Override via:
+        #   --data.skill-list "open door:1.0"
+        #   --data.skill-list "open door:1.0" "close door:1.0" ...
+        name="pi05_b1k-sampled_single_skill-lora",
+        exp_name="openpi",
+        project_name="B1K",
+        model=pi0_config.Pi0Config(
+            pi05=True,
+            action_horizon=32,
+            paligemma_variant="gemma_2b_lora",
+            action_expert_variant="gemma_300m_lora",
+        ),
+        data=LeRobotB1KSkillDataConfig(
+            repo_id="behavior-1k/2025-challenge-demos",
+            base_config=DataConfig(
+                prompt_from_task=True,
+                behavior_dataset_root="../DATASETS/behavior/2025-challenge-demos",
+                # Train/val split: these are PER-TASK positional episode indices (not global episode ids).
+                episodes_index=list(range(0, 180)),
+                fine_grained_level=1,  # 0, 1, 2
+            ),
+        ),
+        weight_loader=weight_loaders.CheckpointWeightLoader(
+            "/root/Models/pi05_base/params"
+        ),  # hf download in advance
+        num_train_steps=30_000,
+        lr_schedule=_optimizer.CosineDecaySchedule(
+            peak_lr=2.5e-5,
+            decay_steps=30_000,
+        ),
+        # Keep train logging reasonably frequent; run validation less often to limit overhead.
+        log_interval=100,
+        save_interval=5000,
+        val_log_interval=100,
+        val_num_batches=10,
+        val_batch_size=2 * 32,
+        val_episodes_index=list(range(180, 200)),
+        # Freeze everything except LoRA params (true "train LoRA only").
+        freeze_filter=nnx.All(nnx.Param, nnx.Not(nnx_utils.PathRegex(".*lora.*"))),
+        ema_decay=None,
+        checkpoint_base_dir="./outputs/checkpoints/pi05_b1k-sampled_single_skill-lora",
         num_workers=8,
         batch_size=8 * 32,
     ),
