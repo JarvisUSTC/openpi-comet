@@ -78,14 +78,10 @@ def _make_val_config(config: _config.TrainConfig) -> _config.TrainConfig:
     return dataclasses.replace(config, batch_size=val_batch_size, data=val_data)
 
 
-# Temporal attention params get a larger LR to compensate for gradient
-# attenuation through frozen backbone layers.  Adjust based on wandb
-# grad_ratio logs (expert_grad / temporal_grad).
-_TEMPORAL_LR_MULTIPLIER = 8.0
-
-# Parameter name patterns that should remain trainable (everything else is frozen)
+# Parameter name patterns that should remain trainable (everything else is frozen).
+# temporal attention is now zero-parameter (v2, aligned with MEM paper) so no
+# temporal_attn entry is needed here.
 _TRAINABLE_PATTERNS = (
-    "temporal_attn",     # temporal attention modules in SigLIP
     "action_in_proj",    # action input projection
     "action_out_proj",   # action output projection
     "time_mlp",          # timestep MLP (pi05)
@@ -97,7 +93,7 @@ _TRAINABLE_PATTERNS = (
 
 
 def _freeze_backbone(model, is_main: bool = True):
-    """Freeze all backbone params; only train temporal attention + action head."""
+    """Freeze all backbone params; only train action head + projections."""
     raw_model = model.module if isinstance(model, torch.nn.parallel.DistributedDataParallel) else model
     total, trainable, frozen = 0, 0, 0
     for name, param in raw_model.named_parameters():
@@ -680,23 +676,14 @@ def train_loop(config: _config.TrainConfig):
         model_to_load = model.module if isinstance(model, torch.nn.parallel.DistributedDataParallel) else model
         missing, unexpected = safetensors.torch.load_model(model_to_load, model_path, strict=False)
         if missing:
-            logging.info(f"Missing keys (new temporal modules, expected): {len(missing)} keys")
+            logging.info(f"Missing keys: {len(missing)} keys")
             for k in missing[:10]:
                 logging.info(f"  {k}")
         if unexpected:
             logging.warning(f"Unexpected keys in checkpoint: {unexpected}")
         logging.info(f"Loaded PyTorch weights from {config.pytorch_weight_path}")
 
-    # Initialize temporal Q/K/V from pretrained spatial attention weights.
-    # Must happen AFTER loading pretrained weights so we clone real values, not random init.
-    raw_model = model.module if isinstance(model, torch.nn.parallel.DistributedDataParallel) else model
-    siglip_encoder = raw_model.paligemma_with_expert.paligemma.vision_tower.vision_model.encoder
-    if hasattr(siglip_encoder, "_init_temporal_from_spatial") and len(siglip_encoder.temporal_attns) > 0:
-        siglip_encoder._init_temporal_from_spatial()
-        if is_main:
-            logging.info("Initialized temporal out_proj from pretrained spatial attention weights (Q/K/V shared)")
-
-    # Freeze backbone, only train temporal attention + action expert + projections
+    # Freeze backbone, only train action expert + projections (temporal attention is zero-parameter)
     _freeze_backbone(model, is_main)
 
     # Optimizer + learning rate schedule from config
@@ -705,25 +692,14 @@ def train_loop(config: _config.TrainConfig):
     decay_steps = config.lr_schedule.decay_steps
     end_lr = config.lr_schedule.decay_lr
 
-    # Split trainable parameters into two groups for independent gradient handling
     logging.info("[DEBUG] [5/6] Creating optimizer...")
-    temporal_params = [p for n, p in model.named_parameters()
-                       if p.requires_grad and "temporal_attn" in n]
-    expert_params = [p for n, p in model.named_parameters()
-                     if p.requires_grad and "temporal_attn" not in n]
+    trainable_params = [p for p in model.parameters() if p.requires_grad]
     if is_main:
-        temporal_numel = sum(p.numel() for p in temporal_params)
-        expert_numel = sum(p.numel() for p in expert_params)
-        logging.info(
-            "Parameter groups: temporal=%.1fM (%d params), expert=%.1fM (%d params)",
-            temporal_numel / 1e6, len(temporal_params),
-            expert_numel / 1e6, len(expert_params),
-        )
+        trainable_numel = sum(p.numel() for p in trainable_params)
+        logging.info("Trainable parameters: %.1fM (%d tensors)", trainable_numel / 1e6, len(trainable_params))
     optim = torch.optim.AdamW(
-        [
-            {"params": expert_params, "lr": peak_lr},
-            {"params": temporal_params, "lr": peak_lr},
-        ],
+        trainable_params,
+        lr=peak_lr,
         betas=(config.optimizer.b1, config.optimizer.b2),
         eps=config.optimizer.eps,
         weight_decay=config.optimizer.weight_decay,
@@ -758,7 +734,7 @@ def train_loop(config: _config.TrainConfig):
         )
         logging.info(f"Memory optimizations: gradient_checkpointing={enable_gradient_checkpointing}")
         logging.info(
-            f"LR schedule: warmup={warmup_steps}, peak_lr={peak_lr:.2e}, decay_steps={decay_steps}, end_lr={end_lr:.2e}, temporal_lr_mult={_TEMPORAL_LR_MULTIPLIER}x"
+            f"LR schedule: warmup={warmup_steps}, peak_lr={peak_lr:.2e}, decay_steps={decay_steps}, end_lr={end_lr:.2e}"
         )
         logging.info(
             f"Optimizer: {type(config.optimizer).__name__}, weight_decay={config.optimizer.weight_decay}, clip_norm={config.optimizer.clip_gradient_norm}"
@@ -838,11 +814,9 @@ def train_loop(config: _config.TrainConfig):
             actions = actions.to(torch.float32)  # noqa: PLW2901
             actions = actions.to(device)  # noqa: PLW2901
 
-            # Update LR — temporal group gets a higher LR to compensate for
-            # gradient attenuation through the frozen backbone.
             base_lr = lr_schedule(global_step)
-            optim.param_groups[0]["lr"] = base_lr                              # expert
-            optim.param_groups[1]["lr"] = base_lr * _TEMPORAL_LR_MULTIPLIER    # temporal
+            for pg in optim.param_groups:
+                pg["lr"] = base_lr
 
             # Forward pass
             losses = model(observation, actions)
@@ -877,11 +851,8 @@ def train_loop(config: _config.TrainConfig):
             if global_step < 5 and is_main and torch.cuda.is_available():
                 log_memory_usage(device, global_step, "after_backward")
 
-            # Grouped gradient clipping — temporal and expert clipped independently
             _clip_norm = config.optimizer.clip_gradient_norm
-            expert_grad_norm = torch.nn.utils.clip_grad_norm_(expert_params, max_norm=_clip_norm)
-            temporal_grad_norm = torch.nn.utils.clip_grad_norm_(temporal_params, max_norm=_clip_norm)
-            grad_norm = (expert_grad_norm ** 2 + temporal_grad_norm ** 2) ** 0.5
+            grad_norm = torch.nn.utils.clip_grad_norm_(trainable_params, max_norm=_clip_norm)
 
             # Optimizer step
             optim.step()
@@ -904,10 +875,8 @@ def train_loop(config: _config.TrainConfig):
                 infos.append(
                     {
                         "loss": reduced_loss.item(),
-                        "learning_rate": optim.param_groups[0]["lr"],
+                        "learning_rate": base_lr,
                         "grad_norm": float(grad_norm) if isinstance(grad_norm, torch.Tensor) else grad_norm,
-                        "expert_grad_norm": float(expert_grad_norm) if isinstance(expert_grad_norm, torch.Tensor) else expert_grad_norm,
-                        "temporal_grad_norm": float(temporal_grad_norm) if isinstance(temporal_grad_norm, torch.Tensor) else temporal_grad_norm,
                     }
                 )
 
@@ -923,17 +892,10 @@ def train_loop(config: _config.TrainConfig):
                     return sum(vals) / len(vals) if vals else None
 
                 avg_grad_norm = _avg_key("grad_norm")
-                avg_expert_grad = _avg_key("expert_grad_norm")
-                avg_temporal_grad = _avg_key("temporal_grad_norm")
-                grad_ratio = (avg_expert_grad / max(avg_temporal_grad, 1e-8)) if avg_expert_grad and avg_temporal_grad else None
 
                 parts = [f"step={global_step}", f"loss={avg_loss:.4f}", f"lr={avg_lr:.2e}"]
                 if avg_grad_norm is not None:
                     parts.append(f"grad={avg_grad_norm:.2f}")
-                if avg_expert_grad is not None and avg_temporal_grad is not None:
-                    parts.append(f"expert_g={avg_expert_grad:.3f}")
-                    parts.append(f"temporal_g={avg_temporal_grad:.4f}")
-                    parts.append(f"ratio={grad_ratio:.0f}x")
                 parts.append(f"time={elapsed:.1f}s")
                 logging.info(" ".join(parts))
 
@@ -947,12 +909,6 @@ def train_loop(config: _config.TrainConfig):
                     }
                     if avg_grad_norm is not None:
                         log_payload["grad_norm"] = avg_grad_norm
-                    if avg_expert_grad is not None:
-                        log_payload["expert_grad_norm"] = avg_expert_grad
-                    if avg_temporal_grad is not None:
-                        log_payload["temporal_grad_norm"] = avg_temporal_grad
-                    if grad_ratio is not None:
-                        log_payload["grad_ratio"] = grad_ratio
                     wandb.log(log_payload, step=global_step)
 
                 start_time = time.time()

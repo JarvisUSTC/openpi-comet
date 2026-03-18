@@ -372,90 +372,62 @@ def temporal_posemb_sincos(K: int, width: int, device: torch.device, max_period:
     return pe
 
 
-class TemporalCausalAttentionModule(nn.Module):
-    """Learnable causal temporal attention across frames at each patch position.
+def temporal_causal_attention(
+    x: torch.Tensor,
+    num_frames: int,
+    num_heads: int,
+    temporal_mask: torch.Tensor | None = None,
+) -> torch.Tensor:
+    """Zero-parameter causal temporal attention (MEM paper, Section III-C).
 
-    Shares Q/K/V projections with the corresponding spatial attention layer
-    (frozen, no new parameters). Only out_proj and LayerNorm are trainable.
-    out_proj is initialized to spatial_out_proj * 0.01 (via
-    init_temporal_from_spatial) so that the temporal residual starts near-zero.
+    Q = x + sinusoidal_PE, K = x + sinusoidal_PE, V = x.
+    No learnable parameters, no projections, no LayerNorm, no Dropout.
+    Returns a residual of shape [B*K, n, d] to be added back to x.
     """
+    if num_frames <= 1:
+        return torch.zeros_like(x)
 
-    def __init__(self, config, spatial_attn):
-        super().__init__()
-        embed_dim = config.hidden_size
-        self.num_heads = config.num_attention_heads
-        self.head_dim = embed_dim // self.num_heads
+    BK, n, d = x.shape
+    B = BK // num_frames
+    K = num_frames
+    head_dim = d // num_heads
 
-        self.layer_norm = nn.LayerNorm(embed_dim, eps=config.layer_norm_eps)
-        # Share Q/K/V with spatial attention (frozen). Stored in a tuple to
-        # avoid registering them as submodules of this nn.Module.
-        self._shared_qkv = (spatial_attn.q_proj, spatial_attn.k_proj, spatial_attn.v_proj)
-        self.out_proj = nn.Linear(embed_dim, embed_dim)
-        self.attn_dropout = nn.Dropout(p=getattr(config, "attention_dropout", 0.1))
-        self.proj_dropout = nn.Dropout(p=0.1)
+    pe = temporal_posemb_sincos(K, d, device=x.device).to(dtype=x.dtype)
+    pe = pe.repeat(B, 1).view(BK, 1, d)
 
-        nn.init.zeros_(self.out_proj.weight)
-        nn.init.zeros_(self.out_proj.bias)
+    q = x + pe
+    k = x + pe
+    v = x
 
-    def forward(
-        self,
-        x: torch.Tensor,
-        num_frames: int,
-        temporal_mask: torch.Tensor | None = None,
-    ) -> torch.Tensor:
-        """Returns residual of shape [B*K, n, d]. Zero when K<=1."""
-        if num_frames <= 1:
-            return torch.zeros_like(x)
+    q = q.view(B, K, n, d).permute(0, 2, 1, 3).reshape(B * n, K, num_heads, head_dim)
+    k = k.view(B, K, n, d).permute(0, 2, 1, 3).reshape(B * n, K, num_heads, head_dim)
+    v = v.view(B, K, n, d).permute(0, 2, 1, 3).reshape(B * n, K, num_heads, head_dim)
 
-        BK, n, d = x.shape
-        B = BK // num_frames
-        K = num_frames
+    q = q.permute(0, 2, 1, 3)  # [B*n, num_heads, K, head_dim]
+    k = k.permute(0, 2, 1, 3)
+    v = v.permute(0, 2, 1, 3)
 
-        h = self.layer_norm(x)
+    scale = head_dim ** -0.5
+    attn = torch.matmul(q, k.transpose(-2, -1)) * scale
 
-        shared_q, shared_k, shared_v = self._shared_qkv
-        q = shared_q(h)
-        k = shared_k(h)
-        v = shared_v(h)
+    causal_mask = torch.triu(torch.ones(K, K, device=x.device, dtype=torch.bool), diagonal=1)
 
-        pe = temporal_posemb_sincos(K, d, device=x.device).to(dtype=x.dtype)
-        pe = pe.repeat(B, 1).view(BK, 1, d)
-        q = q + pe
-        k = k + pe
+    if temporal_mask is not None:
+        padding_mask = ~temporal_mask
+        padding_mask = padding_mask.unsqueeze(1).expand(B, n, K).reshape(B * n, K)
+        padding_mask = padding_mask[:, None, None, :]
+        attn = attn.masked_fill(causal_mask[None, None, :, :] | padding_mask, float("-inf"))
+    else:
+        attn = attn.masked_fill(causal_mask[None, None, :, :], float("-inf"))
 
-        q = q.view(B, K, n, d).permute(0, 2, 1, 3).reshape(B * n, K, self.num_heads, self.head_dim)
-        k = k.view(B, K, n, d).permute(0, 2, 1, 3).reshape(B * n, K, self.num_heads, self.head_dim)
-        v = v.view(B, K, n, d).permute(0, 2, 1, 3).reshape(B * n, K, self.num_heads, self.head_dim)
+    attn = torch.softmax(attn, dim=-1, dtype=torch.float32).to(x.dtype)
+    attn = torch.nan_to_num(attn, nan=0.0)
+    out = torch.matmul(attn, v)
 
-        q = q.permute(0, 2, 1, 3)  # [B*n, num_heads, K, head_dim]
-        k = k.permute(0, 2, 1, 3)
-        v = v.permute(0, 2, 1, 3)
+    out = out.permute(0, 2, 1, 3).reshape(B * n, K, d)
+    out = out.view(B, n, K, d).permute(0, 2, 1, 3).reshape(BK, n, d)
 
-        scale = self.head_dim ** -0.5
-        attn = torch.matmul(q, k.transpose(-2, -1)) * scale
-
-        causal_mask = torch.triu(torch.ones(K, K, device=x.device, dtype=torch.bool), diagonal=1)
-
-        if temporal_mask is not None:
-            padding_mask = ~temporal_mask
-            padding_mask = padding_mask.unsqueeze(1).expand(B, n, K).reshape(B * n, K)
-            padding_mask = padding_mask[:, None, None, :]
-            attn = attn.masked_fill(causal_mask[None, None, :, :] | padding_mask, float("-inf"))
-        else:
-            attn = attn.masked_fill(causal_mask[None, None, :, :], float("-inf"))
-
-        attn = torch.softmax(attn, dim=-1, dtype=torch.float32).to(x.dtype)
-        attn = torch.nan_to_num(attn, nan=0.0)
-        attn = self.attn_dropout(attn)
-        out = torch.matmul(attn, v)
-
-        out = out.permute(0, 2, 1, 3).reshape(B * n, K, d)
-        out = out.view(B, n, K, d).permute(0, 2, 1, 3).reshape(BK, n, d)
-
-        out = self.out_proj(out)
-        out = self.proj_dropout(out)
-        return out
+    return out
 
 
 class SiglipAttention(nn.Module):
@@ -562,7 +534,7 @@ class SiglipEncoderLayer(GradientCheckpointingLayer):
         num_frames: int = 1,
         layer_idx: int = 0,
         temporal_mask: torch.Tensor | None = None,
-        temporal_attn: Optional["TemporalCausalAttentionModule"] = None,
+        has_temporal_attn: bool = False,
     ) -> tuple[torch.FloatTensor]:
         """
         Args:
@@ -578,7 +550,7 @@ class SiglipEncoderLayer(GradientCheckpointingLayer):
             layer_idx (`int`):
                 Index of this layer in the encoder stack.
             temporal_mask: optional [B, K] bool mask for valid frames.
-            temporal_attn: optional TemporalCausalAttentionModule for this layer.
+            has_temporal_attn: whether this layer should apply temporal attention.
         """
         residual = hidden_states
 
@@ -590,9 +562,11 @@ class SiglipEncoderLayer(GradientCheckpointingLayer):
         )
         hidden_states = residual + hidden_states
 
-        if num_frames > 1 and temporal_attn is not None:
-            hidden_states = hidden_states + temporal_attn(
-                hidden_states, num_frames=num_frames, temporal_mask=temporal_mask,
+        if num_frames > 1 and has_temporal_attn:
+            num_heads = self.self_attn.num_heads
+            hidden_states = hidden_states + temporal_causal_attention(
+                hidden_states, num_frames=num_frames, num_heads=num_heads,
+                temporal_mask=temporal_mask,
             )
 
         residual = hidden_states
@@ -687,26 +661,10 @@ class SiglipEncoder(nn.Module):
         super().__init__()
         self.config = config
         self.layers = nn.ModuleList([SiglipEncoderLayer(config) for _ in range(config.num_hidden_layers)])
-        self.temporal_attns = nn.ModuleDict({
-            str(i): TemporalCausalAttentionModule(config, self.layers[i].self_attn)
-            for i in range(config.num_hidden_layers)
-            if (i + 1) % 4 == 0
-        })
+        self._temporal_layer_indices: set[int] = {
+            i for i in range(config.num_hidden_layers) if (i + 1) % 4 == 0
+        }
         self.gradient_checkpointing = False
-
-    def _init_temporal_from_spatial(self):
-        """Initialize temporal out_proj from pretrained spatial attention weights.
-
-        Q/K/V are already shared (same nn.Linear objects as spatial attention).
-        out_proj: scaled copy of spatial out_proj (×0.01), so temporal
-        residual starts near-zero but provides a gradient signal from step 1.
-
-        Must be called AFTER pretrained weights are loaded into the model.
-        """
-        for layer_idx_str, temporal_attn in self.temporal_attns.items():
-            spatial_attn = self.layers[int(layer_idx_str)].self_attn
-            temporal_attn.out_proj.weight.data.copy_(spatial_attn.out_proj.weight.data * 0.01)
-            temporal_attn.out_proj.bias.data.copy_(spatial_attn.out_proj.bias.data * 0.01)
 
     # Ignore copy
     @can_return_tuple
@@ -756,7 +714,6 @@ class SiglipEncoder(nn.Module):
             if output_hidden_states:
                 encoder_states = encoder_states + (hidden_states,)
 
-            temporal_attn = self.temporal_attns[str(layer_idx)] if str(layer_idx) in self.temporal_attns else None
             layer_outputs = encoder_layer(
                 hidden_states,
                 attention_mask,
@@ -764,7 +721,7 @@ class SiglipEncoder(nn.Module):
                 num_frames=num_frames,
                 layer_idx=layer_idx,
                 temporal_mask=temporal_mask,
-                temporal_attn=temporal_attn,
+                has_temporal_attn=(layer_idx in self._temporal_layer_indices),
             )
 
             hidden_states = layer_outputs[0]

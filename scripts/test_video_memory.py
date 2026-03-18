@@ -213,17 +213,12 @@ def run_step3(args):
     print("\n  Test 2: K=1 时 temporal attention 输出为 0")
     try:
         from transformers.models.siglip.modeling_siglip import (
-            TemporalCausalAttentionModule,
+            temporal_causal_attention,
         )
-        from transformers.models.siglip.configuration_siglip import SiglipVisionConfig
-
-        cfg = SiglipVisionConfig(hidden_size=1152, num_attention_heads=16)
-        module = TemporalCausalAttentionModule(cfg)
-        module.eval()
 
         x = torch.randn(2, 256, 1152)  # [B*1, n, d]
         with torch.no_grad():
-            out = module(x, num_frames=1)
+            out = temporal_causal_attention(x, num_frames=1, num_heads=16)
         assert torch.allclose(out, torch.zeros_like(out), atol=1e-5), \
             f"K=1 时输出不为 0, max abs = {out.abs().max().item()}"
         print("    ✅ 通过")
@@ -235,18 +230,13 @@ def run_step3(args):
     print("\n  Test 3: 输出 shape 正确")
     try:
         from transformers.models.siglip.modeling_siglip import (
-            TemporalCausalAttentionModule,
+            temporal_causal_attention,
         )
-        from transformers.models.siglip.configuration_siglip import SiglipVisionConfig
-
-        cfg = SiglipVisionConfig(hidden_size=1152, num_attention_heads=16)
-        module = TemporalCausalAttentionModule(cfg)
-        module.eval()
 
         B, K, n, d = 2, 6, 256, 1152
         x = torch.randn(B * K, n, d)
         with torch.no_grad():
-            out = module(x, num_frames=K)
+            out = temporal_causal_attention(x, num_frames=K, num_heads=16)
         assert out.shape == (B * K, n, d), f"Shape 错误: {out.shape}"
         print("    ✅ 通过")
         passed += 1
@@ -257,27 +247,20 @@ def run_step3(args):
     print("\n  Test 4: 因果性 (修改未来帧不影响过去帧)")
     try:
         from transformers.models.siglip.modeling_siglip import (
-            TemporalCausalAttentionModule,
+            temporal_causal_attention,
         )
-        from transformers.models.siglip.configuration_siglip import SiglipVisionConfig
-
-        cfg = SiglipVisionConfig(hidden_size=1152, num_attention_heads=16)
-        module = TemporalCausalAttentionModule(cfg)
-        # out_proj is zero-init by design; set to non-zero to test causality
-        torch.manual_seed(777)
-        nn.init.xavier_uniform_(module.out_proj.weight)
-        module.eval()
 
         B, K, n, d = 1, 4, 64, 1152
+        num_heads = 16
         torch.manual_seed(123)
         x = torch.randn(B * K, n, d)
         with torch.no_grad():
-            out1 = module(x.clone(), num_frames=K)
+            out1 = temporal_causal_attention(x.clone(), num_frames=K, num_heads=num_heads)
 
         x_modified = x.clone()
         x_modified[-1] = torch.randn(n, d)
         with torch.no_grad():
-            out2 = module(x_modified, num_frames=K)
+            out2 = temporal_causal_attention(x_modified, num_frames=K, num_heads=num_heads)
 
         assert torch.allclose(out1[:3], out2[:3], atol=1e-5), \
             f"因果性违反: 前 3 帧 max diff = {(out1[:3] - out2[:3]).abs().max().item()}"
@@ -357,14 +340,12 @@ def run_step4(args):
         print(f"    ❌ 失败: {e}")
 
     # --- Test C: 同一图重复 K 次，输出应接近单帧 ---
-    # NOTE: Must call _init_temporal_from_spatial to zero out_proj, because
-    # HuggingFace post_init() overwrites __init__'s zero-init with lecun_normal_.
-    print("\n  Test C: 同一图重复 K 次 vs 单帧 (需先 _init_temporal_from_spatial)")
+    # With zero-parameter temporal attention, same-image repeated K times
+    # should produce output close to single-frame (temporal PE is zero for current frame).
+    print("\n  Test C: 同一图重复 K 次 vs 单帧")
     try:
         config = pi0_config.Pi0Config(pi05=True, action_horizon=32, video_memory_frames=6)
         model = _load_model_with_saved_weights(config)
-        siglip_encoder = model.paligemma_with_expert.paligemma.vision_tower.vision_model.encoder
-        siglip_encoder._init_temporal_from_spatial()
 
         B, K = 1, 6
         torch.manual_seed(99)
