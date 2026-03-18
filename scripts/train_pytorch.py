@@ -854,6 +854,22 @@ def train_loop(config: _config.TrainConfig):
 
             loss = losses.mean()
 
+            # 训练诊断：每 100 步打印 pred vs gt
+            if is_main and global_step % 100 == 0:
+                with torch.no_grad():
+                    raw_m = model.module if isinstance(model, torch.nn.parallel.DistributedDataParallel) else model
+                    train_pred = raw_m.sample_actions(device, observation, num_steps=10)
+                    n_s = min(2, train_pred.shape[0])
+                    n_d = min(8, train_pred.shape[-1])
+                    for i in range(n_s):
+                        p = train_pred[i, 0, :n_d].cpu().tolist()
+                        g = actions[i, 0, :n_d].cpu().tolist()
+                        cos = torch.nn.functional.cosine_similarity(
+                            train_pred[i].reshape(1, -1), actions[i].reshape(1, -1)
+                        ).item()
+                        logging.info("[TRAIN step=%d sample %d] pred: [%s]", global_step, i, ", ".join(f"{v:+.4f}" for v in p))
+                        logging.info("[TRAIN step=%d sample %d]   gt: [%s]  cos=%.4f", global_step, i, ", ".join(f"{v:+.4f}" for v in g), cos)
+
             # Backward pass
             loss.backward()
 
