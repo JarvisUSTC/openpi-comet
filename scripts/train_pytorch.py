@@ -24,6 +24,7 @@ Multi-Node Training:
 """
 
 import dataclasses
+import datetime
 import gc
 import logging
 import os
@@ -80,7 +81,7 @@ def _make_val_config(config: _config.TrainConfig) -> _config.TrainConfig:
 # Temporal attention params get a larger LR to compensate for gradient
 # attenuation through frozen backbone layers.  Adjust based on wandb
 # grad_ratio logs (expert_grad / temporal_grad).
-_TEMPORAL_LR_MULTIPLIER = 3.0
+_TEMPORAL_LR_MULTIPLIER = 8.0
 
 # Parameter name patterns that should remain trainable (everything else is frozen)
 _TRAINABLE_PATTERNS = (
@@ -182,7 +183,11 @@ def setup_ddp():
     use_ddp = world_size > 1
     if use_ddp and not torch.distributed.is_initialized():
         backend = "nccl" if torch.cuda.is_available() else "gloo"
-        torch.distributed.init_process_group(backend=backend, init_method="env://")
+        torch.distributed.init_process_group(
+            backend=backend,
+            init_method="env://",
+            timeout=datetime.timedelta(minutes=30),
+        )
 
         # Set up debugging environment variables for DDP issues
         if os.environ.get("TORCH_DISTRIBUTED_DEBUG") is None:
@@ -267,6 +272,12 @@ def reset_val_loader(val_loader):
 @torch.no_grad()
 def validate(model, val_loader, device, config):
     """Run validation and return a dict of metrics."""
+    rng_state = torch.random.get_rng_state()
+    cuda_rng_state = torch.cuda.get_rng_state(device) if torch.cuda.is_available() else None
+    torch.manual_seed(42)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed(42)
+
     raw_model = model.module if isinstance(model, torch.nn.parallel.DistributedDataParallel) else model
     was_training = raw_model.training
     raw_model.eval()
@@ -302,8 +313,30 @@ def validate(model, val_loader, device, config):
 
         first_action_mses.append(torch.mean((pred_actions[:, 0] - actions[:, 0]) ** 2).item())
 
+        if batch_idx == 0:
+            n_samples = min(3, pred_actions.shape[0])
+            n_dims = min(8, pred_actions.shape[-1])
+            for i in range(n_samples):
+                pred_t0 = pred_actions[i, 0, :n_dims].cpu().tolist()
+                gt_t0 = actions[i, 0, :n_dims].cpu().tolist()
+                err_t0 = (pred_actions[i, 0, :n_dims] - actions[i, 0, :n_dims]).abs().cpu().tolist()
+                pred_str = ", ".join(f"{v:+.4f}" for v in pred_t0)
+                gt_str = ", ".join(f"{v:+.4f}" for v in gt_t0)
+                err_str = ", ".join(f"{v:.4f}" for v in err_t0)
+                logging.info("[VAL sample %d] pred: [%s]", i, pred_str)
+                logging.info("[VAL sample %d]   gt: [%s]", i, gt_str)
+                logging.info("[VAL sample %d]  err: [%s]  cos=%.4f", i, err_str, cos_sim[i].item())
+            pred_mean = pred_actions[:n_samples, 0, :n_dims].mean(dim=0).cpu().tolist()
+            gt_std = actions[:n_samples, 0, :n_dims].std(dim=0).cpu().tolist()
+            logging.info("[VAL] pred_mean: [%s]", ", ".join(f"{v:+.4f}" for v in pred_mean))
+            logging.info("[VAL]   gt_std: [%s]", ", ".join(f"{v:.4f}" for v in gt_std))
+
     if was_training:
         raw_model.train()
+
+    torch.random.set_rng_state(rng_state)
+    if cuda_rng_state is not None:
+        torch.cuda.set_rng_state(cuda_rng_state, device)
 
     return {
         "val_loss": float(np.mean(flow_losses)),
@@ -630,9 +663,9 @@ def train_loop(config: _config.TrainConfig):
         model = torch.nn.parallel.DistributedDataParallel(
             model,
             device_ids=[device.index] if device.type == "cuda" else None,
-            find_unused_parameters=True,  # Disable for memory efficiency
-            gradient_as_bucket_view=True,  # Enable for memory efficiency
-            static_graph=world_size >= 8,  # Enable for 8+ GPUs
+            find_unused_parameters=True,
+            gradient_as_bucket_view=True,
+            static_graph=False,
         )
         logging.info("[DEBUG] [3/6] DDP wrapped in %.1fs.", time.time() - _t0)
     else:

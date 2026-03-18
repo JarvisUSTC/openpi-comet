@@ -873,7 +873,7 @@ _CONFIGS = [
         lr_schedule=_optimizer.CosineDecaySchedule(
             peak_lr=2.5e-5,
             decay_steps=150_000,
-            decay_lr=2.5e-6,
+            decay_lr=6.7e-6,
         ),
         skill_resampling=True,
         log_interval=100,

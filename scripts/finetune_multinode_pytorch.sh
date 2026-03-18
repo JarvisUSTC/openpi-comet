@@ -29,6 +29,12 @@ MASTER_ADDR=${master_addr:-localhost}
 MASTER_PORT=${master_port:-29500}
 TOTAL_GPUS=$((NPROC * NNODES))
 
+# NCCL tuning for multi-node training
+export NCCL_TIMEOUT=1800           # 30 min timeout (default 10 min too short for 3-node)
+export NCCL_IB_DISABLE=0           # Enable InfiniBand if available
+export NCCL_SOCKET_IFNAME=eth0     # Network interface (change if your cluster uses a different one)
+export NCCL_DEBUG=WARN             # Show NCCL warnings
+
 echo "============================================"
 echo "Config: ${CONFIG_NAME}"
 echo "Exp name: ${EXP_NAME}"
