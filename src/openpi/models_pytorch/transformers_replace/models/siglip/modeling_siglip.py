@@ -373,44 +373,51 @@ def temporal_posemb_sincos(K: int, width: int, device: torch.device, max_period:
 
 
 def temporal_causal_attention(
-    x: torch.Tensor,
+    hidden_states: torch.Tensor,
     num_frames: int,
     num_heads: int,
+    layer_norm: nn.LayerNorm,
+    q_proj: nn.Linear,
+    k_proj: nn.Linear,
+    v_proj: nn.Linear,
+    out_proj: nn.Linear,
     temporal_mask: torch.Tensor | None = None,
 ) -> torch.Tensor:
-    """Zero-parameter causal temporal attention (MEM paper, Section III-C).
+    """Causal temporal attention reusing existing ViT projections (MEM paper, Section III-C).
 
-    Q = x + sinusoidal_PE, K = x + sinusoidal_PE, V = x.
-    No learnable parameters, no projections, no LayerNorm, no Dropout.
-    Returns a residual of shape [B*K, n, d] to be added back to x.
+    Reuses the layer's LayerNorm and Q/K/V/Out projections — zero new learnable
+    parameters.  For each spatial patch, attention is computed across the K
+    temporal frames with a causal mask so that each frame can only attend to
+    itself and earlier frames.
+
+    Returns a residual of shape [B*K, n, d] to be added back to hidden_states.
     """
     if num_frames <= 1:
-        return torch.zeros_like(x)
+        return torch.zeros_like(hidden_states)
 
-    BK, n, d = x.shape
+    BK, n, d = hidden_states.shape
     B = BK // num_frames
     K = num_frames
     head_dim = d // num_heads
 
+    x = layer_norm(hidden_states)
+
     pe = temporal_posemb_sincos(K, d, device=x.device).to(dtype=x.dtype)
-    pe = pe.repeat(B, 1).view(BK, 1, d)
+    pe = pe.repeat(B, 1).view(BK, 1, d)  # [BK, 1, d] broadcasts over n
 
-    q = x + pe
-    k = x + pe
-    v = x
+    q = q_proj(x + pe)  # [BK, n, d]
+    k = k_proj(x + pe)
+    v = v_proj(x)
 
-    q = q.view(B, K, n, d).permute(0, 2, 1, 3).reshape(B * n, K, num_heads, head_dim)
-    k = k.view(B, K, n, d).permute(0, 2, 1, 3).reshape(B * n, K, num_heads, head_dim)
-    v = v.view(B, K, n, d).permute(0, 2, 1, 3).reshape(B * n, K, num_heads, head_dim)
-
-    q = q.permute(0, 2, 1, 3)  # [B*n, num_heads, K, head_dim]
-    k = k.permute(0, 2, 1, 3)
-    v = v.permute(0, 2, 1, 3)
+    # Reshape: [BK, n, d] -> [B, K, n, heads, head_dim] -> [B*n, heads, K, head_dim]
+    q = q.view(B, K, n, num_heads, head_dim).permute(0, 2, 3, 1, 4).reshape(B * n, num_heads, K, head_dim)
+    k = k.view(B, K, n, num_heads, head_dim).permute(0, 2, 3, 1, 4).reshape(B * n, num_heads, K, head_dim)
+    v = v.view(B, K, n, num_heads, head_dim).permute(0, 2, 3, 1, 4).reshape(B * n, num_heads, K, head_dim)
 
     scale = head_dim ** -0.5
     attn = torch.matmul(q, k.transpose(-2, -1)) * scale
 
-    causal_mask = torch.triu(torch.ones(K, K, device=x.device, dtype=torch.bool), diagonal=1)
+    causal_mask = torch.triu(torch.ones(K, K, device=hidden_states.device, dtype=torch.bool), diagonal=1)
 
     if temporal_mask is not None:
         padding_mask = ~temporal_mask
@@ -420,12 +427,14 @@ def temporal_causal_attention(
     else:
         attn = attn.masked_fill(causal_mask[None, None, :, :], float("-inf"))
 
-    attn = torch.softmax(attn, dim=-1, dtype=torch.float32).to(x.dtype)
+    attn = torch.softmax(attn, dim=-1, dtype=torch.float32).to(hidden_states.dtype)
     attn = torch.nan_to_num(attn, nan=0.0)
-    out = torch.matmul(attn, v)
+    out = torch.matmul(attn, v)  # [B*n, num_heads, K, head_dim]
 
-    out = out.permute(0, 2, 1, 3).reshape(B * n, K, d)
-    out = out.view(B, n, K, d).permute(0, 2, 1, 3).reshape(BK, n, d)
+    # Reshape back: [B*n, heads, K, head_dim] -> [BK, n, d]
+    out = out.reshape(B, n, num_heads, K, head_dim).permute(0, 3, 1, 2, 4).reshape(BK, n, d)
+
+    out = out_proj(out)
 
     return out
 
@@ -563,9 +572,15 @@ class SiglipEncoderLayer(GradientCheckpointingLayer):
         hidden_states = residual + hidden_states
 
         if num_frames > 1 and has_temporal_attn:
-            num_heads = self.self_attn.num_heads
             hidden_states = hidden_states + temporal_causal_attention(
-                hidden_states, num_frames=num_frames, num_heads=num_heads,
+                hidden_states,
+                num_frames=num_frames,
+                num_heads=self.self_attn.num_heads,
+                layer_norm=self.layer_norm1,
+                q_proj=self.self_attn.q_proj,
+                k_proj=self.self_attn.k_proj,
+                v_proj=self.self_attn.v_proj,
+                out_proj=self.self_attn.out_proj,
                 temporal_mask=temporal_mask,
             )
 

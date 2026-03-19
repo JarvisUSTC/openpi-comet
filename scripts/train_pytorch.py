@@ -78,37 +78,87 @@ def _make_val_config(config: _config.TrainConfig) -> _config.TrainConfig:
     return dataclasses.replace(config, batch_size=val_batch_size, data=val_data)
 
 
-# Parameter name patterns that should remain trainable (everything else is frozen).
-# temporal attention is now zero-parameter (v2, aligned with MEM paper) so no
-# temporal_attn entry is needed here.
-_TRAINABLE_PATTERNS = (
-    "action_in_proj",    # action input projection
-    "action_out_proj",   # action output projection
-    "time_mlp",          # timestep MLP (pi05)
-    "action_time_mlp",   # action+time MLP (pi0)
-    "state_proj",        # state projection (pi0)
-    "gemma_expert",      # action expert
-    "multi_modal_projector",  # vision-to-LM projection (adapt to temporal features)
-)
+def _freeze_backbone(model, config, is_main: bool = True):
+    """Apply freeze_filter from config: freeze matching params, train the rest.
 
+    For non-LoRA configs (freeze_filter == nnx.Nothing) all params are trainable.
+    For LoRA configs the base LLM params (except LoRA adapters) are frozen.
+    """
+    import re
+    import flax.nnx as nnx
 
-def _freeze_backbone(model, is_main: bool = True):
-    """Freeze all backbone params; only train action head + projections."""
     raw_model = model.module if isinstance(model, torch.nn.parallel.DistributedDataParallel) else model
-    total, trainable, frozen = 0, 0, 0
-    for name, param in raw_model.named_parameters():
-        total += param.numel()
-        if any(pat in name for pat in _TRAINABLE_PATTERNS):
+
+    freeze_filter = config.freeze_filter
+    # nnx.Nothing means "freeze nothing" → all params trainable
+    is_full_param = isinstance(freeze_filter, type) and issubclass(freeze_filter, nnx.Nothing)
+    if not is_full_param:
+        try:
+            is_full_param = isinstance(freeze_filter, nnx.Nothing)
+        except TypeError:
+            pass
+
+    total = 0
+    frozen = 0
+
+    if is_full_param:
+        for param in raw_model.parameters():
+            total += param.numel()
             param.requires_grad = True
-            trainable += param.numel()
-        else:
-            param.requires_grad = False
-            frozen += param.numel()
+    else:
+        # Extract regex patterns from the Flax freeze_filter for PyTorch params.
+        # Convention: LoRA configs freeze params matching "llm" but not "lora".
+        freeze_patterns: list[re.Pattern] = []
+        unfreeze_patterns: list[re.Pattern] = []
+        _extract_patterns(freeze_filter, freeze_patterns, unfreeze_patterns)
+
+        for name, param in raw_model.named_parameters():
+            total += param.numel()
+            should_freeze = any(p.search(name) for p in freeze_patterns)
+            if should_freeze and unfreeze_patterns:
+                should_freeze = not any(p.search(name) for p in unfreeze_patterns)
+            param.requires_grad = not should_freeze
+            if should_freeze:
+                frozen += param.numel()
+
+    trainable = total - frozen
     if is_main:
         logging.info(
-            "Parameter freezing: total=%.1fM, trainable=%.1fM (%.1f%%), frozen=%.1fM",
-            total / 1e6, trainable / 1e6, trainable / total * 100, frozen / 1e6,
+            "Freeze setup: total=%.1fM, trainable=%.1fM (%.1f%%), frozen=%.1fM",
+            total / 1e6, trainable / 1e6,
+            100.0 * trainable / max(total, 1),
+            frozen / 1e6,
         )
+
+
+def _extract_patterns(flax_filter, freeze_patterns, unfreeze_patterns):
+    """Best-effort extraction of regex patterns from Flax NNX filter objects."""
+    import re
+
+    try:
+        import openpi.shared.nnx_utils as nnx_utils
+    except ImportError:
+        nnx_utils = None
+
+    if nnx_utils and isinstance(flax_filter, nnx_utils.PathRegex):
+        pat = flax_filter.pattern
+        freeze_patterns.append(pat if isinstance(pat, re.Pattern) else re.compile(pat))
+        return
+
+    # Handle nnx.All(filter1, filter2, ...)
+    if hasattr(flax_filter, "filters"):
+        for f in flax_filter.filters:
+            _extract_patterns(f, freeze_patterns, unfreeze_patterns)
+        return
+
+    # Handle nnx.Not(filter)
+    if hasattr(flax_filter, "filter"):
+        inner_freeze: list[re.Pattern] = []
+        inner_unfreeze: list[re.Pattern] = []
+        _extract_patterns(flax_filter.filter, inner_freeze, inner_unfreeze)
+        unfreeze_patterns.extend(inner_freeze)
+        freeze_patterns.extend(inner_unfreeze)
+        return
 
 
 def _decode_prompt_for_logging(observation, tokenizer: _tokenizer.PaligemmaTokenizer) -> str:
@@ -683,8 +733,7 @@ def train_loop(config: _config.TrainConfig):
             logging.warning(f"Unexpected keys in checkpoint: {unexpected}")
         logging.info(f"Loaded PyTorch weights from {config.pytorch_weight_path}")
 
-    # Freeze backbone, only train action expert + projections (temporal attention is zero-parameter)
-    _freeze_backbone(model, is_main)
+    _freeze_backbone(model, config, is_main)
 
     # Optimizer + learning rate schedule from config
     warmup_steps = config.lr_schedule.warmup_steps
