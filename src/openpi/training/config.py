@@ -835,6 +835,7 @@ _CONFIGS = [
         weight_loader=weight_loaders.CheckpointWeightLoader(
             "/root/Models/pi05_base/params"
         ),  # hf download in advance
+        pytorch_weight_path="/root/Models/pi05_base_pytorch",
         num_train_steps=50_000,
         lr_schedule=_optimizer.CosineDecaySchedule(
             peak_lr=2.5e-5,
@@ -858,7 +859,7 @@ _CONFIGS = [
         name="pi05_b1k-all_skills_mem_K6",
         exp_name="openpi",
         project_name="B1K",
-        model=pi0_config.Pi0Config(pi05=True, action_horizon=32, video_memory_frames=6, video_memory_stride_s=1.0),
+        model=pi0_config.Pi0Config(pi05=True, action_horizon=32, video_memory_frames=1, video_memory_stride_s=1.0),
         data=LeRobotB1KDataConfig(
             repo_id="behavior-1k/2025-challenge-demos",
             base_config=DataConfig(
@@ -869,6 +870,7 @@ _CONFIGS = [
             ),
         ),
         weight_loader=weight_loaders.CheckpointWeightLoader("/root/Models/pi05_base/params"),
+        pytorch_weight_path="/root/Models/pi05_base_pytorch",
         num_train_steps=150_000,
         lr_schedule=_optimizer.CosineDecaySchedule(
             peak_lr=2.5e-5,
@@ -878,8 +880,8 @@ _CONFIGS = [
         skill_resampling=True,
         log_interval=100,
         save_interval=5000,
-        val_log_interval=500,
-        val_num_batches=100,
+        val_log_interval=100,
+        val_num_batches=10,
         val_batch_size=2 * 32,
         val_episodes_index=list(range(180, 200)),
         freeze_filter=pi0_config.Pi0Config(pi05=True, action_horizon=32, video_memory_frames=6).get_freeze_filter(),

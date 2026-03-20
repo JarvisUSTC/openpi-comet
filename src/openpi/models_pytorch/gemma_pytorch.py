@@ -155,6 +155,8 @@ class PaliGemmaWithExpertModel(nn.Module):
                 self._debug_gc_printed = True
 
             # Define the complete layer computation function for gradient checkpointing
+            prefix_kv_cache = [] if use_cache else None
+
             def compute_layer_complete(layer_idx, inputs_embeds, attention_mask, position_ids, adarms_cond):
                 models = [self.paligemma.language_model, self.gemma_expert.model]
 
@@ -193,6 +195,13 @@ class PaliGemmaWithExpertModel(nn.Module):
                 query_states, key_states = modeling_gemma.apply_rotary_pos_emb(
                     query_states, key_states, cos, sin, unsqueeze_dim=1
                 )
+
+                if prefix_kv_cache is not None:
+                    prefix_seq_len = inputs_embeds[0].shape[1]
+                    prefix_kv_cache.append((
+                        key_states[:, :, :prefix_seq_len, :].detach(),
+                        value_states[:, :, :prefix_seq_len, :].detach(),
+                    ))
 
                 batch_size = query_states.shape[0]
                 scaling = self.paligemma.language_model.layers[layer_idx].self_attn.scaling
@@ -276,6 +285,6 @@ class PaliGemmaWithExpertModel(nn.Module):
 
             prefix_output = outputs_embeds[0]
             suffix_output = outputs_embeds[1]
-            prefix_past_key_values = None
+            prefix_past_key_values = prefix_kv_cache if use_cache else None
 
         return [prefix_output, suffix_output], prefix_past_key_values

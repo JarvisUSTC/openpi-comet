@@ -397,21 +397,41 @@ class PI0Pytorch(nn.Module):
             images, img_masks, lang_tokens, lang_masks, temporal_mask=temporal_mask
         )
 
-        # Cache prefix KV using the VLM. The action-expert denoising step below uses a
-        # custom attention path to attend to this cached prefix (paligemma K/V) with
-        # the expert's Q/K/V for the suffix tokens.
-        prefix_att_2d_masks = make_att_2d_masks(prefix_pad_masks, prefix_att_masks)
-        prefix_position_ids = torch.cumsum(prefix_pad_masks, dim=1) - 1
-        prefix_att_2d_masks_4d = self._prepare_attention_masks_4d(prefix_att_2d_masks)
-        self.paligemma_with_expert.paligemma.language_model.config._attn_implementation = "eager"  # noqa: SLF001
+        # Cache prefix KV by running a single joint-forward step with dummy suffix.
+        # This ensures the prefix KV matches exactly what the training forward produces,
+        # since compute_layer_complete processes prefix and suffix together.
+        # We must temporarily disable gradient checkpointing because checkpoint()
+        # re-runs the function and discards side effects (like appending to the KV list).
+        dummy_time = torch.ones(bsize, dtype=torch.float32, device=device)
+        dummy_actions = noise.clone()
+        dummy_suffix_embs, dummy_suffix_pad, dummy_suffix_att, dummy_adarms = self.embed_suffix(state, dummy_actions, dummy_time)
 
-        _, past_key_values = self.paligemma_with_expert.forward(
-            attention_mask=prefix_att_2d_masks_4d,
-            position_ids=prefix_position_ids,
-            past_key_values=None,
-            inputs_embeds=[prefix_embs, None],
-            use_cache=True,
-        )
+        if self.paligemma_with_expert.paligemma.language_model.layers[0].self_attn.q_proj.weight.dtype == torch.bfloat16:
+            _prefix = prefix_embs.to(dtype=torch.bfloat16)
+            _suffix = dummy_suffix_embs.to(dtype=torch.bfloat16)
+        else:
+            _prefix = prefix_embs
+            _suffix = dummy_suffix_embs
+
+        _pad = torch.cat([prefix_pad_masks, dummy_suffix_pad], dim=1)
+        _att = torch.cat([prefix_att_masks, dummy_suffix_att], dim=1)
+        _att_2d = make_att_2d_masks(_pad, _att)
+        _pos = torch.cumsum(_pad, dim=1) - 1
+        _att_4d = self._prepare_attention_masks_4d(_att_2d)
+
+        was_training = self.training
+        self.eval()
+        with torch.no_grad():
+            (_, _), past_key_values = self.paligemma_with_expert.forward(
+                attention_mask=_att_4d,
+                position_ids=_pos,
+                past_key_values=None,
+                inputs_embeds=[_prefix, _suffix],
+                use_cache=True,
+                adarms_cond=[None, dummy_adarms],
+            )
+        if was_training:
+            self.train()
 
         dt = torch.tensor(-1.0 / num_steps, dtype=torch.float32, device=device)
         x_t = noise
@@ -430,6 +450,75 @@ class PI0Pytorch(nn.Module):
             time += dt
 
         return x_t
+
+    def _cache_prefix_kv(self, prefix_embs, prefix_pad_masks, prefix_att_masks):
+        """Compute prefix KV cache using the same layer-by-layer path as training.
+
+        The training forward (compute_layer_complete in gemma_pytorch.py) processes
+        prefix through paligemma layers with a residual structure that differs slightly
+        from HF's standard GemmaDecoderLayer.forward. We must match the training path
+        exactly so that the cached K/V are consistent with what denoise_step expects.
+        """
+        from transformers.models.gemma import modeling_gemma as _mg
+
+        prefix_att_2d_masks = make_att_2d_masks(prefix_pad_masks, prefix_att_masks)
+        prefix_position_ids = torch.cumsum(prefix_pad_masks, dim=1) - 1
+        prefix_att_2d_masks_4d = self._prepare_attention_masks_4d(prefix_att_2d_masks)
+
+        pal_lm = self.paligemma_with_expert.paligemma.language_model
+        num_layers = self.paligemma_with_expert.paligemma.config.text_config.num_hidden_layers
+
+        hidden_states = prefix_embs
+        if pal_lm.layers[0].self_attn.q_proj.weight.dtype == torch.bfloat16:
+            hidden_states = hidden_states.to(dtype=torch.bfloat16)
+
+        cached_keys = []
+        cached_values = []
+
+        for layer_idx in range(num_layers):
+            layer = pal_lm.layers[layer_idx]
+            head_dim = layer.self_attn.head_dim
+
+            hidden_states, gate = layer.input_layernorm(hidden_states, cond=None)
+
+            input_shape = hidden_states.shape[:-1]
+            hidden_shape = (*input_shape, -1, head_dim)
+
+            q = layer.self_attn.q_proj(hidden_states).view(hidden_shape).transpose(1, 2)
+            k = layer.self_attn.k_proj(hidden_states).view(hidden_shape).transpose(1, 2)
+            v = layer.self_attn.v_proj(hidden_states).view(hidden_shape).transpose(1, 2)
+
+            dummy = torch.zeros(q.shape[0], q.shape[2], q.shape[-1], device=q.device, dtype=q.dtype)
+            cos, sin = self.paligemma_with_expert.paligemma.model.language_model.rotary_emb(
+                dummy, prefix_position_ids
+            )
+            q, k = _mg.apply_rotary_pos_emb(q, k, cos, sin, unsqueeze_dim=1)
+
+            cached_keys.append(k.detach())
+            cached_values.append(v.detach())
+
+            scaling = layer.self_attn.scaling
+            att_output, _ = _mg.eager_attention_forward(
+                layer.self_attn, q, k, v, prefix_att_2d_masks_4d, scaling
+            )
+
+            batch_size = hidden_states.shape[0]
+            num_heads = layer.self_attn.q_proj.out_features // head_dim
+            att_output = att_output.reshape(batch_size, -1, num_heads * head_dim)
+
+            if att_output.dtype != layer.self_attn.o_proj.weight.dtype:
+                att_output = att_output.to(dtype=layer.self_attn.o_proj.weight.dtype)
+            out_emb = layer.self_attn.o_proj(att_output)
+
+            out_emb = _mg._gated_residual(hidden_states, out_emb, gate)
+            after_first_residual = out_emb.clone()
+            out_emb, gate2 = layer.post_attention_layernorm(out_emb, cond=None)
+            if layer.mlp.up_proj.weight.dtype == torch.bfloat16:
+                out_emb = out_emb.to(dtype=torch.bfloat16)
+            out_emb = layer.mlp(out_emb)
+            hidden_states = _mg._gated_residual(after_first_residual, out_emb, gate2)
+
+        return list(zip(cached_keys, cached_values))
 
     def denoise_step(
         self,
@@ -483,6 +572,7 @@ class PI0Pytorch(nn.Module):
             pal_layer = pal_lm.layers[layer_idx]
             exp_layer = expert.layers[layer_idx]
 
+            residual = hidden_states
             hidden_states, gate = exp_layer.input_layernorm(hidden_states, cond=adarms_cond)
             input_shape = hidden_states.shape[:-1]
             head_dim = pal_layer.self_attn.head_dim
@@ -520,20 +610,20 @@ class PI0Pytorch(nn.Module):
                 scaling,
             )
 
-            num_heads = pal_layer.self_attn.num_heads
-            att_output = att_output.transpose(1, 2).contiguous().view(batch_size, -1, num_heads * head_dim)
+            num_heads = pal_layer.self_attn.q_proj.out_features // pal_layer.self_attn.head_dim
+            att_output = att_output.reshape(batch_size, -1, num_heads * head_dim)
 
             if att_output.dtype != exp_layer.self_attn.o_proj.weight.dtype:
                 att_output = att_output.to(dtype=exp_layer.self_attn.o_proj.weight.dtype)
             out_emb = exp_layer.self_attn.o_proj(att_output)
 
-            out_emb = modeling_gemma._gated_residual(hidden_states, out_emb, gate)  # noqa: SLF001
-            after_first_residual = out_emb.clone()
-            out_emb, gate = exp_layer.post_attention_layernorm(out_emb, cond=adarms_cond)
+            hidden_states = modeling_gemma._gated_residual(residual, out_emb, gate)  # noqa: SLF001
+            after_first_residual = hidden_states.clone()
+            hidden_states, gate = exp_layer.post_attention_layernorm(hidden_states, cond=adarms_cond)
             if exp_layer.mlp.up_proj.weight.dtype == torch.bfloat16:
-                out_emb = out_emb.to(dtype=torch.bfloat16)
-            out_emb = exp_layer.mlp(out_emb)
-            hidden_states = modeling_gemma._gated_residual(after_first_residual, out_emb, gate)  # noqa: SLF001
+                hidden_states = hidden_states.to(dtype=torch.bfloat16)
+            hidden_states = exp_layer.mlp(hidden_states)
+            hidden_states = modeling_gemma._gated_residual(after_first_residual, hidden_states, gate)  # noqa: SLF001
 
         hidden_states, _ = expert.norm(hidden_states, cond=adarms_cond)
         suffix_out = hidden_states[:, -self.config.action_horizon :].to(dtype=torch.float32)

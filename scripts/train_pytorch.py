@@ -318,12 +318,6 @@ def reset_val_loader(val_loader):
 @torch.no_grad()
 def validate(model, val_loader, device, config):
     """Run validation and return a dict of metrics."""
-    rng_state = torch.random.get_rng_state()
-    cuda_rng_state = torch.cuda.get_rng_state(device) if torch.cuda.is_available() else None
-    torch.manual_seed(42)
-    if torch.cuda.is_available():
-        torch.cuda.manual_seed(42)
-
     raw_model = model.module if isinstance(model, torch.nn.parallel.DistributedDataParallel) else model
     was_training = raw_model.training
     raw_model.eval()
@@ -379,10 +373,6 @@ def validate(model, val_loader, device, config):
 
     if was_training:
         raw_model.train()
-
-    torch.random.set_rng_state(rng_state)
-    if cuda_rng_state is not None:
-        torch.cuda.set_rng_state(cuda_rng_state, device)
 
     return {
         "val_loss": float(np.mean(flow_losses)),
@@ -719,6 +709,24 @@ def train_loop(config: _config.TrainConfig):
 
     # Load weights from weight_loader if specified (for fine-tuning)
     logging.info("[DEBUG] [4/6] pytorch_weight_path=%s", config.pytorch_weight_path)
+    # NOTE: The JAX training pipeline supports `config.weight_loader` (Orbax/JAX params).
+    # This PyTorch training script currently only supports loading PyTorch weights from
+    # `config.pytorch_weight_path` (expects a `model.safetensors`).
+    if config.pytorch_weight_path is None:
+        try:
+            import openpi.training.weight_loaders as _weight_loaders
+
+            if not isinstance(config.weight_loader, _weight_loaders.NoOpWeightLoader):
+                logging.warning(
+                    "PyTorch training: `config.weight_loader=%s` will be ignored because "
+                    "`pytorch_weight_path` is None. You are likely training from scratch. "
+                    "Convert your JAX/Orbax checkpoint to a PyTorch `model.safetensors` and set "
+                    "`--pytorch_weight_path`, or use the JAX training script instead.",
+                    type(config.weight_loader).__name__,
+                )
+        except Exception:
+            # Best-effort warning only; do not block training if optional deps are missing.
+            pass
     if config.pytorch_weight_path is not None:
         logging.info(f"Loading weights from: {config.pytorch_weight_path}")
 
@@ -844,7 +852,6 @@ def train_loop(config: _config.TrainConfig):
             if is_val_step:
                 if val_loader is not None:
                     try:
-                        reset_val_loader(val_loader)
                         val_metrics = validate(model, val_loader, device, config)
                         metrics_str = ", ".join(f"{k}={v:.4f}" for k, v in val_metrics.items() if not k.startswith("val/"))
                         if pbar is not None:
