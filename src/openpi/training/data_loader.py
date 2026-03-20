@@ -510,6 +510,7 @@ def create_torch_behavior_data_loader(
     shuffle: bool = False,
     num_workers: int = 0,
     seed: int = 0,
+    is_validation: bool = False,
 ) -> DataLoader[tuple[_model.Observation, _model.Actions]]:
     """Create a data loader for training.
 
@@ -522,6 +523,8 @@ def create_torch_behavior_data_loader(
         num_workers: The number of worker processes to use. If zero, the data loader will
             execute in the main process.
         seed: The seed to use for shuffling the data.
+        is_validation: If True, skip DDP batch division and DistributedSampler
+            since validation runs independently on rank 0.
     """
     vm_frames = getattr(config.model, "video_memory_frames", 1)
     vm_stride = getattr(config.model, "video_memory_stride_s", 1.0)
@@ -543,7 +546,7 @@ def create_torch_behavior_data_loader(
         _rebalance_chunks_by_skill(dataset)
 
     sampler = None
-    if torch.distributed.is_initialized():
+    if torch.distributed.is_initialized() and not is_validation:
         rank = torch.distributed.get_rank()
         world_size = torch.distributed.get_world_size()
         sampler = torch.utils.data.distributed.DistributedSampler(

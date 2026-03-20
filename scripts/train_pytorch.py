@@ -286,6 +286,7 @@ def build_val_loader(config: _config.TrainConfig):
         shuffle=False,
         num_workers=0,
         seed=config.seed + 1000,
+        is_validation=True,
     )
     return val_loader
 
@@ -852,6 +853,7 @@ def train_loop(config: _config.TrainConfig):
             if is_val_step:
                 if val_loader is not None:
                     try:
+                        reset_val_loader(val_loader)
                         val_metrics = validate(model, val_loader, device, config)
                         metrics_str = ", ".join(f"{k}={v:.4f}" for k, v in val_metrics.items() if not k.startswith("val/"))
                         if pbar is not None:
