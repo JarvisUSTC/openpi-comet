@@ -284,7 +284,7 @@ def build_val_loader(config: _config.TrainConfig):
         batch_size=val_batch_size,
         skip_norm_stats=False,
         shuffle=False,
-        num_workers=0,
+        num_workers=8,
         seed=config.seed + 1000,
         is_validation=True,
     )
@@ -339,38 +339,38 @@ def validate(model, val_loader, device, config):
         per_element_loss = raw_model(observation, actions)
         flow_losses.append(per_element_loss.mean().item())
 
-        pred_actions = raw_model.sample_actions(device, observation, num_steps=config.val_denoise_steps)
+        # pred_actions = raw_model.sample_actions(device, observation, num_steps=config.val_denoise_steps)
 
-        action_error = pred_actions - actions
-        action_mses.append(torch.mean(action_error**2).item())
-        action_maes.append(torch.mean(torch.abs(action_error)).item())
+        # action_error = pred_actions - actions
+        # action_mses.append(torch.mean(action_error**2).item())
+        # action_maes.append(torch.mean(torch.abs(action_error)).item())
 
-        pred_flat = pred_actions.reshape(pred_actions.shape[0], -1)
-        gt_flat = actions.reshape(actions.shape[0], -1)
-        cos_sim = torch.sum(pred_flat * gt_flat, dim=-1) / (
-            torch.norm(pred_flat, dim=-1) * torch.norm(gt_flat, dim=-1) + 1e-8
-        )
-        action_cosine_sims.append(cos_sim.mean().item())
+        # pred_flat = pred_actions.reshape(pred_actions.shape[0], -1)
+        # gt_flat = actions.reshape(actions.shape[0], -1)
+        # cos_sim = torch.sum(pred_flat * gt_flat, dim=-1) / (
+        #     torch.norm(pred_flat, dim=-1) * torch.norm(gt_flat, dim=-1) + 1e-8
+        # )
+        # action_cosine_sims.append(cos_sim.mean().item())
 
-        first_action_mses.append(torch.mean((pred_actions[:, 0] - actions[:, 0]) ** 2).item())
+        # first_action_mses.append(torch.mean((pred_actions[:, 0] - actions[:, 0]) ** 2).item())
 
-        if batch_idx == 0:
-            n_samples = min(3, pred_actions.shape[0])
-            n_dims = min(8, pred_actions.shape[-1])
-            for i in range(n_samples):
-                pred_t0 = pred_actions[i, 0, :n_dims].cpu().tolist()
-                gt_t0 = actions[i, 0, :n_dims].cpu().tolist()
-                err_t0 = (pred_actions[i, 0, :n_dims] - actions[i, 0, :n_dims]).abs().cpu().tolist()
-                pred_str = ", ".join(f"{v:+.4f}" for v in pred_t0)
-                gt_str = ", ".join(f"{v:+.4f}" for v in gt_t0)
-                err_str = ", ".join(f"{v:.4f}" for v in err_t0)
-                logging.info("[VAL sample %d] pred: [%s]", i, pred_str)
-                logging.info("[VAL sample %d]   gt: [%s]", i, gt_str)
-                logging.info("[VAL sample %d]  err: [%s]  cos=%.4f", i, err_str, cos_sim[i].item())
-            pred_mean = pred_actions[:n_samples, 0, :n_dims].mean(dim=0).cpu().tolist()
-            gt_std = actions[:n_samples, 0, :n_dims].std(dim=0).cpu().tolist()
-            logging.info("[VAL] pred_mean: [%s]", ", ".join(f"{v:+.4f}" for v in pred_mean))
-            logging.info("[VAL]   gt_std: [%s]", ", ".join(f"{v:.4f}" for v in gt_std))
+        # if batch_idx == 0:
+        #     n_samples = min(3, pred_actions.shape[0])
+        #     n_dims = min(8, pred_actions.shape[-1])
+        #     for i in range(n_samples):
+        #         pred_t0 = pred_actions[i, 0, :n_dims].cpu().tolist()
+        #         gt_t0 = actions[i, 0, :n_dims].cpu().tolist()
+        #         err_t0 = (pred_actions[i, 0, :n_dims] - actions[i, 0, :n_dims]).abs().cpu().tolist()
+        #         pred_str = ", ".join(f"{v:+.4f}" for v in pred_t0)
+        #         gt_str = ", ".join(f"{v:+.4f}" for v in gt_t0)
+        #         err_str = ", ".join(f"{v:.4f}" for v in err_t0)
+        #         logging.info("[VAL sample %d] pred: [%s]", i, pred_str)
+        #         logging.info("[VAL sample %d]   gt: [%s]", i, gt_str)
+        #         logging.info("[VAL sample %d]  err: [%s]  cos=%.4f", i, err_str, cos_sim[i].item())
+        #     pred_mean = pred_actions[:n_samples, 0, :n_dims].mean(dim=0).cpu().tolist()
+        #     gt_std = actions[:n_samples, 0, :n_dims].std(dim=0).cpu().tolist()
+        #     logging.info("[VAL] pred_mean: [%s]", ", ".join(f"{v:+.4f}" for v in pred_mean))
+        #     logging.info("[VAL]   gt_std: [%s]", ", ".join(f"{v:.4f}" for v in gt_std))
 
     if was_training:
         raw_model.train()
@@ -378,10 +378,10 @@ def validate(model, val_loader, device, config):
     return {
         "val_loss": float(np.mean(flow_losses)),
         "val/flow_loss": float(np.mean(flow_losses)),
-        "val/action_mse": float(np.mean(action_mses)),
-        "val/action_mae": float(np.mean(action_maes)),
-        "val/action_cosine_sim": float(np.mean(action_cosine_sims)),
-        "val/first_action_mse": float(np.mean(first_action_mses)),
+        # "val/action_mse": float(np.mean(action_mses)),
+        # "val/action_mae": float(np.mean(action_maes)),
+        # "val/action_cosine_sim": float(np.mean(action_cosine_sims)),
+        # "val/first_action_mse": float(np.mean(first_action_mses)),
     }
 
 
@@ -853,8 +853,8 @@ def train_loop(config: _config.TrainConfig):
             if is_val_step:
                 if val_loader is not None:
                     try:
-                        reset_val_loader(val_loader)
-                        val_metrics = validate(model, val_loader, device, config)
+                        # reset_val_loader(val_loader)
+                        # val_metrics = validate(model, val_loader, device, config)
                         metrics_str = ", ".join(f"{k}={v:.4f}" for k, v in val_metrics.items() if not k.startswith("val/"))
                         if pbar is not None:
                             pbar.write(f"Step {global_step}: {metrics_str}")
