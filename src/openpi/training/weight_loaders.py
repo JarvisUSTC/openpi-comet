@@ -73,6 +73,51 @@ class PaliGemmaWeightLoader(WeightLoader):
         return _merge_params(loaded_params, params, missing_regex=".*")
 
 
+def _expand_siglip_scan_to_unroll(flat_loaded: dict, flat_ref: dict) -> dict:
+    """Convert SigLIP scan-format encoder block params to unrolled format.
+
+    The base checkpoint stores SigLIP encoder blocks in scan format:
+      Transformer/encoderblock/<param>  shape=[num_layers, ...]
+    When K>1, the model unrolls these into separate entries:
+      Transformer/encoderblock_0/<param>, encoderblock_1/<param>, ...
+    This function expands the scan params to match the unrolled model.
+    """
+    scan_prefix = "/img/Transformer/encoderblock/"
+    unroll_prefix_re = re.compile(r".*/img/Transformer/encoderblock_(\d+)/")
+
+    has_scan = any(scan_prefix in k for k in flat_loaded)
+    has_unroll_ref = any(unroll_prefix_re.search(k) for k in flat_ref)
+
+    if not (has_scan and has_unroll_ref):
+        return flat_loaded
+
+    # Determine num_layers from ref keys
+    layer_indices = set()
+    for k in flat_ref:
+        m = unroll_prefix_re.search(k)
+        if m:
+            layer_indices.add(int(m.group(1)))
+    if not layer_indices:
+        return flat_loaded
+    num_layers = max(layer_indices) + 1
+
+    result = {}
+    for k, v in flat_loaded.items():
+        if scan_prefix in k:
+            # Split stacked axis 0 into per-layer keys
+            idx = k.index(scan_prefix)
+            prefix = k[:idx + len("/img/Transformer/")]
+            suffix = k[idx + len(scan_prefix):]
+            for i in range(num_layers):
+                new_key = f"{prefix}encoderblock_{i}/{suffix}"
+                result[new_key] = v[i]
+        else:
+            result[k] = v
+
+    logger.info("Expanded SigLIP scan params: 1 encoderblock → %d encoderblock_N entries", num_layers)
+    return result
+
+
 def _merge_params(loaded_params: at.Params, params: at.Params, *, missing_regex: str) -> at.Params:
     """Merges the loaded parameters with the reference parameters.
 
@@ -86,6 +131,9 @@ def _merge_params(loaded_params: at.Params, params: at.Params, *, missing_regex:
     """
     flat_ref = flax.traverse_util.flatten_dict(params, sep="/")
     flat_loaded = flax.traverse_util.flatten_dict(loaded_params, sep="/")
+
+    # Expand SigLIP scan-format params to unrolled format if needed (K>1 training).
+    flat_loaded = _expand_siglip_scan_to_unroll(flat_loaded, flat_ref)
 
     # First, take all weights that are a subset of the reference weights.
     result = {}
