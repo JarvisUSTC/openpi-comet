@@ -236,17 +236,20 @@ def preprocess_observation(
         else:
             out_masks[key] = jnp.asarray(observation.image_masks[key])
 
-    return Observation(
-        images=out_images,
-        image_masks=out_masks,
-        state=observation.state,
-        tokenized_prompt=observation.tokenized_prompt,
-        tokenized_prompt_mask=observation.tokenized_prompt_mask,
-        token_ar_mask=observation.token_ar_mask,
-        token_loss_mask=observation.token_loss_mask,
-        pcd_xyz=observation.pcd_xyz,
-        temporal_mask=observation.temporal_mask,
-    )
+    # MEM: images are [B*K, H, W, C] while state is [B, s]; disable jaxtyping's *b
+    # binding check to avoid TypeCheckError when K > 1.
+    with at.disable_typechecking():
+        return Observation(
+            images=out_images,
+            image_masks=out_masks,
+            state=observation.state,
+            tokenized_prompt=observation.tokenized_prompt,
+            tokenized_prompt_mask=observation.tokenized_prompt_mask,
+            token_ar_mask=observation.token_ar_mask,
+            token_loss_mask=observation.token_loss_mask,
+            pcd_xyz=observation.pcd_xyz,
+            temporal_mask=observation.temporal_mask,
+        )
 
 
 @dataclasses.dataclass(frozen=True)
