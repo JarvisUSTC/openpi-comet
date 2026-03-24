@@ -37,6 +37,13 @@ class Pi0Config(_model.BaseModelConfig):
     # whether to use pointnet to encode the point cloud
     pcd: bool = False
 
+    # === MEM Video Memory ===
+    # Number of observation frames for short-term video memory.
+    # K=1 degrades to original single-frame behavior.
+    video_memory_frames: int = 1
+    # Stride between frames in seconds (e.g., 1.0 = one frame per second).
+    video_memory_stride_s: float = 1.0
+
     def __post_init__(self):
         if self.max_token_len is None:
             object.__setattr__(self, "max_token_len", 200 if self.pi05 else 48)

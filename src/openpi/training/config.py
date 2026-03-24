@@ -590,6 +590,9 @@ class TrainConfig:
     val_repo_id: str | None = None
     val_episodes_index: list[int] | None = None
 
+    # MEM: rebalance dataset chunks by skill for more uniform skill sampling
+    skill_resampling: bool = False
+
     @property
     def assets_dirs(self) -> pathlib.Path:
         """Get the assets directory for this config."""

@@ -103,6 +103,119 @@ class IterableTransformedDataset(IterableDataset[T_co]):
         return len(self._dataset)
 
 
+class VideoMemoryDataset(Dataset):
+    """Wraps a dataset to provide K historical frames per camera.
+
+    Maintains a per-episode frame buffer with LRU eviction. The returned item
+    contains extra keys like ``{cam_key}_history`` with a list of K-1 historical
+    frames (oldest first). If fewer than K-1 frames are available, the earliest
+    frame is repeated.
+
+    NOTE: This relies on the underlying BehaviorLeRobotDataset streaming mode
+    which returns frames sequentially within 250-frame chunks (ignoring the
+    ``idx`` parameter passed by DataLoader). The buffer therefore accumulates
+    correctly within each chunk regardless of DataLoader shuffle settings.
+    At chunk boundaries there is a ~(K-1)*stride frame warm-up where history
+    is partially padded — this is expected and typically covers <5% of frames.
+    """
+
+    _DEFAULT_CAMERA_KEYS = (
+        "observation.images.rgb.head",
+        "observation.images.rgb.left_wrist",
+        "observation.images.rgb.right_wrist",
+    )
+    _MAX_EPISODES_CACHED = 32
+
+    def __init__(self, dataset: Dataset, num_frames: int, stride: int = 1, camera_keys: Sequence[str] | None = None):
+        self._dataset = dataset
+        self._num_frames = num_frames
+        self._stride = max(1, stride)
+        self._camera_keys = camera_keys or self._DEFAULT_CAMERA_KEYS
+        from collections import OrderedDict
+        self._buffers: "OrderedDict[int, dict[str, list]]" = OrderedDict()
+        self._last_frame_idx: dict[int, int] = {}
+        self._max_buffer = (num_frames - 1) * self._stride + 1
+        self._stats_total = 0
+        self._stats_valid = 0
+
+    def _get_frame_idx(self, item) -> int:
+        ts = item.get("timestamp")
+        if ts is not None:
+            return round(float(ts.item() if hasattr(ts, "item") else ts) * 30)
+        return -1
+
+    def __getitem__(self, index):
+        item = self._dataset[index]
+        if self._num_frames <= 1:
+            return item
+
+        ep_idx = item.get("episode_index")
+        if hasattr(ep_idx, "item"):
+            ep_idx = ep_idx.item()
+
+        frame_idx = self._get_frame_idx(item)
+
+        if ep_idx in self._buffers:
+            self._buffers.move_to_end(ep_idx)
+            if ep_idx in self._last_frame_idx and frame_idx >= 0:
+                gap = abs(frame_idx - self._last_frame_idx[ep_idx])
+                if gap > self._stride + 1:
+                    self._buffers[ep_idx] = {}
+        else:
+            self._buffers[ep_idx] = {}
+            while len(self._buffers) > self._MAX_EPISODES_CACHED:
+                oldest_key = next(iter(self._buffers))
+                del self._buffers[oldest_key]
+                self._last_frame_idx.pop(oldest_key, None)
+
+        if frame_idx >= 0:
+            self._last_frame_idx[ep_idx] = frame_idx
+
+        for cam_key in self._camera_keys:
+            if cam_key not in item:
+                continue
+            if cam_key not in self._buffers[ep_idx]:
+                self._buffers[ep_idx][cam_key] = []
+
+            buf = self._buffers[ep_idx][cam_key]
+            frame = item[cam_key]
+            buf.append(frame.clone() if hasattr(frame, "clone") else np.copy(frame))
+
+            if len(buf) > self._max_buffer:
+                buf.pop(0)
+
+            K = self._num_frames
+            available = buf[:-1]
+            sampled = []
+            valid_flags = []
+            for i in range(K - 1, 0, -1):
+                idx = len(available) - i * self._stride
+                if idx < 0:
+                    sampled.append(available[0] if available else buf[-1])
+                    valid_flags.append(False)
+                else:
+                    sampled.append(available[idx])
+                    valid_flags.append(True)
+
+            item[f"{cam_key}_history"] = sampled
+            item[f"{cam_key}_history_valid"] = valid_flags
+
+        self._stats_total += 1
+        if valid_flags and all(valid_flags):
+            self._stats_valid += 1
+        if self._stats_total > 0 and self._stats_total % 5000 == 0:
+            pct = self._stats_valid / self._stats_total * 100
+            logging.info(
+                "VideoMemoryDataset: %d/%d (%.1f%%) samples have full history",
+                self._stats_valid, self._stats_total, pct,
+            )
+
+        return item
+
+    def __len__(self):
+        return len(self._dataset)
+
+
 class FakeDataset(Dataset):
     def __init__(self, model_config: _model.BaseModelConfig, num_samples: int):
         self._num_samples = num_samples
@@ -134,7 +247,7 @@ class FakeDataset(Dataset):
         return self._num_samples
 
 
-def create_behavior_dataset(data_config: _config.DataConfig, action_horizon: int) -> Dataset:
+def create_behavior_dataset(data_config: _config.DataConfig, action_horizon: int, video_memory_frames: int = 1, video_memory_stride_s: float = 1.0) -> Dataset:
     """Create a dataset for training."""
     from behavior.learning.datas.dataset import BehaviorLeRobotDataset
 
@@ -171,6 +284,12 @@ def create_behavior_dataset(data_config: _config.DataConfig, action_horizon: int
 
     # fixed prompt hard coding
     dataset = TransformedDataset(dataset, [_transforms.PromptFromLeRobotItem()])
+
+    # MEM: wrap with video memory buffer if K > 1
+    if video_memory_frames > 1:
+        fps = 30  # B1K dataset FPS
+        stride_frames = max(1, int(video_memory_stride_s * fps))
+        dataset = VideoMemoryDataset(dataset, num_frames=video_memory_frames, stride=stride_frames)
 
     return dataset
 
@@ -244,6 +363,8 @@ def create_behavior_data_loader(
     skip_norm_stats: bool = False,
     seed_shift: int = 0,
 ) -> DataLoader[tuple[_model.Observation, _model.Actions]]:
+    vm_frames = getattr(config.model, "video_memory_frames", 1)
+    vm_stride = getattr(config.model, "video_memory_stride_s", 1.0)
     if isinstance(config.data, list):
         data_configs = [config_.create(config.assets_dirs, config.model) for config_ in config.data]
         dataset = create_multi_behavior_dataset(
@@ -254,7 +375,7 @@ def create_behavior_data_loader(
         data_config = data_configs[0]
     else:
         data_config = config.data.create(config.assets_dirs, config.model)
-        dataset = create_behavior_dataset(data_config, action_horizon=config.model.action_horizon)
+        dataset = create_behavior_dataset(data_config, action_horizon=config.model.action_horizon, video_memory_frames=vm_frames, video_memory_stride_s=vm_stride)
 
     dataset = transform_dataset(dataset, data_config, skip_norm_stats=skip_norm_stats)
 
