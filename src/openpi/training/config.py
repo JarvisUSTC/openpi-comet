@@ -664,12 +664,12 @@ _CONFIGS = [
         batch_size=1 * 32,
         wandb_enabled=False,
     ),
-    # K=3 smoke test: video memory with 3 frames
+    # K=6 smoke test: video memory with 6 frames
     TrainConfig(
-        name="pi05_b1k-k3-smoke-step200",
-        exp_name="openpi_smoke_k3",
+        name="pi05_b1k-k6-smoke-step200",
+        exp_name="openpi_smoke_k6",
         project_name="B1K",
-        model=pi0_config.Pi0Config(pi05=True, action_horizon=32, video_memory_frames=3, video_memory_stride_s=1.0),
+        model=pi0_config.Pi0Config(pi05=True, action_horizon=32, video_memory_frames=6, video_memory_stride_s=1.0),
         data=LeRobotB1KDataConfig(
             repo_id="behavior-1k/2025-challenge-demos",
             base_config=DataConfig(
@@ -693,9 +693,9 @@ _CONFIGS = [
         val_num_batches=5,
         val_batch_size=1 * 32,
         val_episodes_index=list(range(50, 60)),
-        freeze_filter=pi0_config.Pi0Config(pi05=True, action_horizon=32, video_memory_frames=3).get_freeze_filter(),
+        freeze_filter=pi0_config.Pi0Config(pi05=True, action_horizon=32, video_memory_frames=6).get_freeze_filter(),
         ema_decay=None,
-        checkpoint_base_dir="./outputs/checkpoints/pi05_b1k-k3-smoke-step200",
+        checkpoint_base_dir="./outputs/checkpoints/pi05_b1k-k6-smoke-step200",
         num_workers=8,
         batch_size=1 * 32,
         wandb_enabled=False,
