@@ -419,6 +419,103 @@ video_memory_frames=getattr(model_config, "video_memory_frames", 1),
 
 ---
 
+### Bug 3：RepackTransform 丢弃 `_history` key
+
+**现象**
+
+修完 Bug 2 后，K=6 训练不崩溃，但实际上历史帧全部丢失，等价于 K=1（用当前帧重复 6 次）。
+
+**根因**
+
+`RepackTransform.__call__` 的实现：
+
+```python
+def __call__(self, data: DataDict) -> DataDict:
+    flat_item = flatten_dict(data)
+    return jax.tree.map(lambda k: flat_item[k], self.structure)
+```
+
+只返回 `structure` 里定义的 key，**所有其他 key 全丢**。
+
+`VideoMemoryDataset` 写入的 `{cam_key}_history` key（如 `observation.images.rgb.head_history`）不在 structure 里，在 RepackTransform 阶段被静默丢弃。
+
+B1kInputs 调用 `_stack_history_frames` 时找不到历史帧，退回到 "重复当前帧 K 次" 的 fallback，temporal_mask 全为 `[False, ..., False, True]`。
+
+**为什么 K=1 没问题**
+
+K=1 时 VideoMemoryDataset 不创建，不存在任何 `_history` key。
+
+**修复**
+
+在 `src/openpi/transforms.py` 的 `RepackTransform.__call__` 加透传逻辑（与 `openpi-comet` 对齐）：
+
+```python
+def __call__(self, data: DataDict) -> DataDict:
+    flat_item = flatten_dict(data)
+    result = jax.tree.map(lambda k: flat_item[k], self.structure)
+    # MEM: pass through video memory history keys so they survive repacking
+    for key, value in flat_item.items():
+        if "_history" in key:
+            result[key] = value
+    return result
+```
+
+---
+
+### Bug 4：B1kInputs 缺少 `video_memory_frames` 字段和 `_stack_history_frames` 函数
+
+**现象**
+
+修完 Bug 2（config.py 传参）后，运行报：
+
+```
+TypeError: B1kInputs.__init__() got an unexpected keyword argument 'video_memory_frames'
+```
+
+**根因**
+
+`openpi-comet-baseline` 的 `b1k_policy.py` 里 `B1kInputs` 是旧版本，缺少：
+1. `video_memory_frames: int = 1` 字段
+2. `_stack_history_frames()` 函数
+3. `_REPACK_TO_RAW` 映射字典
+4. `__call__` 里的 stack 调用和 `temporal_mask` 输出
+
+这些在 `openpi-comet`（组长版本）里已经存在，baseline 迁移时漏掉了。
+
+**修复**
+
+在 `src/openpi/policies/b1k_policy.py` 中：
+
+1. `B1kInputs` 增加字段：
+```python
+# MEM: number of video memory frames. 1 = single-frame (original behavior).
+video_memory_frames: int = 1
+```
+
+2. `__call__` 增加 stack 逻辑：
+```python
+K = self.video_memory_frames
+temporal_mask = None
+if K > 1:
+    base_image, temporal_mask = _stack_history_frames(data, "observation/egocentric_camera", base_image, K)
+    wrist_image_left, _ = _stack_history_frames(data, "observation/wrist_image_left", wrist_image_left, K)
+    wrist_image_right, _ = _stack_history_frames(data, "observation/wrist_image_right", wrist_image_right, K)
+```
+
+3. `return inputs` 前加：
+```python
+if temporal_mask is not None:
+    inputs["temporal_mask"] = temporal_mask
+```
+
+4. 新增 `_REPACK_TO_RAW` 和 `_stack_history_frames()` 函数（从 `openpi-comet` 移植）。
+
+**为什么 K=1 没问题**
+
+`if K > 1:` 保护，K=1 时完全跳过所有新增逻辑。
+
+---
+
 ## 备注
 
 - 本文档记录的是本轮迁移会话中已经做过的修改，不等同于项目全部历史。
