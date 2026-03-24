@@ -152,17 +152,20 @@ class Observation(Generic[ArrayT]):
                         data["image_mask"][key] = mask.repeat_interleave(num_frames)
                     else:
                         data["image_mask"][key] = np.repeat(mask, num_frames)
-        return cls(
-            images=data["image"],
-            image_masks=data["image_mask"],
-            state=data["state"],
-            tokenized_prompt=data.get("tokenized_prompt"),
-            tokenized_prompt_mask=data.get("tokenized_prompt_mask"),
-            token_ar_mask=data.get("token_ar_mask"),
-            token_loss_mask=data.get("token_loss_mask"),
-            pcd_xyz=data.get("pcd_xyz"),
-            temporal_mask=data.get("temporal_mask"),
-        )
+        # MEM: images are [B*K, H, W, C] while state is [B, s]; disable jaxtyping's *b
+        # binding check to avoid TypeCheckError when K > 1.
+        with at.disable_typechecking():
+            return cls(
+                images=data["image"],
+                image_masks=data["image_mask"],
+                state=data["state"],
+                tokenized_prompt=data.get("tokenized_prompt"),
+                tokenized_prompt_mask=data.get("tokenized_prompt_mask"),
+                token_ar_mask=data.get("token_ar_mask"),
+                token_loss_mask=data.get("token_loss_mask"),
+                pcd_xyz=data.get("pcd_xyz"),
+                temporal_mask=data.get("temporal_mask"),
+            )
 
     def to_dict(self) -> at.PyTree[ArrayT]:
         """Convert the Observation to a nested dict."""
