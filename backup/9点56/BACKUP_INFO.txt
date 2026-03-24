@@ -1,0 +1,19 @@
+备份标记: 9点56
+仓库: /root/Training/openpi-comet-baseline
+说明: 关键迁移文件快照，保留相对目录结构。
+文件列表:
+- src/openpi/models/model.py
+- src/openpi/models/siglip.py
+- src/openpi/models/pi0.py
+- src/openpi/training/config.py
+- src/openpi/training/data_loader.py
+- src/openpi/policies/b1k_policy.py
+- src/behavior/learning/datas/dataset.py
+- scripts/train.py
+- scripts/run_k1_smoke.sh
+- scripts/compute_norm_stats.py
+- scripts/test_temporal_siglip.py
+- scripts/test_temporal_pi0.py
+- scripts/test_temporal_pi0_integration.py
+- docs/memory0_1_to_jax_migration_log.md
+- outputs/assets/train/pi05_b1k-k1-smoke-step200/behavior-1k/2025-challenge-demos/norm_stats.json
