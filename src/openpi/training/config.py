@@ -306,7 +306,7 @@ class LeRobotB1KDataConfig(DataConfigFactory):
         # Prepare data for policy training
         # Convert images to uint8 numpy arrays, add masks
         data_transforms = _transforms.Group(
-            inputs=[b1k_policy.B1kInputs(action_dim=model_config.action_dim, model_type=model_config.model_type)],
+            inputs=[b1k_policy.B1kInputs(action_dim=model_config.action_dim, model_type=model_config.model_type, video_memory_frames=getattr(model_config, "video_memory_frames", 1))],
             outputs=[b1k_policy.B1kOutputs(action_dim=23)],
         )
 
@@ -384,6 +384,7 @@ class LeRobotB1KRGBDDataConfig(DataConfigFactory):
                     meta_image_keys=self.meta_image_keys,
                     depth_as_pcd=self.depth_as_pcd,
                     pcd_downsample=self.pcd_downsample,
+                    video_memory_frames=getattr(model_config, "video_memory_frames", 1),
                 )
             ],
             outputs=[b1k_policy.B1kOutputs(action_dim=23)],
@@ -463,6 +464,7 @@ class LeRobotB1KRGBSegmentationDataConfig(DataConfigFactory):
                     meta_image_keys=self.meta_image_keys,
                     depth_as_pcd=self.depth_as_pcd,
                     pcd_downsample=self.pcd_downsample,
+                    video_memory_frames=getattr(model_config, "video_memory_frames", 1),
                 )
             ],
             outputs=[b1k_policy.B1kOutputs(action_dim=23)],
@@ -590,9 +592,6 @@ class TrainConfig:
     val_repo_id: str | None = None
     val_episodes_index: list[int] | None = None
 
-    # MEM: rebalance dataset chunks by skill for more uniform skill sampling
-    skill_resampling: bool = False
-
     @property
     def assets_dirs(self) -> pathlib.Path:
         """Get the assets directory for this config."""
@@ -660,42 +659,6 @@ _CONFIGS = [
         freeze_filter=pi0_config.Pi0Config(pi05=True, action_horizon=32).get_freeze_filter(),
         ema_decay=None,
         checkpoint_base_dir="./outputs/checkpoints/pi05_b1k-k1-smoke-step200",
-        num_workers=8,
-        batch_size=1 * 32,
-        wandb_enabled=False,
-    ),
-    # K=6 smoke test: video memory with 6 frames
-    TrainConfig(
-        name="pi05_b1k-k6-smoke-step200",
-        exp_name="openpi_smoke_k6",
-        project_name="B1K",
-        model=pi0_config.Pi0Config(pi05=True, action_horizon=32, video_memory_frames=6, video_memory_stride_s=1.0),
-        data=LeRobotB1KDataConfig(
-            repo_id="behavior-1k/2025-challenge-demos",
-            base_config=DataConfig(
-                prompt_from_task=True,
-                behavior_dataset_root="../DATASETS/behavior/2025-challenge-demos",
-                episodes_index=list(range(0, 50)),
-                fine_grained_level=1,
-            ),
-        ),
-        weight_loader=weight_loaders.CheckpointWeightLoader("/root/Models/pi05_base/params"),
-        num_train_steps=5000,
-        lr_schedule=_optimizer.CosineDecaySchedule(
-            warmup_steps=100,
-            peak_lr=2.5e-5,
-            decay_steps=5000,
-            decay_lr=2.5e-6,
-        ),
-        log_interval=10,
-        save_interval=1000,
-        val_log_interval=100,
-        val_num_batches=5,
-        val_batch_size=1 * 32,
-        val_episodes_index=list(range(50, 60)),
-        freeze_filter=pi0_config.Pi0Config(pi05=True, action_horizon=32, video_memory_frames=6).get_freeze_filter(),
-        ema_decay=None,
-        checkpoint_base_dir="./outputs/checkpoints/pi05_b1k-k6-smoke-step200",
         num_workers=8,
         batch_size=1 * 32,
         wandb_enabled=False,

@@ -295,6 +295,130 @@
 
 则应安装完整 `omnigibson` 环境，而不是长期依赖 fallback。
 
+---
+
+## K=6 训练链路排障（2026-03-24）
+
+本节记录从 K=1 smoke 训练通过之后，推进 K=6 训练时遇到的两个新 bug 及修复。
+
+---
+
+### Bug 1：SigLIP checkpoint scan→unroll 结构不匹配
+
+**现象**
+
+K=6 训练启动后在加载 `pi05_base` checkpoint 时崩溃：
+
+```
+ValueError: PyTrees have different structure
+```
+
+**根因**
+
+`pi05_base` checkpoint 使用 Flax scan 格式存储 SigLIP encoder blocks：
+- checkpoint：`encoderblock/` — 所有 27 层堆叠为一个 `[27, ...]` 数组
+
+K>1 时模型强制走 unroll 路径（因为不同层需要不同的 `has_temporal_attn`），期望：
+- 模型：`encoderblock_0/`, `encoderblock_1/`, ..., `encoderblock_26/` — 27 个独立 entry
+
+两者结构不同，`_merge_params` 无法对齐。
+
+**为什么 K=1 没问题**
+
+`siglip.py` 里的条件是 `if self.scan and num_frames <= 1`，K=1 时模型本身也用 scan 格式，和 checkpoint 结构完全一致。
+
+**修复**
+
+在 `src/openpi/training/weight_loaders.py` 新增 `_expand_siglip_scan_to_unroll()`：
+
+```python
+def _expand_siglip_scan_to_unroll(flat_loaded: dict, flat_ref: dict) -> dict:
+    """Convert scan-format SigLIP encoderblock params to unroll format.
+
+    pi05_base checkpoint stores all 27 encoder blocks stacked on axis 0 (scan).
+    K>1 forces unroll (27 separate encoderblock_N entries).
+    This function expands v[i] -> encoderblock_i for all i.
+    Mathematically exact — no numerical change.
+    """
+```
+
+在 `_merge_params()` 开头调用：
+
+```python
+flat_loaded = _expand_siglip_scan_to_unroll(flat_loaded, flat_ref)
+```
+
+转换完成后日志输出：
+
+```
+Expanded SigLIP scan params: 1 encoderblock → 27 encoderblock_N entries
+```
+
+**测试**
+
+新增 `scripts/test_scan_to_unroll.py`，10 个纯 numpy 测试：
+- noop（两边都是 scan / 都是 unroll）
+- 输出 key 数量正确
+- 每层数值与 stacked[i] 完全一致
+- 非 encoderblock key 不受影响
+- shape / dtype 保持
+- 27 层真实规模验证
+
+---
+
+### Bug 2：B1kInputs 未收到 video_memory_frames，K 帧未 stack
+
+**现象**
+
+K=6 训练加载完 checkpoint 后，进入 `loss_fn` 时崩溃：
+
+```
+ValueError: Expected batch divisible by num_frames, got BK=32, K=6
+```
+
+**根因分析**
+
+数据流：
+1. `VideoMemoryDataset` 为每个 step 收集 K-1 历史帧，存为 `{cam_key}_history` list
+2. `B1kInputs`（model transform）负责调用 `_stack_history_frames`，把 history + current frame 合并为 `[K, H, W, C]` + `temporal_mask`
+3. `Observation.from_dict` 检测到 ndim=5 的 uint8 图像时，reshape `[B, K, H, W, C] → [B*K, H, W, C]`
+4. SigLIP temporal attention 收到 `[B*K, H, W, C]`，按 K 分组做 causal attention
+
+问题出在第 2 步：`openpi-comet-baseline` 的 `config.py` 里 `B1kInputs` 调用时**没有传 `video_memory_frames`**，默认值为 1，导致 `_stack_history_frames` 永远不被调用。
+
+最终 SigLIP 收到 `[B=32, H, W, C]` 而非 `[B*K=32*6, H, W, C]`，`32 % 6 ≠ 0`，崩溃。
+
+**对比**
+
+```python
+# openpi-comet（组长，正确）
+b1k_policy.B1kInputs(..., video_memory_frames=getattr(model_config, "video_memory_frames", 1))
+
+# openpi-comet-baseline（迁移版，修复前缺失）
+b1k_policy.B1kInputs(action_dim=..., model_type=...)
+```
+
+**为什么 K=1 没问题**
+
+K=1 时 `VideoMemoryDataset` 不创建（只有 `video_memory_frames > 1` 才包裹），`_history` key 不存在，`B1kInputs` 拿 `video_memory_frames=1` 也不调用 stack 逻辑，图像正常为 `[H, W, C]`。
+
+**修复**
+
+在 `src/openpi/training/config.py` 中，所有 `B1kInputs(...)` 调用加上：
+
+```python
+video_memory_frames=getattr(model_config, "video_memory_frames", 1),
+```
+
+涉及三处：
+- `LeRobotB1KDataConfig.create()` — 第 309 行
+- `LeRobotB1KRGBDDataConfig.create()` — 第 381 行
+- `LeRobotB1KRGBSegmentationDataConfig.create()` — 第 460 行
+
+`getattr(..., 1)` 保证 K=1 的 config（无 `video_memory_frames` 字段时）默认回退为 1，不影响已有训练。
+
+---
+
 ## 备注
 
 - 本文档记录的是本轮迁移会话中已经做过的修改，不等同于项目全部历史。

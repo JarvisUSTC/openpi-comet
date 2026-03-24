@@ -98,7 +98,12 @@ class RepackTransform(DataTransformFn):
 
     def __call__(self, data: DataDict) -> DataDict:
         flat_item = flatten_dict(data)
-        return jax.tree.map(lambda k: flat_item[k], self.structure)
+        result = jax.tree.map(lambda k: flat_item[k], self.structure)
+        # MEM: pass through video memory history keys so they survive repacking
+        for key, value in flat_item.items():
+            if "_history" in key:
+                result[key] = value
+        return result
 
 
 @dataclasses.dataclass(frozen=True)

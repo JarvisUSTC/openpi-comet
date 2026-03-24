@@ -154,6 +154,9 @@ class B1kInputs(transforms.DataTransformFn):
 
     pcd_downsample: int = 6
 
+    # MEM: number of video memory frames. 1 = single-frame (original behavior).
+    video_memory_frames: int = 1
+
     def __call__(self, data: dict) -> dict:
         proprio_data = data["observation/state"]
         # extract joint position
@@ -161,11 +164,20 @@ class B1kInputs(transforms.DataTransformFn):
         if "actions" in data:
             action = data["actions"]
 
+        K = self.video_memory_frames
+
         # Possibly need to parse images to uint8 (H,W,C) since LeRobot automatically
         # stores as float32 (C,H,W), gets skipped for policy inference
         base_image = _parse_image(data["observation/egocentric_camera"])
         wrist_image_left = _parse_image(data["observation/wrist_image_left"])
         wrist_image_right = _parse_image(data["observation/wrist_image_right"])
+
+        # MEM: stack history frames if available
+        temporal_mask = None
+        if K > 1:
+            base_image, temporal_mask = _stack_history_frames(data, "observation/egocentric_camera", base_image, K)
+            wrist_image_left, _ = _stack_history_frames(data, "observation/wrist_image_left", wrist_image_left, K)
+            wrist_image_right, _ = _stack_history_frames(data, "observation/wrist_image_right", wrist_image_right, K)
 
         meta_images, meta_image_names = [], []
 
@@ -209,7 +221,46 @@ class B1kInputs(transforms.DataTransformFn):
 
         if self.depth_as_pcd:
             inputs["pcd_xyz"] = pcd_xyz
+        if temporal_mask is not None:
+            inputs["temporal_mask"] = temporal_mask
         return inputs
+
+
+# Mapping from repacked key to raw B1K dataset key (for history lookup)
+_REPACK_TO_RAW = {
+    "observation/egocentric_camera": "observation.images.rgb.head",
+    "observation/wrist_image_left": "observation.images.rgb.left_wrist",
+    "observation/wrist_image_right": "observation.images.rgb.right_wrist",
+}
+
+
+def _stack_history_frames(data: dict, key: str, current_frame: np.ndarray, K: int) -> tuple[np.ndarray, np.ndarray]:
+    """Stack K frames: K-1 history + 1 current. Returns ([K, H, W, C], [K] bool mask).
+
+    Looks for history frames in data using both repacked and raw key conventions.
+    If not available, repeats the current frame K times.
+    The mask indicates which frames are valid (True) vs padded (False).
+    """
+    history = None
+    valid_flags = None
+    for candidate in (f"{key}_history", f"{_REPACK_TO_RAW.get(key, key)}_history"):
+        if candidate in data and len(data[candidate]) >= K - 1:
+            history = [_parse_image(f) for f in data[candidate][-(K - 1):]]
+            valid_key = f"{candidate}_valid"
+            if valid_key in data:
+                valid_flags = list(data[valid_key][-(K - 1):])
+            break
+
+    if history is not None:
+        frames = np.stack(history + [current_frame], axis=0)
+        if valid_flags is not None:
+            mask = np.array(valid_flags + [True], dtype=np.bool_)
+        else:
+            mask = np.ones(K, dtype=np.bool_)
+        return frames, mask
+    frames = np.stack([current_frame] * K, axis=0)
+    mask = np.array([False] * (K - 1) + [True], dtype=np.bool_)
+    return frames, mask
 
 
 @dataclasses.dataclass(frozen=True)
