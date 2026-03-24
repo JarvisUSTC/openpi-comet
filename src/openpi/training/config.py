@@ -663,6 +663,42 @@ _CONFIGS = [
         batch_size=1 * 32,
         wandb_enabled=False,
     ),
+    # smoke test config: K=6 short training for video memory migration checks
+    TrainConfig(
+        name="pi05_b1k-k6-smoke-step200",
+        exp_name="openpi_smoke",
+        project_name="B1K",
+        model=pi0_config.Pi0Config(pi05=True, action_horizon=32, video_memory_frames=6, video_memory_stride_s=1.0),
+        data=LeRobotB1KDataConfig(
+            repo_id="behavior-1k/2025-challenge-demos",
+            base_config=DataConfig(
+                prompt_from_task=True,
+                behavior_dataset_root="../DATASETS/behavior/2025-challenge-demos",
+                episodes_index=list(range(0, 50)),
+                fine_grained_level=1,
+            ),
+        ),
+        weight_loader=weight_loaders.CheckpointWeightLoader("/root/Models/pi05_base/params"),
+        num_train_steps=200,
+        lr_schedule=_optimizer.CosineDecaySchedule(
+            warmup_steps=20,
+            peak_lr=2.5e-5,
+            decay_steps=200,
+            decay_lr=2.5e-6,
+        ),
+        log_interval=10,
+        save_interval=100,
+        val_log_interval=50,
+        val_num_batches=5,
+        val_batch_size=1 * 32,
+        val_episodes_index=list(range(50, 60)),
+        freeze_filter=pi0_config.Pi0Config(pi05=True, action_horizon=32, video_memory_frames=6).get_freeze_filter(),
+        ema_decay=None,
+        checkpoint_base_dir="./outputs/checkpoints/pi05_b1k-k6-smoke-step200",
+        num_workers=8,
+        batch_size=1 * 32,
+        wandb_enabled=False,
+    ),
     # 0. Base Model Configs
     TrainConfig(
         name="pi05_b1k-base",
