@@ -340,6 +340,22 @@ class LeRobotB1KDataConfig(DataConfigFactory):
 
 
 @dataclasses.dataclass(frozen=True)
+class LeRobotB1KSkillDataConfig(LeRobotB1KDataConfig):
+    """LeRobotB1KDataConfig with exposed `skill_list` CLI override.
+
+    `DataConfigFactory.base_config` is suppressed from the tyro CLI, so we expose `skill_list` here
+    to support per-skill (or multi-skill) training via `--data.skill-list "skill:weight" ...`.
+    """
+
+    skill_list: list[str] = dataclasses.field(default_factory=lambda: ["all"])
+
+    @override
+    def create(self, assets_dirs: pathlib.Path, model_config: _model.BaseModelConfig) -> DataConfig:
+        data_config = super().create(assets_dirs, model_config)
+        return dataclasses.replace(data_config, skill_list=self.skill_list)
+
+
+@dataclasses.dataclass(frozen=True)
 class LeRobotB1KRGBDDataConfig(DataConfigFactory):
     action_sequence_keys: Sequence[str] = ("action",)
 
@@ -737,6 +753,72 @@ _CONFIGS = [
         num_workers=8,
         batch_size=16,
         wandb_enabled=False,
+    ),
+    # Skill-group full fine-tune (filtered by skill list)
+    TrainConfig(
+        name="pi05_b1k-sampled_skill_group-full",
+        exp_name="openpi",
+        project_name="B1K",
+        model=pi0_config.Pi0Config(pi05=True, action_horizon=32),
+        data=LeRobotB1KSkillDataConfig(
+            repo_id="behavior-1k/2025-challenge-demos",
+            base_config=DataConfig(
+                prompt_from_task=True,
+                behavior_dataset_root="../DATASETS/behavior/2025-challenge-demos",
+                episodes_index=list(range(0, 180)),
+                fine_grained_level=1,
+            ),
+        ),
+        weight_loader=weight_loaders.CheckpointWeightLoader("/root/Models/pi05_base/params"),
+        num_train_steps=60_000,
+        lr_schedule=_optimizer.CosineDecaySchedule(
+            peak_lr=2.5e-5,
+            decay_steps=60_000,
+        ),
+        log_interval=100,
+        save_interval=5000,
+        val_log_interval=100,
+        val_num_batches=10,
+        val_batch_size=2 * 32,
+        val_episodes_index=list(range(180, 200)),
+        freeze_filter=pi0_config.Pi0Config(pi05=True, action_horizon=32).get_freeze_filter(),
+        ema_decay=None,
+        checkpoint_base_dir="./outputs/checkpoints/pi05_b1k-sampled_skill_group-full",
+        num_workers=8,
+        batch_size=8 * 32,
+    ),
+    # Single-skill full fine-tune (filtered by skill list)
+    TrainConfig(
+        name="pi05_b1k-sampled_single_skill-full",
+        exp_name="openpi",
+        project_name="B1K",
+        model=pi0_config.Pi0Config(pi05=True, action_horizon=32),
+        data=LeRobotB1KSkillDataConfig(
+            repo_id="behavior-1k/2025-challenge-demos",
+            base_config=DataConfig(
+                prompt_from_task=True,
+                behavior_dataset_root="../DATASETS/behavior/2025-challenge-demos",
+                episodes_index=list(range(0, 180)),
+                fine_grained_level=1,
+            ),
+        ),
+        weight_loader=weight_loaders.CheckpointWeightLoader("/root/Models/pi05_base/params"),
+        num_train_steps=30_000,
+        lr_schedule=_optimizer.CosineDecaySchedule(
+            peak_lr=2.5e-5,
+            decay_steps=30_000,
+        ),
+        log_interval=100,
+        save_interval=5000,
+        val_log_interval=100,
+        val_num_batches=10,
+        val_batch_size=2 * 32,
+        val_episodes_index=list(range(180, 200)),
+        freeze_filter=pi0_config.Pi0Config(pi05=True, action_horizon=32).get_freeze_filter(),
+        ema_decay=None,
+        checkpoint_base_dir="./outputs/checkpoints/pi05_b1k-sampled_single_skill-full",
+        num_workers=8,
+        batch_size=8 * 32,
     ),
     # 0. Base Model Configs
     TrainConfig(
