@@ -213,14 +213,9 @@ class Encoder(nn.Module):
             for lyr in range(self.depth):
                 out[f"block{lyr:02d}"] = jax.tree.map(lambda o, lyr=lyr: o[lyr], scan_out)
         else:
-            # Input Encoder (unrolled for K>1 temporal attention)
-            remat_policy = getattr(jax.checkpoint_policies, self.remat_policy, None)
+            # Input Encoder
             for lyr in range(self.depth):
-                block_cur = nn.remat(
-                    Encoder1DBlock,
-                    prevent_cse=False,
-                    policy=remat_policy,
-                )(
+                block_cur = Encoder1DBlock(
                     name=f"encoderblock_{lyr}",
                     dtype_mm=self.dtype_mm,
                     mlp_dim=self.mlp_dim,
