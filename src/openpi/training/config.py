@@ -803,10 +803,10 @@ _CONFIGS = [
             ),
         ),
         weight_loader=weight_loaders.CheckpointWeightLoader("/root/Models/pi05_base/params"),
-        num_train_steps=30_000,
+        num_train_steps=60_000,
         lr_schedule=_optimizer.CosineDecaySchedule(
             peak_lr=2.5e-5,
-            decay_steps=30_000,
+            decay_steps=60_000,
         ),
         log_interval=100,
         save_interval=5000,
