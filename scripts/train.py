@@ -51,8 +51,8 @@ def _make_val_config(config: _config.TrainConfig) -> _config.TrainConfig:
     return dataclasses.replace(config, batch_size=val_batch_size, data=val_data)
 
 
-@at.typecheck
 def eval_step(
+    num_denoise_steps: int,
     rng: at.KeyArrayLike,
     state: training_utils.TrainState,
     batch: tuple[_model.Observation, _model.Actions],
@@ -60,11 +60,28 @@ def eval_step(
     model = nnx.merge(state.model_def, state.params)
     model.eval()
     observation, actions = batch
-    chunked_loss = model.compute_loss(rng, observation, actions, train=False)
+
+    loss_rng, sample_rng = jax.random.split(rng)
+
+    chunked_loss = model.compute_loss(loss_rng, observation, actions, train=False)
     flow_loss = jnp.mean(chunked_loss)
+
+    pred_actions = model.sample_actions(sample_rng, observation, num_steps=num_denoise_steps)
+
+    action_error = pred_actions - actions
+    action_mse = jnp.mean(jnp.square(action_error))
+
+    pred_flat = pred_actions.reshape(pred_actions.shape[0], -1)
+    gt_flat = actions.reshape(actions.shape[0], -1)
+    cos_sim = jnp.sum(pred_flat * gt_flat, axis=-1) / (
+        jnp.linalg.norm(pred_flat, axis=-1) * jnp.linalg.norm(gt_flat, axis=-1) + 1e-8
+    )
+
     return {
         "val_loss": flow_loss,
         "val/flow_loss": flow_loss,
+        "val/action_mse": action_mse,
+        "val/action_cosine_sim": jnp.mean(cos_sim),
     }
 
 
@@ -300,7 +317,7 @@ def main(config: _config.TrainConfig):
             skip_norm_stats=False,
         )
         peval_step = jax.jit(
-            eval_step,
+            functools.partial(eval_step, config.val_denoise_steps),
             in_shardings=(replicated_sharding, train_state_sharding, data_sharding),
             out_shardings=replicated_sharding,
         )
