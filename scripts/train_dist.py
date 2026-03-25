@@ -18,7 +18,6 @@ import tqdm_loggable.auto as tqdm
 import wandb
 
 import openpi.models.model as _model
-import openpi.models.tokenizer as _tokenizer
 import openpi.shared.array_typing as at
 import openpi.shared.nnx_utils as nnx_utils
 import openpi.training.checkpoints_dist as _checkpoints
@@ -28,53 +27,6 @@ import openpi.training.optimizer as _optimizer
 import openpi.training.sharding as sharding
 import openpi.training.utils as training_utils
 import openpi.training.weight_loaders as _weight_loaders
-
-_PROMPT_LOG_INTERVAL = 10
-
-
-def _validation_is_enabled(config: _config.TrainConfig) -> bool:
-    if config.val_log_interval <= 0 or config.val_num_batches <= 0:
-        return False
-    return (config.val_repo_id is not None) or (config.val_episodes_index is not None)
-
-
-def _override_factory_for_val(
-    factory: _config.DataConfigFactory, config: _config.TrainConfig
-) -> _config.DataConfigFactory:
-    if config.val_repo_id is not None:
-        factory = dataclasses.replace(factory, repo_id=config.val_repo_id)
-    if config.val_episodes_index is not None:
-        base = factory.base_config or _config.DataConfig()
-        base = dataclasses.replace(base, episodes_index=config.val_episodes_index)
-        factory = dataclasses.replace(factory, base_config=base)
-    return factory
-
-
-def _make_val_config(config: _config.TrainConfig) -> _config.TrainConfig:
-    val_batch_size = config.batch_size if config.val_batch_size is None else config.val_batch_size
-    if isinstance(config.data, list):
-        val_data = [_override_factory_for_val(f, config) for f in config.data]
-    else:
-        val_data = _override_factory_for_val(config.data, config)
-    return dataclasses.replace(config, batch_size=val_batch_size, data=val_data)
-
-
-def _decode_prompt_for_logging(observation: Any, tokenizer: _tokenizer.PaligemmaTokenizer) -> str:
-    tokens = jax.device_get(observation.tokenized_prompt)[0]
-    token_mask = getattr(observation, "tokenized_prompt_mask", None)
-    token_mask = None if token_mask is None else jax.device_get(token_mask)[0].astype(bool)
-
-    token_ar_mask = getattr(observation, "token_ar_mask", None)
-    token_ar_mask = None if token_ar_mask is None else jax.device_get(token_ar_mask)[0]
-    if token_ar_mask is not None:
-        prompt_mask = token_ar_mask == 0
-        if token_mask is not None:
-            prompt_mask = prompt_mask & token_mask
-        return tokenizer.decode(tokens, mask=prompt_mask)
-
-    if token_mask is not None:
-        return tokenizer.decode(tokens, mask=token_mask)
-    return tokenizer.decode(tokens)
 
 
 def _broadcast_str_from_primary(s: str, max_len: int = 512) -> str:
@@ -250,12 +202,39 @@ def train_step(
     return new_state, info
 
 
+def _validation_is_enabled(config: _config.TrainConfig) -> bool:
+    if config.val_log_interval <= 0 or config.val_num_batches <= 0:
+        return False
+    return (config.val_repo_id is not None) or (config.val_episodes_index is not None)
+
+
+def _override_factory_for_val(
+    factory: _config.DataConfigFactory, config: _config.TrainConfig
+) -> _config.DataConfigFactory:
+    if config.val_repo_id is not None:
+        factory = dataclasses.replace(factory, repo_id=config.val_repo_id)
+    if config.val_episodes_index is not None:
+        base = factory.base_config or _config.DataConfig()
+        base = dataclasses.replace(base, episodes_index=config.val_episodes_index)
+        factory = dataclasses.replace(factory, base_config=base)
+    return factory
+
+
+def _make_val_config(config: _config.TrainConfig) -> _config.TrainConfig:
+    val_batch_size = config.batch_size if config.val_batch_size is None else config.val_batch_size
+    if isinstance(config.data, list):
+        val_data = [_override_factory_for_val(f, config) for f in config.data]
+    else:
+        val_data = _override_factory_for_val(config.data, config)
+    return dataclasses.replace(config, batch_size=val_batch_size, data=val_data)
+
+
 def eval_step(
     num_denoise_steps: int,
     rng: at.KeyArrayLike,
     state: training_utils.TrainState,
     batch: tuple[_model.Observation, _model.Actions],
-) -> dict[str, at.Float[at.Array, ""]]:
+) -> dict[str, at.Array]:
     model = nnx.merge(state.model_def, state.params)
     model.eval()
     observation, actions = batch
@@ -269,7 +248,6 @@ def eval_step(
 
     action_error = pred_actions - actions
     action_mse = jnp.mean(jnp.square(action_error))
-    action_mae = jnp.mean(jnp.abs(action_error))
 
     pred_flat = pred_actions.reshape(pred_actions.shape[0], -1)
     gt_flat = actions.reshape(actions.shape[0], -1)
@@ -277,15 +255,11 @@ def eval_step(
         jnp.linalg.norm(pred_flat, axis=-1) * jnp.linalg.norm(gt_flat, axis=-1) + 1e-8
     )
 
-    first_action_mse = jnp.mean(jnp.square(pred_actions[:, 0] - actions[:, 0]))
-
     return {
         "val_loss": flow_loss,
         "val/flow_loss": flow_loss,
         "val/action_mse": action_mse,
-        "val/action_mae": action_mae,
         "val/action_cosine_sim": jnp.mean(cos_sim),
-        "val/first_action_mse": first_action_mse,
     }
 
 
@@ -339,10 +313,6 @@ def main(config: _config.TrainConfig):
     data_iter = iter(data_loader)
     batch = next(data_iter)
 
-    prompt_tokenizer = None
-    if jax.process_index() == 0:
-        prompt_tokenizer = _tokenizer.PaligemmaTokenizer(config.model.max_token_len)
-
     train_state, train_state_sharding = init_train_state(config, init_rng, mesh, resume=resuming)
     jax.block_until_ready(train_state)
     logging.info(
@@ -376,14 +346,6 @@ def main(config: _config.TrainConfig):
             in_shardings=(replicated_sharding, train_state_sharding, data_sharding),
             out_shardings=replicated_sharding,
         )
-        logging.info(
-            "Validation enabled: val_repo_id=%s val_episodes_index=%s val_batch_size=%s val_num_batches=%s val_log_interval=%s",
-            val_config.val_repo_id,
-            val_config.val_episodes_index,
-            val_config.batch_size,
-            val_config.val_num_batches,
-            val_config.val_log_interval,
-        )
 
     start_step = int(train_state.step)
     pbar = tqdm.tqdm(
@@ -400,14 +362,6 @@ def main(config: _config.TrainConfig):
     logging.info(f"[P{jax.process_index()}] Steps per epoch: {N}")
 
     for step in pbar:
-        if prompt_tokenizer is not None and (step % _PROMPT_LOG_INTERVAL == 0):
-            try:
-                observation, _actions = batch
-                prompt_text = _decode_prompt_for_logging(observation, prompt_tokenizer)
-                pbar.write(f"[prompt step={step}] {prompt_text}")
-            except Exception:
-                logging.exception("Failed to decode/log prompt at step=%s", step)
-
         if val_loader is not None and peval_step is not None and (step % config.val_log_interval == 0):
             try:
                 val_metrics_list = []
