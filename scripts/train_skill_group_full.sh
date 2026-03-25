@@ -94,14 +94,15 @@ export XLA_PYTHON_CLIENT_MEM_FRACTION="${XLA_PYTHON_CLIENT_MEM_FRACTION:-0.9}"
 export XLA_PYTHON_CLIENT_PREALLOCATE="${XLA_PYTHON_CLIENT_PREALLOCATE:-false}"
 export PYTHONUNBUFFERED=1
 
+# Map platform env vars (platform may inject lowercase names)
+export MASTER_ADDR="${master_addr:-${MASTER_ADDR:-}}"
+export MASTER_PORT="${master_port:-${MASTER_PORT:-23456}}"
+export WORLD_SIZE="${nnodes:-${WORLD_SIZE:-}}"
+export WORLD_RANK="${node_rank:-${WORLD_RANK:-${RANK:-}}}"
+NPROC="${nproc_per_node:-${NPROC_PER_NODE:-8}}"
+
 # Use train_dist.py for multi-node, fall back to train.py for single-node
-if [[ -n "${MASTER_ADDR:-}" && -n "${WORLD_SIZE:-}" ]]; then
-  # Multi-node: map platform env vars
-  export MASTER_ADDR="${master_addr:-${MASTER_ADDR}}"
-  export MASTER_PORT="${master_port:-${MASTER_PORT:-23456}}"
-  export WORLD_SIZE="${nnodes:-${WORLD_SIZE}}"
-  export WORLD_RANK="${node_rank:-${WORLD_RANK:-${RANK:-0}}}"
-  NPROC="${nproc_per_node:-${NPROC_PER_NODE:-8}}"
+if [[ -n "${MASTER_ADDR}" && -n "${WORLD_SIZE}" && "${WORLD_SIZE}" -gt 1 ]]; then
   if [[ -z "${CUDA_VISIBLE_DEVICES:-}" ]]; then
     devs=""
     for ((i = 0; i < NPROC; i++)); do
