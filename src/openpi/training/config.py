@@ -735,7 +735,7 @@ _CONFIGS = [
         ema_decay=None,
         checkpoint_base_dir="./outputs/checkpoints/pi05_b1k-k6-smoke-step50000",
         num_workers=8,
-        batch_size=24,
+        batch_size=32,
         wandb_enabled=False,
     ),
     # 0. Base Model Configs
