@@ -86,11 +86,15 @@ PY
   if [[ ! -f "${NORM_STATS_PATH}" ]]; then
     echo "Norm stats not found at: ${NORM_STATS_PATH}"
     echo "Computing norm stats..."
-    uv run scripts/compute_norm_stats.py --config-name "${CONFIG_NAME}"
+    python scripts/compute_norm_stats.py --config-name "${CONFIG_NAME}"
   fi
 fi
 
-uv run scripts/train.py "${CONFIG_NAME}" \
+export XLA_PYTHON_CLIENT_MEM_FRACTION="${XLA_PYTHON_CLIENT_MEM_FRACTION:-0.9}"
+export XLA_PYTHON_CLIENT_PREALLOCATE="${XLA_PYTHON_CLIENT_PREALLOCATE:-false}"
+
+python -u scripts/train.py "${CONFIG_NAME}" \
   --exp-name="${EXP_NAME}" \
+  --overwrite \
   --data.skill-list "${SKILL_ITEMS[@]}" \
   "$@"
