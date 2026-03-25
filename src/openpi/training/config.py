@@ -729,7 +729,7 @@ _CONFIGS = [
         save_interval=5000,
         val_log_interval=500,
         val_num_batches=100,
-        val_batch_size=8,
+        val_batch_size=16,
         val_episodes_index=list(range(50, 60)),
         freeze_filter=pi0_config.Pi0Config(pi05=True, action_horizon=32, video_memory_frames=6).get_freeze_filter(),
         ema_decay=None,
