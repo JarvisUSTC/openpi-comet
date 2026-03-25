@@ -787,12 +787,12 @@ _CONFIGS = [
         num_workers=8,
         batch_size=8 * 32,
     ),
-    # Single-skill full fine-tune (filtered by skill list)
+    # Single-skill full fine-tune (filtered by skill list) with K=6 video memory
     TrainConfig(
         name="pi05_b1k-sampled_single_skill-full",
         exp_name="openpi",
         project_name="B1K",
-        model=pi0_config.Pi0Config(pi05=True, action_horizon=32),
+        model=pi0_config.Pi0Config(pi05=True, action_horizon=32, video_memory_frames=6, video_memory_stride_s=1.0),
         data=LeRobotB1KSkillDataConfig(
             repo_id="behavior-1k/2025-challenge-demos",
             base_config=DataConfig(
@@ -812,13 +812,13 @@ _CONFIGS = [
         save_interval=5000,
         val_log_interval=100,
         val_num_batches=10,
-        val_batch_size=2 * 32,
+        val_batch_size=16,
         val_episodes_index=list(range(180, 200)),
-        freeze_filter=pi0_config.Pi0Config(pi05=True, action_horizon=32).get_freeze_filter(),
+        freeze_filter=pi0_config.Pi0Config(pi05=True, action_horizon=32, video_memory_frames=6).get_freeze_filter(),
         ema_decay=None,
         checkpoint_base_dir="./outputs/checkpoints/pi05_b1k-sampled_single_skill-full",
         num_workers=8,
-        batch_size=8 * 32,
+        batch_size=16,
     ),
     # 0. Base Model Configs
     TrainConfig(
