@@ -92,8 +92,33 @@ fi
 
 export XLA_PYTHON_CLIENT_MEM_FRACTION="${XLA_PYTHON_CLIENT_MEM_FRACTION:-0.9}"
 export XLA_PYTHON_CLIENT_PREALLOCATE="${XLA_PYTHON_CLIENT_PREALLOCATE:-false}"
+export PYTHONUNBUFFERED=1
 
-python -u scripts/train.py "${CONFIG_NAME}" \
+# Use train_dist.py for multi-node, fall back to train.py for single-node
+if [[ -n "${MASTER_ADDR:-}" && -n "${WORLD_SIZE:-}" ]]; then
+  # Multi-node: map platform env vars
+  export MASTER_ADDR="${master_addr:-${MASTER_ADDR}}"
+  export MASTER_PORT="${master_port:-${MASTER_PORT:-23456}}"
+  export WORLD_SIZE="${nnodes:-${WORLD_SIZE}}"
+  export WORLD_RANK="${node_rank:-${WORLD_RANK:-${RANK:-0}}}"
+  NPROC="${nproc_per_node:-${NPROC_PER_NODE:-8}}"
+  if [[ -z "${CUDA_VISIBLE_DEVICES:-}" ]]; then
+    devs=""
+    for ((i = 0; i < NPROC; i++)); do
+      [[ -z "${devs}" ]] && devs="${i}" || devs="${devs},${i}"
+    done
+    export CUDA_VISIBLE_DEVICES="${devs}"
+  fi
+  # Broadcast exp_name from rank 0 only
+  if [[ "${WORLD_RANK}" != "0" ]]; then
+    EXP_NAME="placeholder"
+  fi
+  TRAIN_SCRIPT="scripts/train_dist.py"
+else
+  TRAIN_SCRIPT="scripts/train.py"
+fi
+
+python -u "${TRAIN_SCRIPT}" "${CONFIG_NAME}" \
   --exp-name="${EXP_NAME}" \
   --overwrite \
   --data.skill-list "${SKILL_ITEMS[@]}" \
