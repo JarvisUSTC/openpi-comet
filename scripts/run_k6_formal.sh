@@ -4,6 +4,11 @@
 
 set -euo pipefail
 
+# Activate virtual environment if available
+if [ -f ".venv/bin/activate" ]; then
+    source .venv/bin/activate
+fi
+
 CONFIG_NAME="pi05_b1k-k6-smoke-step50000"
 LOG_DIR="./outputs/logs"
 mkdir -p "$LOG_DIR"
