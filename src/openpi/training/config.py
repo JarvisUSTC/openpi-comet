@@ -702,6 +702,42 @@ _CONFIGS = [
         batch_size=1 * 8,
         wandb_enabled=False,
     ),
+    # K6 formal training: 50k steps with video memory K=6
+    TrainConfig(
+        name="pi05_b1k-k6-smoke-step50000",
+        exp_name="openpi_smoke",
+        project_name="B1K",
+        model=pi0_config.Pi0Config(pi05=True, action_horizon=32, video_memory_frames=6, video_memory_stride_s=1.0),
+        data=LeRobotB1KDataConfig(
+            repo_id="behavior-1k/2025-challenge-demos",
+            base_config=DataConfig(
+                prompt_from_task=True,
+                behavior_dataset_root="../DATASETS/behavior/2025-challenge-demos",
+                episodes_index=list(range(0, 50)),
+                fine_grained_level=1,
+            ),
+        ),
+        weight_loader=weight_loaders.CheckpointWeightLoader("/root/Models/pi05_base/params"),
+        num_train_steps=50000,
+        lr_schedule=_optimizer.CosineDecaySchedule(
+            warmup_steps=1000,
+            peak_lr=2.5e-5,
+            decay_steps=50000,
+            decay_lr=2.5e-6,
+        ),
+        log_interval=10,
+        save_interval=5000,
+        val_log_interval=500,
+        val_num_batches=100,
+        val_batch_size=32,
+        val_episodes_index=list(range(50, 60)),
+        freeze_filter=pi0_config.Pi0Config(pi05=True, action_horizon=32, video_memory_frames=6).get_freeze_filter(),
+        ema_decay=None,
+        checkpoint_base_dir="./outputs/checkpoints/pi05_b1k-k6-smoke-step50000",
+        num_workers=8,
+        batch_size=192,
+        wandb_enabled=False,
+    ),
     # 0. Base Model Configs
     TrainConfig(
         name="pi05_b1k-base",
