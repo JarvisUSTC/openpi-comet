@@ -12,4 +12,4 @@ python scripts/serve_b1k.py \
   --port "${PORT:-8000}" \
   policy:checkpoint \
   --policy.config pi05_b1k-sampled_single_skill-full \
-  --policy.dir "${CHECKPOINT_DIR:-$HOME/Jiawei/openpi-comet-baseline/checkpoints/params}"
+  --policy.dir "${CHECKPOINT_DIR:-$HOME/Jiawei/openpi-comet-baseline/checkpoints}"
