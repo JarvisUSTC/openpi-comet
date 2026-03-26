@@ -90,6 +90,10 @@ def main(args: Args) -> None:
     if args.record:
         policy = _policy.PolicyRecorder(policy, "policy_records")
 
+    # Get video_memory_frames from model config.
+    config = _config.get_config(args.policy.config)
+    video_memory_frames = getattr(config.model, "video_memory_frames", 1)
+
     policy = B1KPolicyWrapper(
         policy,
         task_name=args.task_name,
@@ -98,6 +102,7 @@ def main(args: Args) -> None:
         action_horizon=args.action_horizon,
         temporal_ensemble_max=args.temporal_ensemble_max,
         fine_grained_level=args.fine_grained_level,
+        video_memory_frames=video_memory_frames,
     )
 
     hostname = socket.gethostname()

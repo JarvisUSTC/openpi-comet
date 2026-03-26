@@ -26,6 +26,13 @@ What's the next skill to perform? Only respond with a single skill name.
 
 
 class B1KPolicyWrapper:
+    # Camera keys that need frame history for video memory (K>1).
+    _HISTORY_CAMERA_KEYS = (
+        "observation/egocentric_camera",
+        "observation/wrist_image_left",
+        "observation/wrist_image_right",
+    )
+
     def __init__(
         self,
         policy: BasePolicy,
@@ -35,9 +42,15 @@ class B1KPolicyWrapper:
         action_horizon: int = 5,  # temporal ensemble mode | receeding temporal mode
         temporal_ensemble_max: int = 3,  # receeding temporal mode
         fine_grained_level: int = 0,
+        video_memory_frames: int = 1,
     ) -> None:
         self.policy = policy
         self.task_name = task_name
+        self.video_memory_frames = video_memory_frames
+        # Frame history buffer: stores up to K-1 past frames per camera.
+        self._frame_history: dict[str, deque] = {
+            k: deque(maxlen=max(video_memory_frames - 1, 0)) for k in self._HISTORY_CAMERA_KEYS
+        }
 
         # load the task name from the metadata
         metadata = json.load(open("scripts/task_mapping.json"))
@@ -83,8 +96,24 @@ class B1KPolicyWrapper:
         self.action_queue = deque(maxlen=self.action_horizon)
         self.last_action = {"actions": np.zeros((self.action_horizon, 23), dtype=np.float64)}
         self.step_counter = 0
+        for k in self._frame_history:
+            self._frame_history[k].clear()
         if self.reasoner:
             self.reasoner.reset()
+
+    def _attach_history(self, batch: dict) -> dict:
+        """Attach frame history to batch and update buffers for K>1 video memory."""
+        if self.video_memory_frames <= 1:
+            return batch
+        for key in self._HISTORY_CAMERA_KEYS:
+            if key in batch:
+                current_frame = batch[key]
+                history = list(self._frame_history[key])
+                valid = [True] * len(history) + [False] * (self.video_memory_frames - 1 - len(history))
+                batch[f"{key}_history"] = history + [np.zeros_like(current_frame)] * (self.video_memory_frames - 1 - len(history))
+                batch[f"{key}_history_valid"] = valid
+                self._frame_history[key].append(current_frame.copy())
+        return batch
 
     def process_obs(self, obs: dict) -> dict:
         """
@@ -164,6 +193,8 @@ class B1KPolicyWrapper:
 
             if "observation/egocentric_depth" in nbatch:
                 batch["observation/egocentric_depth"] = nbatch["observation/egocentric_depth"][0]
+
+            batch = self._attach_history(batch)
 
             try:
                 action = self.policy.infer(batch)
@@ -270,6 +301,8 @@ class B1KPolicyWrapper:
 
         if "observation/egocentric_depth" in nbatch:
             batch["observation/egocentric_depth"] = nbatch["observation/egocentric_depth"][0]
+
+        batch = self._attach_history(batch)
 
         if self.fine_grained_level > 0:
             # skill_prompt = SKILL_PROMPT.format(task_prompt=self.task_prompt, skill_prompts="\n".join(self.skill_prompts))
