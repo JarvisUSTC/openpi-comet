@@ -1,5 +1,6 @@
 import bisect
 from collections import defaultdict
+import logging
 from collections.abc import Callable, Iterable
 import json
 import os
@@ -660,7 +661,19 @@ class BehaviorLeRobotDataset(LeRobotDataset):
 
             # load visual observations
             for key in self.meta.video_keys:
-                item[key] = next(self.obs_loaders[key])[0]
+                try:
+                    item[key] = next(self.obs_loaders[key])[0]
+                except StopIteration:
+                    # obs_loader exhausted before skill segment ended
+                    # (annotation end_frame > actual video frames). Skip this episode.
+                    logging.warning(
+                        f"obs_loader exhausted early for ep_idx={ep_idx}, key={key}. "
+                        "Skipping episode and resampling."
+                    )
+                    self.current_streaming_frame_idx = None
+                    self._skill_stream_range_end = None
+                    self._should_obs_loaders_reload = True
+                    return self.__getitem__(idx)
 
                 if self.return_seg_instance and "seg_instance_id" in key:
                     seg_instance, instance_mapping = instance_id_to_instance(

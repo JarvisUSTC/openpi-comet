@@ -2,13 +2,11 @@
 # 单机 8 卡 OpenPi finetune 启动脚本
 # 使用 scripts/train.py：单进程、JAX 自动使用全部可见 GPU（数据+可选 FSDP 分片）
 #
+set -euo pipefail
+
 # 注意（config 里需满足）：
 #   - batch_size 必须能被 GPU 数整除，例如 8 卡时 batch_size=8*32=256
 #   - fsdp_devices：设为 8 时模型 8 路 FSDP 分片（省显存）；设为 1 时仅数据并行
-cd /root/Training/openpi-comet
-source .venv/bin/activate
-
-set -euo pipefail
 
 # ---------- 环境变量（8 卡）---------
 # 指定使用的 GPU，8 卡时通常为 0-7
@@ -28,6 +26,8 @@ export XLA_PYTHON_CLIENT_MEM_FRACTION=0.9
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "${SCRIPT_DIR}/.." && pwd)"
 cd "${REPO_ROOT}"
+
+source .venv/bin/activate
 
 # ---------- 配置与实验名 ----------
 # 对应 config.py 里注册的 TrainConfig 的 name（例如 pi05_b1k-turning_on_radio）

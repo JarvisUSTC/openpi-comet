@@ -28,6 +28,10 @@ import openpi.transforms as _transforms
 ModelType: TypeAlias = _model.ModelType
 # Work around a tyro issue with using nnx.filterlib.Filter directly.
 Filter: TypeAlias = nnx.filterlib.Filter
+_REPO_ROOT = pathlib.Path(__file__).resolve().parents[3]
+_ALL_SKILLS_50K_CHECKPOINT = (
+    _REPO_ROOT / "outputs/checkpoints/pi05_b1k-all_skills/pi05_b1k-all_skills/49999/params"
+)
 
 
 class DroidActionSpace(Enum):
