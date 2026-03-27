@@ -101,6 +101,14 @@ class B1KPolicyWrapper:
         if self.reasoner:
             self.reasoner.reset()
 
+    def _resolve_prompt(self, obs: dict) -> str:
+        """Prefer the evaluator-provided prompt; fall back to the task prompt."""
+        prompt = obs.get("prompt")
+        if prompt is None:
+            return self.task_prompt
+        prompt = str(prompt).strip()
+        return prompt or self.task_prompt
+
     def _attach_history(self, batch: dict) -> dict:
         """Attach frame history to batch and update buffers for K>1 video memory."""
         if self.video_memory_frames <= 1:
@@ -149,6 +157,9 @@ class B1KPolicyWrapper:
             "proprio": prop_state,
         }
 
+        if "prompt" in obs:
+            processed_obs["prompt"] = obs["prompt"]
+
         if "robot_r1::robot_r1:zed_link:Camera:0::depth_linear" in obs:
             depth_obs = obs["robot_r1::robot_r1:zed_link:Camera:0::depth_linear"]
             depth_obs = cv2.resize(depth_obs, (DESPTH_RESIZE_SIZE, DESPTH_RESIZE_SIZE), interpolation=cv2.INTER_LINEAR)
@@ -175,12 +186,13 @@ class B1KPolicyWrapper:
 
             # nbatch["proprio"] is B, 16, where B=1
             joint_positions = nbatch["proprio"][0]
+            prompt = self._resolve_prompt(nbatch)
             batch = {
                 "observation/egocentric_camera": nbatch["observation"][0, 0],
                 "observation/wrist_image_left": nbatch["observation"][0, 1],
                 "observation/wrist_image_right": nbatch["observation"][0, 2],
                 "observation/state": joint_positions,
-                "prompt": self.task_prompt,
+                "prompt": prompt,
             }
 
             if self.fine_grained_level > 0:
@@ -291,12 +303,13 @@ class B1KPolicyWrapper:
 
         # nbatch["proprio"] is B, 16, where B=1
         joint_positions = nbatch["proprio"][0]
+        prompt = self._resolve_prompt(nbatch)
         batch = {
             "observation/egocentric_camera": nbatch["observation"][0, 0],
             "observation/wrist_image_left": nbatch["observation"][0, 1],
             "observation/wrist_image_right": nbatch["observation"][0, 2],
             "observation/state": joint_positions,
-            "prompt": self.task_prompt,
+            "prompt": prompt,
         }
 
         if "observation/egocentric_depth" in nbatch:
