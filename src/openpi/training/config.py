@@ -819,6 +819,7 @@ _CONFIGS = [
         checkpoint_base_dir="./outputs/checkpoints/pi05_b1k-sampled_single_skill-full",
         num_workers=8,
         batch_size=16,
+        fsdp_devices=2,
     ),
     # 0. Base Model Configs
     TrainConfig(
