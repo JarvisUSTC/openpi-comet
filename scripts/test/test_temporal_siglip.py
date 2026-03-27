@@ -46,6 +46,24 @@ def main():
     assert jnp.isfinite(out_full_true).all(), "Output contains non-finite values with full temporal_mask"
     print("[PASS] temporal_mask stability check")
 
+    # Test 4: multi-frame training path should support backward pass with remat enabled.
+    def loss_fn(p):
+        out, _ = model.apply(
+            p,
+            img_k3,
+            train=True,
+            num_frames=num_frames,
+            temporal_mask=mask_k3,
+        )
+        return jnp.mean(out)
+
+    loss, grads = jax.value_and_grad(loss_fn)(params)
+    grad_leaves = jax.tree.leaves(grads)
+    assert jnp.isfinite(loss), "Loss contains non-finite values in backward test"
+    assert grad_leaves, "Expected non-empty gradients from backward test"
+    assert all(jnp.isfinite(g).all() for g in grad_leaves), "Gradient contains non-finite values in backward test"
+    print("[PASS] K=3 backward pass with remat")
+
     print("ALL PASS")
 
 

@@ -130,7 +130,6 @@ class Encoder1DBlock(nn.Module):
         self,
         x,
         deterministic=True,
-        *,
         num_frames=1,
         temporal_mask=None,
         has_temporal_attn=False,
@@ -194,7 +193,7 @@ class Encoder(nn.Module):
             block = nn.remat(
                 Encoder1DBlock,
                 prevent_cse=False,
-                static_argnums=(2,),  # 0=self, 2=deterministic
+                static_argnums=(2, 3, 5),  # 0=self, 2=deterministic, 3=num_frames, 5=has_temporal_attn
                 policy=getattr(jax.checkpoint_policies, self.remat_policy, None),
             )
             x, scan_out = nn.scan(
@@ -209,13 +208,19 @@ class Encoder(nn.Module):
                 mlp_dim=self.mlp_dim,
                 num_heads=self.num_heads,
                 dropout=self.dropout,
-            )(x, deterministic, num_frames=1, temporal_mask=None, has_temporal_attn=False)
+            )(x, deterministic, 1, None, False)
             for lyr in range(self.depth):
                 out[f"block{lyr:02d}"] = jax.tree.map(lambda o, lyr=lyr: o[lyr], scan_out)
         else:
             # Input Encoder
+            block_cls = nn.remat(
+                Encoder1DBlock,
+                prevent_cse=False,
+                static_argnums=(2, 3, 5),  # 0=self, 2=deterministic, 3=num_frames, 5=has_temporal_attn
+                policy=getattr(jax.checkpoint_policies, self.remat_policy, None),
+            )
             for lyr in range(self.depth):
-                block_cur = Encoder1DBlock(
+                block_cur = block_cls(
                     name=f"encoderblock_{lyr}",
                     dtype_mm=self.dtype_mm,
                     mlp_dim=self.mlp_dim,
@@ -225,9 +230,9 @@ class Encoder(nn.Module):
                 x, out[f"block{lyr:02d}"] = block_cur(
                     x,
                     deterministic,
-                    num_frames=num_frames,
-                    temporal_mask=temporal_mask,
-                    has_temporal_attn=((lyr + 1) % 4 == 0),
+                    num_frames,
+                    temporal_mask,
+                    ((lyr + 1) % 4 == 0),
                 )
             out["pre_ln"] = x  # Alias for last block, but without the number in it.
 
