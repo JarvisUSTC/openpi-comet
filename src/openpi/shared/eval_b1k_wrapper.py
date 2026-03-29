@@ -203,6 +203,8 @@ class B1KPolicyWrapper:
 
     def act_receeding_temporal(self, input_obs):
         if self._stop_active:
+            # Still advance the internal step counter for consistent logging / warmup behavior.
+            self.step_counter += 1
             return self._make_stop_action()
 
         # Step 1: check if we should re-run policy
@@ -329,6 +331,8 @@ class B1KPolicyWrapper:
         """
         input_obs = self.process_obs(input_obs)
         if self._stop_active:
+            # Still advance the internal step counter for consistent logging / warmup behavior.
+            self.step_counter += 1
             return self._make_stop_action()
 
         if self.control_mode == "receeding_temporal":
@@ -373,7 +377,9 @@ class B1KPolicyWrapper:
                         self._maybe_update_stop(float(stop_prob))
                         if self._stop_active:
                             self._stop_hold_action = np.asarray(final_action[0]).copy()
+                            self.step_counter += 1
                             return self._make_stop_action()
+                self.step_counter += 1
                 return torch.from_numpy(final_action)
 
         nbatch = copy.deepcopy(input_obs)
@@ -470,5 +476,7 @@ class B1KPolicyWrapper:
                 self._stop_hold_action = final_np.copy()
             else:
                 self._stop_hold_action = None
+            self.step_counter += 1
             return self._make_stop_action()
+        self.step_counter += 1
         return torch.from_numpy(final_action)
