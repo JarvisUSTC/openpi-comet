@@ -35,6 +35,12 @@ class B1KPolicyWrapper:
         action_horizon: int = 5,  # temporal ensemble mode | receeding temporal mode
         temporal_ensemble_max: int = 3,  # receeding temporal mode
         fine_grained_level: int = 0,
+        *,
+        stop_enabled: bool = False,
+        stop_threshold: float = 0.6,
+        stop_patience: int = 3,
+        stop_action: str = "hold",  # hold | zero
+        stop_warmup_steps: int = 0,
     ) -> None:
         self.policy = policy
         self.task_name = task_name
@@ -63,6 +69,17 @@ class B1KPolicyWrapper:
         else:
             self.reasoner = None
 
+        # Stop gating (Option A): keep sending a hold/zero action after stop triggers.
+        self.stop_enabled = stop_enabled
+        self.stop_threshold = float(stop_threshold)
+        self.stop_patience = int(stop_patience)
+        self.stop_action = str(stop_action)
+        self.stop_warmup_steps = int(stop_warmup_steps)
+        self._stop_counter = 0
+        self._stop_active = False
+        self._stop_hold_action: np.ndarray | None = None  # (23,)
+        self._last_stop_prob: float | None = None
+
         self.log_config()
 
     def log_config(self):
@@ -73,6 +90,11 @@ class B1KPolicyWrapper:
         logger.info(f"{self.temporal_ensemble_max=}")
         logger.info(f"{self.replan_interval=}")
         logger.info(f"{self.fine_grained_level=}")
+        logger.info(f"{self.stop_enabled=}")
+        logger.info(f"{self.stop_threshold=}")
+        logger.info(f"{self.stop_patience=}")
+        logger.info(f"{self.stop_action=}")
+        logger.info(f"{self.stop_warmup_steps=}")
         logger.info(f"{self.step_counter=}")
         logger.info(f"{self.action_queue=}")
         logger.info(f"{self.task_prompt=}")
@@ -85,6 +107,42 @@ class B1KPolicyWrapper:
         self.step_counter = 0
         if self.reasoner:
             self.reasoner.reset()
+        self._stop_counter = 0
+        self._stop_active = False
+        self._stop_hold_action = None
+        self._last_stop_prob = None
+
+    def _make_stop_action(self) -> torch.Tensor:
+        if self.stop_action == "hold" and self._stop_hold_action is not None:
+            return torch.from_numpy(self._stop_hold_action[None])
+        # Default: output zeros (acts like "no-op" for many controllers, but verify in your env).
+        return torch.from_numpy(np.zeros((1, 23), dtype=np.float64))
+
+    def _maybe_update_stop(self, stop_prob: float | None) -> None:
+        if not self.stop_enabled or stop_prob is None:
+            return
+        self._last_stop_prob = float(stop_prob)
+
+        if self.step_counter < self.stop_warmup_steps:
+            self._stop_counter = 0
+            return
+
+        if self._last_stop_prob >= self.stop_threshold:
+            self._stop_counter += 1
+        else:
+            self._stop_counter = 0
+
+        if not self._stop_active and self._stop_counter >= self.stop_patience:
+            self._stop_active = True
+            # Clear pending actions; we will hold/zero from now on.
+            self.action_queue.clear()
+            logger.info(
+                "STOP triggered: stop_prob=%.4f threshold=%.3f patience=%d step=%d",
+                self._last_stop_prob,
+                self.stop_threshold,
+                self.stop_patience,
+                self.step_counter,
+            )
 
     def process_obs(self, obs: dict) -> dict:
         """
@@ -136,6 +194,9 @@ class B1KPolicyWrapper:
         return processed_obs
 
     def act_receeding_temporal(self, input_obs):
+        if self._stop_active:
+            return self._make_stop_action()
+
         # Step 1: check if we should re-run policy
         if self.step_counter % self.replan_interval == 0:
             nbatch = copy.deepcopy(input_obs)
@@ -175,6 +236,12 @@ class B1KPolicyWrapper:
                 )
 
             target_joint_positions = action["actions"].copy()
+            stop_prob = None
+            if "stop_prob" in action:
+                try:
+                    stop_prob = float(action["stop_prob"])
+                except Exception:
+                    stop_prob = None
 
             # Add this sequence to action queue
             new_seq = deque([a for a in target_joint_positions[: self.max_len]])
@@ -207,6 +274,16 @@ class B1KPolicyWrapper:
         final_action[-9] = actions_current_timestep[0, -9]
         final_action[-1] = actions_current_timestep[0, -1]
         final_action = final_action[None]
+
+        # Update stop state based on stop_prob observed at the last replanning step (if available).
+        # If stop triggers, hold the current final_action.
+        try:
+            self._maybe_update_stop(stop_prob)  # type: ignore[possibly-undefined]
+        except Exception:
+            pass
+        if self._stop_active:
+            self._stop_hold_action = np.asarray(final_action[0]).copy()
+            return self._make_stop_action()
 
         self.step_counter += 1
 
@@ -243,6 +320,9 @@ class B1KPolicyWrapper:
             Shape: (10, 16)
         """
         input_obs = self.process_obs(input_obs)
+        if self._stop_active:
+            return self._make_stop_action()
+
         if self.control_mode == "receeding_temporal":
             return self.act_receeding_temporal(input_obs)
 
@@ -290,6 +370,12 @@ class B1KPolicyWrapper:
         # action shape: (10, 23), joint_positions shape: (23,)
         # Need to broadcast joint_positions to match action sequence length
         target_joint_positions = action["actions"].copy()
+        stop_prob = None
+        if "stop_prob" in action:
+            try:
+                stop_prob = float(action["stop_prob"])
+            except Exception:
+                stop_prob = None
         if self.control_mode == "receeding_horizon":
             self.action_queue = deque([a for a in target_joint_positions[: self.max_len]])
             final_action = self.action_queue.popleft()[None]
@@ -314,4 +400,17 @@ class B1KPolicyWrapper:
             final_action = final_action[None]
         else:
             final_action = target_joint_positions
+
+        # Stop gating: if triggered, hold the current output and clear any queued actions.
+        self._maybe_update_stop(stop_prob)
+        if self._stop_active:
+            # Cache the action we were about to send as the hold action.
+            final_np = np.asarray(final_action)
+            if final_np.ndim == 2:
+                self._stop_hold_action = final_np[0].copy()
+            elif final_np.ndim == 1:
+                self._stop_hold_action = final_np.copy()
+            else:
+                self._stop_hold_action = None
+            return self._make_stop_action()
         return torch.from_numpy(final_action)

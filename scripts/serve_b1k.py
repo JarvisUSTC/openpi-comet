@@ -71,11 +71,28 @@ class Args:
     action_horizon: int = 5  # temporal ensemble mode
     temporal_ensemble_max: int = 3  # receeding temporal mode
 
+    # Denoising steps for pi0/pi05 sampling.
+    denoise_steps: int = 10
+
+    # Stop gating (Option A): stop action generation and keep sending hold/zero actions once stop triggers.
+    stop_enabled: bool = False
+    stop_threshold: float = 0.6
+    stop_patience: int = 3
+    stop_action: str = "hold"  # hold | zero
+    stop_warmup_steps: int = 0
+
 
 def create_policy(args: Args) -> _policy.Policy:
     """Create a policy from the given arguments."""
+    sample_kwargs = {
+        "num_steps": args.denoise_steps,
+        "return_stop_prob": args.stop_enabled,
+    }
     return _policy_config.create_trained_policy(
-        _config.get_config(args.policy.config), args.policy.dir, default_prompt=args.default_prompt
+        _config.get_config(args.policy.config),
+        args.policy.dir,
+        default_prompt=args.default_prompt,
+        sample_kwargs=sample_kwargs,
     )
 
 
@@ -98,6 +115,11 @@ def main(args: Args) -> None:
         action_horizon=args.action_horizon,
         temporal_ensemble_max=args.temporal_ensemble_max,
         fine_grained_level=args.fine_grained_level,
+        stop_enabled=args.stop_enabled,
+        stop_threshold=args.stop_threshold,
+        stop_patience=args.stop_patience,
+        stop_action=args.stop_action,
+        stop_warmup_steps=args.stop_warmup_steps,
     )
 
     hostname = socket.gethostname()
