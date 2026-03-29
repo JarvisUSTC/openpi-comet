@@ -122,6 +122,10 @@ class DataConfig:
     # tolerance decoding
     tolerance_s: float = 1e-4
 
+    # Whether to check timestamp synchronization between modalities / state / actions on dataset init.
+    # This can be very slow for large episode selections since it materializes the full timestamp column.
+    check_timestamp_sync: bool = True
+
     # fine-grained level of orchestrators to use for training
     fine_grained_level: int = 0  # 0, 1, 2
 
@@ -133,6 +137,15 @@ class DataConfig:
 
     # skill list to use for training
     skill_list: list[str] = dataclasses.field(default_factory=lambda: ["all"])
+
+    # Weak stop supervision margins (in frames) for skill-end prediction.
+    # If skill_end is known:
+    #   d = (skill_end - frame_index)
+    #   d <= stop_pos_margin_frames => positive label (mask=1)
+    #   d >= stop_neg_margin_frames => negative label (mask=1)
+    #   otherwise => ignore (mask=0)
+    stop_pos_margin_frames: int = 0
+    stop_neg_margin_frames: int = 15
 
 
 class GroupFactory(Protocol):
@@ -236,6 +249,11 @@ class DataConfigFactory(abc.ABC):
     base_config: tyro.conf.Suppress[DataConfig | None] = None
     # Meta image keys to use for training
     meta_image_keys: list[str] = dataclasses.field(default_factory=list)
+    # Weak stop supervision margins (in frames) for skill-end prediction.
+    stop_pos_margin_frames: int = 0
+    stop_neg_margin_frames: int = 15
+    # Whether to check timestamp sync when constructing the dataset.
+    check_timestamp_sync: bool = True
 
     @abc.abstractmethod
     def create(self, assets_dirs: pathlib.Path, model_config: _model.BaseModelConfig) -> DataConfig:
@@ -250,6 +268,9 @@ class DataConfigFactory(abc.ABC):
             asset_id=asset_id,
             norm_stats=self._load_norm_stats(epath.Path(self.assets.assets_dir or assets_dirs), asset_id),
             use_quantile_norm=model_config.model_type != ModelType.PI0,
+            stop_pos_margin_frames=self.stop_pos_margin_frames,
+            stop_neg_margin_frames=self.stop_neg_margin_frames,
+            check_timestamp_sync=self.check_timestamp_sync,
         )
 
     def _load_norm_stats(self, assets_dir: epath.Path, asset_id: str | None) -> dict[str, _transforms.NormStats] | None:
@@ -299,6 +320,8 @@ class LeRobotB1KDataConfig(DataConfigFactory):
                         "observation/state": "observation.state",
                         "actions": "action",
                         "prompt": "prompt",
+                        "stop_label": "stop_label",
+                        "stop_mask": "stop_mask",
                     }
                 )
             ]
@@ -386,6 +409,8 @@ class LeRobotB1KRGBDDataConfig(DataConfigFactory):
                         "observation/state": "observation.state",
                         "actions": "action",
                         "prompt": "prompt",
+                        "stop_label": "stop_label",
+                        "stop_mask": "stop_mask",
                     }
                 )
             ]
@@ -461,6 +486,8 @@ class LeRobotB1KRGBSegmentationDataConfig(DataConfigFactory):
                         "observation/state": "observation.state",
                         "actions": "action",
                         "prompt": "prompt",
+                        "stop_label": "stop_label",
+                        "stop_mask": "stop_mask",
                     }
                 )
             ]
@@ -866,6 +893,43 @@ _CONFIGS = [
         batch_size=8 * 32,
     ),
     TrainConfig(
+        # Pi05 skill-level training with weak stop supervision.
+        # Uses fine_grained_level=1 to align stop labels with skill segments.
+        name="pi05_b1k-skill_stop",
+        exp_name="openpi",
+        project_name="B1K",
+        model=pi0_config.Pi0Config(pi05=True, action_horizon=32),
+        data=LeRobotB1KDataConfig(
+            repo_id="behavior-1k/2025-challenge-demos",
+            stop_pos_margin_frames=0,
+            stop_neg_margin_frames=15,
+            base_config=DataConfig(
+                prompt_from_task=True,
+                behavior_dataset_root="../DATASETS/behavior/2025-challenge-demos",
+                # Train/val split: these are PER-TASK positional episode indices (not global episode ids).
+                episodes_index=list(range(0, 180)),
+                fine_grained_level=1,  # B1K: 1=skill segments (from annotations/orchestrators)
+            ),
+        ),
+        weight_loader=weight_loaders.CheckpointWeightLoader("gs://openpi-assets/checkpoints/pi05_base/params"),
+        num_train_steps=50_000,
+        lr_schedule=_optimizer.CosineDecaySchedule(
+            peak_lr=2.5e-5,
+            decay_steps=50_000,
+        ),
+        log_interval=100,
+        save_interval=5000,
+        val_log_interval=100,
+        val_num_batches=10,
+        val_batch_size=2 * 32,
+        val_episodes_index=list(range(180, 200)),
+        freeze_filter=pi0_config.Pi0Config(pi05=True, action_horizon=32).get_freeze_filter(),
+        ema_decay=None,
+        checkpoint_base_dir="./outputs/checkpoints/pi05_b1k-skill_stop",
+        num_workers=8,
+        batch_size=8 * 32,
+    ),
+    TrainConfig(
         # LoRA fine-tune (skill-filtered). Override via:
         #   --data.skill-list "open door:1.0"
         #   --data.skill-list "open door:1.0" "close door:1.0" ...
@@ -1010,6 +1074,86 @@ _CONFIGS = [
         ).get_freeze_filter(),
         ema_decay=None,
         checkpoint_base_dir="./outputs/checkpoints/pi05_b1k-sampled_single_skill-full",
+        num_workers=8,
+        batch_size=8 * 32,
+    ),
+    TrainConfig(
+        # Full fine-tune (skill-group filtered) + weak stop supervision head (Pi05).
+        # Override via:
+        #   --data.skill-list "place on:1.0" "place under:1.0" ...
+        name="pi05_b1k-sampled_skill_group-stop-full-pretrained",
+        exp_name="openpi",
+        project_name="B1K",
+        model=pi0_config.Pi0Config(pi05=True, action_horizon=32),
+        data=LeRobotB1KSkillDataConfig(
+            repo_id="behavior-1k/2025-challenge-demos",
+            stop_pos_margin_frames=0,
+            stop_neg_margin_frames=15,
+            check_timestamp_sync=False,
+            base_config=DataConfig(
+                prompt_from_task=True,
+                behavior_dataset_root="../DATASETS/behavior/2025-challenge-demos",
+                # Train/val split: these are PER-TASK positional episode indices (not global episode ids).
+                episodes_index=list(range(0, 180)),
+                fine_grained_level=1,  # skill segments
+            ),
+        ),
+        weight_loader=weight_loaders.CheckpointWeightLoader(
+            "/root/Training/openpi-comet/outputs/checkpoints/pi05_b1k-all_skills/pi05_b1k-all_skills/49999/params"
+        ),
+        num_train_steps=60_000,
+        lr_schedule=_optimizer.CosineDecaySchedule(
+            peak_lr=2.5e-5,
+            decay_steps=60_000,
+        ),
+        log_interval=100,
+        save_interval=5000,
+        val_log_interval=100,
+        val_num_batches=10,
+        val_batch_size=2 * 32,
+        val_episodes_index=list(range(180, 200)),
+        freeze_filter=pi0_config.Pi0Config(pi05=True, action_horizon=32).get_freeze_filter(),
+        ema_decay=None,
+        checkpoint_base_dir="./outputs/checkpoints/pi05_b1k-sampled_skill_group-stop-full-pretrained",
+        num_workers=8,
+        batch_size=8 * 32,
+    ),
+    TrainConfig(
+        # Full fine-tune (skill-filtered) + weak stop supervision head (Pi05).
+        # Override via:
+        #   --data.skill-list "open door:1.0"
+        name="pi05_b1k-sampled_single_skill-stop-full-pretrained",
+        exp_name="openpi",
+        project_name="B1K",
+        model=pi0_config.Pi0Config(pi05=True, action_horizon=32),
+        data=LeRobotB1KSkillDataConfig(
+            repo_id="behavior-1k/2025-challenge-demos",
+            stop_pos_margin_frames=0,
+            stop_neg_margin_frames=15,
+            check_timestamp_sync=False,
+            base_config=DataConfig(
+                prompt_from_task=True,
+                behavior_dataset_root="../DATASETS/behavior/2025-challenge-demos",
+                # Train/val split: these are PER-TASK positional episode indices (not global episode ids).
+                episodes_index=list(range(0, 180)),
+                fine_grained_level=1,  # skill segments
+            ),
+        ),
+        weight_loader=weight_loaders.CheckpointWeightLoader("/root/Training/openpi-comet/outputs/checkpoints/pi05_b1k-all_skills/pi05_b1k-all_skills/49999/params"),
+        num_train_steps=30_000,
+        lr_schedule=_optimizer.CosineDecaySchedule(
+            peak_lr=2.5e-5,
+            decay_steps=30_000,
+        ),
+        log_interval=100,
+        save_interval=5000,
+        val_log_interval=100,
+        val_num_batches=10,
+        val_batch_size=2 * 32,
+        val_episodes_index=list(range(180, 200)),
+        freeze_filter=pi0_config.Pi0Config(pi05=True, action_horizon=32).get_freeze_filter(),
+        ema_decay=None,
+        checkpoint_base_dir="./outputs/checkpoints/pi05_b1k-sampled_single_skill-stop-full-pretrained",
         num_workers=8,
         batch_size=8 * 32,
     ),

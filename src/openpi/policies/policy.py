@@ -59,9 +59,13 @@ class Policy(BasePolicy):
             self._model = self._model.to(pytorch_device)
             self._model.eval()
             self._sample_actions = model.sample_actions
+            self._sample_actions_with_stop = None
         else:
             # JAX model setup
             self._sample_actions = nnx_utils.module_jit(model.sample_actions)
+            self._sample_actions_with_stop = (
+                nnx_utils.module_jit(model.sample_actions_with_stop) if hasattr(model, "sample_actions_with_stop") else None
+            )
             self._rng = rng or jax.random.key(0)
 
     @override
@@ -78,8 +82,9 @@ class Policy(BasePolicy):
             inputs = jax.tree.map(lambda x: torch.from_numpy(np.array(x)).to(self._pytorch_device)[None, ...], inputs)
             sample_rng_or_pytorch_device = self._pytorch_device
 
-        # Prepare kwargs for sample_actions
+        # Prepare kwargs for sampling
         sample_kwargs = dict(self._sample_kwargs)
+        return_stop_prob = bool(sample_kwargs.pop("return_stop_prob", False))
         if noise is not None:
             noise = torch.from_numpy(noise).to(self._pytorch_device) if self._is_pytorch_model else jnp.asarray(noise)
 
@@ -88,9 +93,15 @@ class Policy(BasePolicy):
             sample_kwargs["noise"] = noise
         observation = _model.Observation.from_dict(inputs)
         start_time = time.monotonic()
+        stop_prob = None
+        if return_stop_prob and self._sample_actions_with_stop is not None:
+            actions, stop_prob = self._sample_actions_with_stop(sample_rng_or_pytorch_device, observation, **sample_kwargs)
+        else:
+            actions = self._sample_actions(sample_rng_or_pytorch_device, observation, **sample_kwargs)
+
         outputs = {
             "state": inputs["state"],
-            "actions": self._sample_actions(sample_rng_or_pytorch_device, observation, **sample_kwargs),
+            "actions": actions,
         }
         model_time = time.monotonic() - start_time
         if self._is_pytorch_model:
@@ -99,6 +110,8 @@ class Policy(BasePolicy):
             outputs = jax.tree.map(lambda x: np.asarray(x[0, ...]), outputs)
 
         outputs = self._output_transform(outputs)
+        if stop_prob is not None:
+            outputs["stop_prob"] = np.asarray(stop_prob[0, ...])
         outputs["policy_timing"] = {
             "infer_ms": model_time * 1000,
         }

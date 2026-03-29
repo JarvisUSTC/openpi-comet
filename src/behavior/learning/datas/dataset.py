@@ -53,6 +53,7 @@ from behavior.learning.datas.skill_prompt import _flatten_objs
 from behavior.learning.datas.skill_prompt import _sanitize_object_name
 from behavior.learning.datas.skill_prompt import _skill_desc_text
 from behavior.learning.datas.skill_prompt import format_skill_prompt
+from behavior.learning.datas.stop_supervision import compute_stop_label_and_mask
 
 
 
@@ -171,6 +172,8 @@ class BehaviorLeRobotDataset(LeRobotDataset):
         train_rgb_type: str = "regular",  # regular | bbox | point
         return_seg_instance: bool = False,
         skill_list: list[str] = ["all"],
+        stop_pos_margin_frames: int = 0,
+        stop_neg_margin_frames: int = 15,
     ):
         """
         Custom args:
@@ -217,6 +220,8 @@ class BehaviorLeRobotDataset(LeRobotDataset):
         self.return_seg_instance = return_seg_instance
         self.train_rgb_type = train_rgb_type
         self.skill_list = skill_list
+        self.stop_pos_margin_frames = stop_pos_margin_frames
+        self.stop_neg_margin_frames = stop_neg_margin_frames
 
         # Unused attributes
         self.image_writer = None
@@ -349,10 +354,12 @@ class BehaviorLeRobotDataset(LeRobotDataset):
 
         # Check timestamps
         if check_timestamp_sync:
+            logger.info("Checking timestamp synchronization (this can be slow for large selections)...")
             timestamps = th.stack(self.hf_dataset["timestamp"]).numpy()
             episode_indices = th.stack(self.hf_dataset["episode_index"]).numpy()
             ep_data_index_np = {k: t.numpy() for k, t in self.episode_data_index.items()}
             check_timestamps_sync(timestamps, episode_indices, ep_data_index_np, self.fps, self.tolerance_s)
+            logger.info("Timestamp synchronization check finished.")
 
         # Setup delta_indices
         if self.delta_timestamps is not None:
@@ -566,6 +573,14 @@ class BehaviorLeRobotDataset(LeRobotDataset):
             skill_end = self._get_skill_end_frame(ep_idx, frame_index)
             if skill_end is not None:
                 self._mask_action_chunks_to_skill_end(item, frame_index, skill_end)
+            stop_label, stop_mask = compute_stop_label_and_mask(
+                frame_index=frame_index,
+                skill_end=skill_end,
+                pos_margin_frames=self.stop_pos_margin_frames,
+                neg_margin_frames=self.stop_neg_margin_frames,
+            )
+            item["stop_label"] = stop_label
+            item["stop_mask"] = stop_mask
             return item
 
         # Skill streaming path: sample an eligible skill segment, seek once to its start,
@@ -695,6 +710,14 @@ class BehaviorLeRobotDataset(LeRobotDataset):
             skill_end = self._get_skill_end_frame(ep_idx, frame_index)
             if skill_end is not None:
                 self._mask_action_chunks_to_skill_end(item, frame_index, skill_end)
+            stop_label, stop_mask = compute_stop_label_and_mask(
+                frame_index=frame_index,
+                skill_end=skill_end,
+                pos_margin_frames=self.stop_pos_margin_frames,
+                neg_margin_frames=self.stop_neg_margin_frames,
+            )
+            item["stop_label"] = stop_label
+            item["stop_mask"] = stop_mask
 
             self.current_streaming_frame_idx += 1
             return item
@@ -838,6 +861,14 @@ class BehaviorLeRobotDataset(LeRobotDataset):
         skill_end = self._get_skill_end_frame(ep_idx, frame_index)
         if skill_end is not None:
             self._mask_action_chunks_to_skill_end(item, frame_index, skill_end)
+        stop_label, stop_mask = compute_stop_label_and_mask(
+            frame_index=frame_index,
+            skill_end=skill_end,
+            pos_margin_frames=self.stop_pos_margin_frames,
+            neg_margin_frames=self.stop_neg_margin_frames,
+        )
+        item["stop_label"] = stop_label
+        item["stop_mask"] = stop_mask
         self.current_streaming_frame_idx += 1
 
         return item

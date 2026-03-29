@@ -16,6 +16,8 @@ from openpi.shared import array_typing as at
 
 logger = logging.getLogger("openpi")
 
+STOP_LOSS_WEIGHT = 0.1
+
 
 def make_attn_mask(input_mask, mask_ar):
     """Adapted from big_vision.
@@ -113,8 +115,26 @@ class Pi0(_model.BaseModel):
             )
             self.pointnet.lazy_init(config.fake_obs().pcd_xyz, rngs=rngs)
 
+        # Weak stop head (skill-end probability). For Pi05, the discrete state input is already included in the
+        # tokenized prompt, so we use pooled prefix hidden states as features.
+        self.stop_head = nnx.Linear(paligemma_config.width, 1, rngs=rngs)
+
         # This attribute gets automatically set by model.train() and model.eval().
         self.deterministic = True
+
+    @staticmethod
+    def _masked_mean_pool(tokens: at.Array, mask: at.Array) -> at.Array:
+        """Mean-pool token features using a boolean mask over the sequence dimension."""
+        mask_f = mask.astype(tokens.dtype)
+        masked = tokens * mask_f[..., None]
+        denom = jnp.maximum(jnp.sum(mask_f, axis=1), 1.0)
+        return jnp.sum(masked, axis=1) / denom[..., None]
+
+    @staticmethod
+    def _sigmoid_bce_with_logits(logits: at.Array, labels: at.Array) -> at.Array:
+        """Numerically stable sigmoid BCE with logits, elementwise."""
+        labels = labels.astype(logits.dtype)
+        return jnp.maximum(logits, 0) - logits * labels + jnp.log1p(jnp.exp(-jnp.abs(logits)))
 
     @at.typecheck
     def embed_prefix(
@@ -212,6 +232,12 @@ class Pi0(_model.BaseModel):
     def compute_loss(
         self, rng: at.KeyArrayLike, observation: _model.Observation, actions: _model.Actions, *, train: bool = False
     ) -> at.Float[at.Array, "*b ah"]:
+        chunked_loss, _metrics = self.compute_loss_and_metrics(rng, observation, actions, train=train)
+        return chunked_loss
+
+    def compute_loss_and_metrics(
+        self, rng: at.KeyArrayLike, observation: _model.Observation, actions: _model.Actions, *, train: bool = False
+    ) -> tuple[at.Float[at.Array, "*b ah"], dict[str, at.Float[at.Array, ""]]]:
         preprocess_rng, noise_rng, time_rng = jax.random.split(rng, 3)
         observation = _model.preprocess_observation(preprocess_rng, observation, train=train)
 
@@ -222,7 +248,7 @@ class Pi0(_model.BaseModel):
         x_t = time_expanded * noise + (1 - time_expanded) * actions
         u_t = noise - actions
 
-        # one big forward pass of prefix + suffix at once
+        # One big forward pass of prefix + suffix at once.
         prefix_tokens, prefix_mask, prefix_ar_mask = self.embed_prefix(observation)
         suffix_tokens, suffix_mask, suffix_ar_mask, adarms_cond = self.embed_suffix(observation, x_t, time)
         input_mask = jnp.concatenate([prefix_mask, suffix_mask], axis=1)
@@ -234,7 +260,37 @@ class Pi0(_model.BaseModel):
         )
         v_t = self.action_out_proj(suffix_out[:, -self.action_horizon :])
 
-        return jnp.mean(jnp.square(v_t - u_t), axis=-1)
+        flow_loss = jnp.mean(jnp.square(v_t - u_t), axis=-1)  # (b, ah)
+
+        # Default metrics (always defined so train loop can log them without branching).
+        metrics: dict[str, at.Float[at.Array, ""]] = {
+            "stop/loss": jnp.asarray(0.0, dtype=flow_loss.dtype),
+            "stop/mask_frac": jnp.asarray(0.0, dtype=flow_loss.dtype),
+            "stop/pos_frac": jnp.asarray(0.0, dtype=flow_loss.dtype),
+        }
+
+        if observation.stop_label is None or observation.stop_mask is None:
+            return flow_loss, metrics
+
+        stop_label = jnp.asarray(observation.stop_label).reshape(flow_loss.shape[:-1])
+        stop_mask = jnp.asarray(observation.stop_mask).reshape(flow_loss.shape[:-1]).astype(jnp.bool_)
+
+        pooled_prefix = self._masked_mean_pool(prefix_out, prefix_mask)
+        stop_logits = self.stop_head(pooled_prefix).squeeze(-1)
+
+        bce = self._sigmoid_bce_with_logits(stop_logits, stop_label)
+        mask_f = stop_mask.astype(bce.dtype)
+        mask_sum = jnp.sum(mask_f)
+        stop_loss = jnp.sum(bce * mask_f) / (mask_sum + 1e-6)
+
+        # Logging helpers.
+        metrics["stop/loss"] = stop_loss
+        metrics["stop/mask_frac"] = jnp.mean(mask_f)
+        metrics["stop/pos_frac"] = jnp.sum(stop_label * mask_f) / (mask_sum + 1e-6)
+
+        # Keep the original API contract (per-horizon loss) by distributing stop loss across horizons.
+        stop_loss_per_h = (STOP_LOSS_WEIGHT * stop_loss) / float(self.action_horizon)
+        return flow_loss + stop_loss_per_h[..., None], metrics
 
     @override
     def sample_actions(
@@ -300,3 +356,57 @@ class Pi0(_model.BaseModel):
 
         x_0, _ = jax.lax.while_loop(cond, step, (noise, 1.0))
         return x_0
+
+    @at.typecheck
+    def sample_actions_with_stop(
+        self,
+        rng: at.KeyArrayLike,
+        observation: _model.Observation,
+        *,
+        num_steps: int | at.Int[at.Array, ""] = 10,
+        noise: at.Float[at.Array, "b ah ad"] | None = None,
+    ) -> tuple[_model.Actions, at.Float[at.Array, "b"]]:
+        """Sample actions and also return a stop probability for the current observation."""
+        observation = _model.preprocess_observation(None, observation, train=False)
+        dt = -1.0 / num_steps
+        batch_size = observation.state.shape[0]
+        if noise is None:
+            noise = jax.random.normal(rng, (batch_size, self.action_horizon, self.action_dim))
+
+        # Fill KV cache with a forward pass of the prefix, and reuse the prefix hidden states for stop prediction.
+        prefix_tokens, prefix_mask, prefix_ar_mask = self.embed_prefix(observation)
+        prefix_attn_mask = make_attn_mask(prefix_mask, prefix_ar_mask)
+        prefix_positions = jnp.cumsum(prefix_mask, axis=1) - 1
+        (prefix_out, _), kv_cache = self.PaliGemma.llm([prefix_tokens, None], mask=prefix_attn_mask, positions=prefix_positions)
+
+        pooled_prefix = self._masked_mean_pool(prefix_out, prefix_mask)
+        stop_logits = self.stop_head(pooled_prefix).squeeze(-1)
+        stop_prob = jax.nn.sigmoid(stop_logits)
+
+        def step(carry):
+            x_t, time = carry
+            suffix_tokens, suffix_mask, suffix_ar_mask, adarms_cond = self.embed_suffix(
+                observation, x_t, jnp.broadcast_to(time, batch_size)
+            )
+            suffix_attn_mask = make_attn_mask(suffix_mask, suffix_ar_mask)
+            prefix_attn_mask = einops.repeat(prefix_mask, "b p -> b s p", s=suffix_tokens.shape[1])
+            full_attn_mask = jnp.concatenate([prefix_attn_mask, suffix_attn_mask], axis=-1)
+            positions = jnp.sum(prefix_mask, axis=-1)[:, None] + jnp.cumsum(suffix_mask, axis=-1) - 1
+
+            (prefix_out, suffix_out), _ = self.PaliGemma.llm(
+                [None, suffix_tokens],
+                mask=full_attn_mask,
+                positions=positions,
+                kv_cache=kv_cache,
+                adarms_cond=[None, adarms_cond],
+            )
+            assert prefix_out is None
+            v_t = self.action_out_proj(suffix_out[:, -self.action_horizon :])
+            return x_t + dt * v_t, time + dt
+
+        def cond(carry):
+            _x_t, time = carry
+            return time >= -dt / 2
+
+        x_0, _ = jax.lax.while_loop(cond, step, (noise, 1.0))
+        return x_0, stop_prob

@@ -1,5 +1,6 @@
 from flax import nnx
 import jax
+import jax.numpy as jnp
 import pytest
 
 from openpi.models import model as _model
@@ -22,6 +23,24 @@ def test_pi0_model():
 
     actions = nnx_utils.module_jit(model.sample_actions)(key, obs, num_steps=10)
     assert actions.shape == (batch_size, model.action_horizon, model.action_dim)
+
+
+@pytest.mark.manual
+def test_pi05_model_stop_head():
+    key = jax.random.key(0)
+    config = pi0_config.Pi0Config(pi05=True)
+    model = config.create(key)
+
+    batch_size = 1
+    obs, act = config.fake_obs(batch_size), config.fake_act(batch_size)
+
+    loss = nnx_utils.module_jit(model.compute_loss)(key, obs, act)
+    assert loss.shape == (batch_size, config.action_horizon)
+
+    actions, stop_prob = nnx_utils.module_jit(model.sample_actions_with_stop)(key, obs, num_steps=1)
+    assert actions.shape == (batch_size, model.action_horizon, model.action_dim)
+    assert stop_prob.shape == (batch_size,)
+    assert jnp.all((stop_prob >= 0) & (stop_prob <= 1))
 
 
 def test_pi0_lora_model():

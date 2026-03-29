@@ -157,6 +157,11 @@ class B1kInputs(transforms.DataTransformFn):
         if "actions" in data:
             inputs["actions"] = action
 
+        if "stop_label" in data:
+            inputs["stop_label"] = np.asarray(data["stop_label"], dtype=np.float32)
+        if "stop_mask" in data:
+            inputs["stop_mask"] = np.asarray(data["stop_mask"], dtype=np.bool_)
+
         if "prompt" in data:
             inputs["prompt"] = data["prompt"]
 

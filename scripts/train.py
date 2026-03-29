@@ -342,15 +342,21 @@ def train_step(
         observation: _model.Observation,
         actions: _model.Actions,
     ):
-        chunked_loss = model.compute_loss(rng, observation, actions, train=True)
-        return jnp.mean(chunked_loss)
+        if hasattr(model, "compute_loss_and_metrics"):
+            chunked_loss, metrics = model.compute_loss_and_metrics(rng, observation, actions, train=True)  # type: ignore[attr-defined]
+        else:
+            chunked_loss = model.compute_loss(rng, observation, actions, train=True)
+            metrics = {}
+        return jnp.mean(chunked_loss), metrics
 
     train_rng = jax.random.fold_in(rng, state.step)
     observation, actions = batch
 
     # Filter out frozen params.
     diff_state = nnx.DiffState(0, config.trainable_filter)
-    loss, grads = nnx.value_and_grad(loss_fn, argnums=diff_state)(model, train_rng, observation, actions)
+    (loss, metrics), grads = nnx.value_and_grad(loss_fn, argnums=diff_state, has_aux=True)(
+        model, train_rng, observation, actions
+    )
 
     params = state.params.filter(config.trainable_filter)
     updates, new_opt_state = state.tx.update(grads, state.opt_state, params)
@@ -392,6 +398,8 @@ def train_step(
         "update_to_param": update_norm / (trainable_param_norm + 1e-8),
         "param_norm": optax.global_norm(kernel_params),
     }
+    if isinstance(metrics, dict):
+        info.update(metrics)
     return new_state, info
 
 

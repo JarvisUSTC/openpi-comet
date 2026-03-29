@@ -138,6 +138,7 @@ def create_behavior_dataset(data_config: _config.DataConfig, action_horizon: int
         repo_id=data_config.repo_id,
         root=data_config.behavior_dataset_root,
         tolerance_s=data_config.tolerance_s,
+        check_timestamp_sync=data_config.check_timestamp_sync,
         tasks=data_config.tasks,
         modalities=data_config.modalities,
         local_only=True,
@@ -148,6 +149,8 @@ def create_behavior_dataset(data_config: _config.DataConfig, action_horizon: int
         fine_grained_level=data_config.fine_grained_level,
         return_seg_instance=data_config.return_seg_instance,
         train_rgb_type=data_config.train_rgb_type,
+        stop_pos_margin_frames=data_config.stop_pos_margin_frames,
+        stop_neg_margin_frames=data_config.stop_neg_margin_frames,
         **args,
     )
 

@@ -113,6 +113,10 @@ class Observation(Generic[ArrayT]):
     # Point cloud.
     pcd_xyz: at.Float[ArrayT, "*b pc_s n 3"] | None = None
 
+    # Optional weak stop supervision (per-sample, not per-horizon).
+    stop_label: at.Float[ArrayT, "*b"] | None = None
+    stop_mask: at.Bool[ArrayT, "*b"] | None = None
+
     @classmethod
     def from_dict(cls, data: at.PyTree[ArrayT]) -> "Observation[ArrayT]":
         """This method defines the mapping between unstructured data (i.e., nested dict) to the structured Observation format."""
@@ -134,6 +138,8 @@ class Observation(Generic[ArrayT]):
             token_ar_mask=data.get("token_ar_mask"),
             token_loss_mask=data.get("token_loss_mask"),
             pcd_xyz=data.get("pcd_xyz"),
+            stop_label=data.get("stop_label"),
+            stop_mask=data.get("stop_mask"),
         )
 
     def to_dict(self) -> at.PyTree[ArrayT]:
@@ -214,6 +220,8 @@ def preprocess_observation(
         token_ar_mask=observation.token_ar_mask,
         token_loss_mask=observation.token_loss_mask,
         pcd_xyz=observation.pcd_xyz,
+        stop_label=observation.stop_label,
+        stop_mask=observation.stop_mask,
     )
 
 
