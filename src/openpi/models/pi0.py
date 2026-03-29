@@ -410,3 +410,17 @@ class Pi0(_model.BaseModel):
 
         x_0, _ = jax.lax.while_loop(cond, step, (noise, 1.0))
         return x_0, stop_prob
+
+    @at.typecheck
+    def predict_stop_prob(self, observation: _model.Observation) -> at.Float[at.Array, "b"]:
+        """Compute stop probability without sampling actions (prefix-only forward)."""
+        observation = _model.preprocess_observation(None, observation, train=False)
+        prefix_tokens, prefix_mask, prefix_ar_mask = self.embed_prefix(observation)
+        prefix_attn_mask = make_attn_mask(prefix_mask, prefix_ar_mask)
+        prefix_positions = jnp.cumsum(prefix_mask, axis=1) - 1
+        (prefix_out, _), _kv_cache = self.PaliGemma.llm(
+            [prefix_tokens, None], mask=prefix_attn_mask, positions=prefix_positions
+        )
+        pooled_prefix = self._masked_mean_pool(prefix_out, prefix_mask)
+        stop_logits = self.stop_head(pooled_prefix).squeeze(-1)
+        return jax.nn.sigmoid(stop_logits)

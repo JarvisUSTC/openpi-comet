@@ -41,6 +41,8 @@ class B1KPolicyWrapper:
         stop_patience: int = 3,
         stop_action: str = "hold",  # hold | zero
         stop_warmup_steps: int = 0,
+        stop_log_interval: int = 1,
+        stop_check_every_step: bool = False,
     ) -> None:
         self.policy = policy
         self.task_name = task_name
@@ -75,10 +77,13 @@ class B1KPolicyWrapper:
         self.stop_patience = int(stop_patience)
         self.stop_action = str(stop_action)
         self.stop_warmup_steps = int(stop_warmup_steps)
+        self.stop_log_interval = int(stop_log_interval)
+        self.stop_check_every_step = bool(stop_check_every_step)
         self._stop_counter = 0
         self._stop_active = False
         self._stop_hold_action: np.ndarray | None = None  # (23,)
         self._last_stop_prob: float | None = None
+        self._last_prompt: str | None = None
 
         self.log_config()
 
@@ -95,6 +100,8 @@ class B1KPolicyWrapper:
         logger.info(f"{self.stop_patience=}")
         logger.info(f"{self.stop_action=}")
         logger.info(f"{self.stop_warmup_steps=}")
+        logger.info(f"{self.stop_log_interval=}")
+        logger.info(f"{self.stop_check_every_step=}")
         logger.info(f"{self.step_counter=}")
         logger.info(f"{self.action_queue=}")
         logger.info(f"{self.task_prompt=}")
@@ -111,6 +118,7 @@ class B1KPolicyWrapper:
         self._stop_active = False
         self._stop_hold_action = None
         self._last_stop_prob = None
+        self._last_prompt = None
 
     def _make_stop_action(self) -> torch.Tensor:
         if self.stop_action == "hold" and self._stop_hold_action is not None:
@@ -330,6 +338,42 @@ class B1KPolicyWrapper:
             if len(self.action_queue) > 0:
                 # pop the first action in the queue
                 final_action = self.action_queue.popleft()[None]
+                # Optionally check stop_prob every env step without re-sampling actions.
+                if self.stop_enabled and self.stop_check_every_step and not self._stop_active:
+                    nbatch = copy.deepcopy(input_obs)
+                    if nbatch["observation"].shape[-1] != 3:
+                        nbatch["observation"] = np.transpose(nbatch["observation"], (0, 1, 3, 4, 2))
+                    joint_positions = nbatch["proprio"][0]
+                    batch = {
+                        "observation/egocentric_camera": nbatch["observation"][0, 0],
+                        "observation/wrist_image_left": nbatch["observation"][0, 1],
+                        "observation/wrist_image_right": nbatch["observation"][0, 2],
+                        "observation/state": joint_positions,
+                        "prompt": self._last_prompt or self.task_prompt,
+                    }
+                    if "observation/egocentric_depth" in nbatch:
+                        batch["observation/egocentric_depth"] = nbatch["observation/egocentric_depth"][0]
+
+                    stop_prob = None
+                    if hasattr(self.policy, "predict_stop_prob"):
+                        try:
+                            stop_prob = self.policy.predict_stop_prob(batch)  # type: ignore[attr-defined]
+                        except Exception:
+                            stop_prob = None
+                    if stop_prob is not None:
+                        if self.stop_log_interval > 0 and (self.step_counter % self.stop_log_interval) == 0:
+                            logger.info(
+                                "stop_prob=%.4f counter=%d/%d active=%s step=%d",
+                                float(stop_prob),
+                                self._stop_counter,
+                                self.stop_patience,
+                                self._stop_active,
+                                self.step_counter,
+                            )
+                        self._maybe_update_stop(float(stop_prob))
+                        if self._stop_active:
+                            self._stop_hold_action = np.asarray(final_action[0]).copy()
+                            return self._make_stop_action()
                 return torch.from_numpy(final_action)
 
         nbatch = copy.deepcopy(input_obs)
@@ -359,6 +403,9 @@ class B1KPolicyWrapper:
             )
             logger.info(f"* {reasoner_response}")
             batch["prompt"] = reasoner_response
+            self._last_prompt = reasoner_response
+        else:
+            self._last_prompt = batch["prompt"]
 
         try:
             action = self.policy.infer(batch)
@@ -376,6 +423,17 @@ class B1KPolicyWrapper:
                 stop_prob = float(action["stop_prob"])
             except Exception:
                 stop_prob = None
+
+        if self.stop_enabled and stop_prob is not None and self.stop_log_interval > 0:
+            if (self.step_counter % self.stop_log_interval) == 0:
+                logger.info(
+                    "stop_prob=%.4f counter=%d/%d active=%s step=%d",
+                    float(stop_prob),
+                    self._stop_counter,
+                    self.stop_patience,
+                    self._stop_active,
+                    self.step_counter,
+                )
         if self.control_mode == "receeding_horizon":
             self.action_queue = deque([a for a in target_joint_positions[: self.max_len]])
             final_action = self.action_queue.popleft()[None]

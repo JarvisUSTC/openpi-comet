@@ -60,11 +60,15 @@ class Policy(BasePolicy):
             self._model.eval()
             self._sample_actions = model.sample_actions
             self._sample_actions_with_stop = None
+            self._predict_stop_prob = None
         else:
             # JAX model setup
             self._sample_actions = nnx_utils.module_jit(model.sample_actions)
             self._sample_actions_with_stop = (
                 nnx_utils.module_jit(model.sample_actions_with_stop) if hasattr(model, "sample_actions_with_stop") else None
+            )
+            self._predict_stop_prob = (
+                nnx_utils.module_jit(model.predict_stop_prob) if hasattr(model, "predict_stop_prob") else None
             )
             self._rng = rng or jax.random.key(0)
 
@@ -116,6 +120,18 @@ class Policy(BasePolicy):
             "infer_ms": model_time * 1000,
         }
         return outputs
+
+    def predict_stop_prob(self, obs: dict) -> float | None:
+        """Return stop probability for the given observation without sampling actions."""
+        if self._is_pytorch_model or self._predict_stop_prob is None:
+            return None
+
+        inputs = jax.tree.map(lambda x: x, obs)
+        inputs = self._input_transform(inputs)
+        inputs = jax.tree.map(lambda x: jnp.asarray(x)[np.newaxis, ...], inputs)
+        observation = _model.Observation.from_dict(inputs)
+        stop_prob = self._predict_stop_prob(observation)
+        return float(np.asarray(stop_prob[0]))
 
     @property
     def metadata(self) -> dict[str, Any]:

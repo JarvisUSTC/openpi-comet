@@ -80,6 +80,8 @@ class Args:
     stop_patience: int = 3
     stop_action: str = "hold"  # hold | zero
     stop_warmup_steps: int = 0
+    stop_log_interval: int = 1
+    stop_check_every_step: bool = False
 
 
 def create_policy(args: Args) -> _policy.Policy:
@@ -120,6 +122,8 @@ def main(args: Args) -> None:
         stop_patience=args.stop_patience,
         stop_action=args.stop_action,
         stop_warmup_steps=args.stop_warmup_steps,
+        stop_log_interval=args.stop_log_interval,
+        stop_check_every_step=args.stop_check_every_step,
     )
 
     hostname = socket.gethostname()
