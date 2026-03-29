@@ -901,8 +901,8 @@ _CONFIGS = [
         model=pi0_config.Pi0Config(pi05=True, action_horizon=32),
         data=LeRobotB1KDataConfig(
             repo_id="behavior-1k/2025-challenge-demos",
-            stop_pos_margin_frames=0,
-            stop_neg_margin_frames=15,
+            stop_pos_margin_frames=3,
+            stop_neg_margin_frames=30,
             base_config=DataConfig(
                 prompt_from_task=True,
                 behavior_dataset_root="../DATASETS/behavior/2025-challenge-demos",
@@ -1084,11 +1084,11 @@ _CONFIGS = [
         name="pi05_b1k-sampled_skill_group-stop-full-pretrained",
         exp_name="openpi",
         project_name="B1K",
-        model=pi0_config.Pi0Config(pi05=True, action_horizon=32),
+        model=pi0_config.Pi0Config(pi05=True, action_horizon=32, stop_loss_weight=1.0),
         data=LeRobotB1KSkillDataConfig(
             repo_id="behavior-1k/2025-challenge-demos",
-            stop_pos_margin_frames=0,
-            stop_neg_margin_frames=15,
+            stop_pos_margin_frames=3,
+            stop_neg_margin_frames=30,
             check_timestamp_sync=False,
             base_config=DataConfig(
                 prompt_from_task=True,
@@ -1125,11 +1125,11 @@ _CONFIGS = [
         name="pi05_b1k-sampled_single_skill-stop-full-pretrained",
         exp_name="openpi",
         project_name="B1K",
-        model=pi0_config.Pi0Config(pi05=True, action_horizon=32),
+        model=pi0_config.Pi0Config(pi05=True, action_horizon=32, stop_loss_weight=1.0),
         data=LeRobotB1KSkillDataConfig(
             repo_id="behavior-1k/2025-challenge-demos",
-            stop_pos_margin_frames=0,
-            stop_neg_margin_frames=15,
+            stop_pos_margin_frames=3,
+            stop_neg_margin_frames=30,
             check_timestamp_sync=False,
             base_config=DataConfig(
                 prompt_from_task=True,

@@ -16,8 +16,6 @@ from openpi.shared import array_typing as at
 
 logger = logging.getLogger("openpi")
 
-STOP_LOSS_WEIGHT = 0.1
-
 
 def make_attn_mask(input_mask, mask_ar):
     """Adapted from big_vision.
@@ -69,6 +67,7 @@ def posemb_sincos(
 class Pi0(_model.BaseModel):
     def __init__(self, config: pi0_config.Pi0Config, rngs: nnx.Rngs):
         super().__init__(config.action_dim, config.action_horizon, config.max_token_len)
+        self.config = config
         self.pi05 = config.pi05
         self.pcd = config.pcd
         paligemma_config = _gemma.get_config(config.paligemma_variant)
@@ -135,6 +134,15 @@ class Pi0(_model.BaseModel):
         """Numerically stable sigmoid BCE with logits, elementwise."""
         labels = labels.astype(logits.dtype)
         return jnp.maximum(logits, 0) - logits * labels + jnp.log1p(jnp.exp(-jnp.abs(logits)))
+
+    @staticmethod
+    def _sigmoid_bce_with_logits_pos_weight(logits: at.Array, labels: at.Array, *, pos_weight: at.Array) -> at.Array:
+        """Sigmoid BCE with logits where positive examples are scaled by pos_weight."""
+        labels = labels.astype(logits.dtype)
+        # softplus(logits) == log(1 + exp(logits))  (stable)
+        neg_term = (1.0 - labels) * jax.nn.softplus(logits)
+        pos_term = labels * jax.nn.softplus(-logits) * pos_weight.astype(logits.dtype)
+        return neg_term + pos_term
 
     @at.typecheck
     def embed_prefix(
@@ -267,6 +275,7 @@ class Pi0(_model.BaseModel):
             "stop/loss": jnp.asarray(0.0, dtype=flow_loss.dtype),
             "stop/mask_frac": jnp.asarray(0.0, dtype=flow_loss.dtype),
             "stop/pos_frac": jnp.asarray(0.0, dtype=flow_loss.dtype),
+            "stop/pos_weight": jnp.asarray(1.0, dtype=flow_loss.dtype),
         }
 
         if observation.stop_label is None or observation.stop_mask is None:
@@ -278,19 +287,30 @@ class Pi0(_model.BaseModel):
         pooled_prefix = self._masked_mean_pool(prefix_out, prefix_mask)
         stop_logits = self.stop_head(pooled_prefix).squeeze(-1)
 
-        bce = self._sigmoid_bce_with_logits(stop_logits, stop_label)
-        mask_f = stop_mask.astype(bce.dtype)
+        mask_f = stop_mask.astype(stop_logits.dtype)
         mask_sum = jnp.sum(mask_f)
+        pos_sum = jnp.sum(stop_label * mask_f)
+        neg_sum = mask_sum - pos_sum
+        # Dynamic pos_weight to fight extreme class imbalance; clipped for stability.
+        pos_weight = jnp.clip(
+            (neg_sum + 1e-6) / (pos_sum + 1e-6),
+            float(self.config.stop_pos_weight_clip_min),
+            float(self.config.stop_pos_weight_clip_max),
+        )
+
+        bce = self._sigmoid_bce_with_logits_pos_weight(stop_logits, stop_label, pos_weight=pos_weight)
         stop_loss = jnp.sum(bce * mask_f) / (mask_sum + 1e-6)
 
         # Logging helpers.
         metrics["stop/loss"] = stop_loss
         metrics["stop/mask_frac"] = jnp.mean(mask_f)
         metrics["stop/pos_frac"] = jnp.sum(stop_label * mask_f) / (mask_sum + 1e-6)
+        metrics["stop/pos_weight"] = pos_weight
 
-        # Keep the original API contract (per-horizon loss) by distributing stop loss across horizons.
-        stop_loss_per_h = (STOP_LOSS_WEIGHT * stop_loss) / float(self.action_horizon)
-        return flow_loss + stop_loss_per_h[..., None], metrics
+        # Keep the original API contract (per-horizon loss). We add the same stop loss to each horizon element,
+        # so that `mean(chunked_loss)` contributes exactly `stop_loss_weight * stop_loss` (not diluted by horizon).
+        stop_loss_chunk = (float(self.config.stop_loss_weight) * stop_loss) * jnp.ones_like(flow_loss)
+        return flow_loss + stop_loss_chunk, metrics
 
     @override
     def sample_actions(
