@@ -112,6 +112,9 @@ STATUS="${PIPESTATUS[0]}"
 set -e
 
 TASK_ID="$(echo "${OUT}" | sed -n 's/.* id: \\([0-9a-f-]\\{36\\}\\).*/\\1/p' | tail -n 1)"
+if [[ -z "${TASK_ID}" && -f "${SUBMIT_LOG_FILE}" ]]; then
+  TASK_ID="$(sed -n 's/.* id: \\([0-9a-f-]\\{36\\}\\).*/\\1/p' "${SUBMIT_LOG_FILE}" | tail -n 1)"
+fi
 if [[ -n "${TASK_ID}" ]]; then
   echo "${TASK_ID}" > "${SUBMIT_LOG_DIR}/${NAME}.task_id"
   echo "Task id: ${TASK_ID} (saved to ${SUBMIT_LOG_DIR}/${NAME}.task_id)"
