@@ -687,7 +687,7 @@ _CONFIGS = [
         name="pi05_b1k-k6-smoke-step200",
         exp_name="openpi_smoke",
         project_name="B1K",
-        model=pi0_config.Pi0Config(pi05=True, action_horizon=32, video_memory_frames=6, video_memory_stride_s=1.0),
+        model=pi0_config.Pi0Config(pi05=True, action_horizon=16, video_memory_frames=6, video_memory_stride_s=1.0),
         data=LeRobotB1KDataConfig(
             repo_id="behavior-1k/2025-challenge-demos",
             base_config=DataConfig(
@@ -770,10 +770,10 @@ _CONFIGS = [
             ),
         ),
         weight_loader=weight_loaders.CheckpointWeightLoader("/root/Models/pi05_base/params"),
-        num_train_steps=60_000,
+        num_train_steps=400_000,
         lr_schedule=_optimizer.CosineDecaySchedule(
             peak_lr=2.5e-5,
-            decay_steps=60_000,
+            decay_steps=400_000,
         ),
         log_interval=100,
         save_interval=5000,
@@ -814,11 +814,11 @@ _CONFIGS = [
         val_num_batches=10,
         val_batch_size=16,
         val_episodes_index=list(range(180, 200)),
-        freeze_filter=pi0_config.Pi0Config(pi05=True, action_horizon=32, video_memory_frames=6).get_freeze_filter(),
+        freeze_filter=pi0_config.Pi0Config(pi05=True, action_horizon=16, video_memory_frames=6).get_freeze_filter(),
         ema_decay=None,
         checkpoint_base_dir="./outputs/checkpoints/pi05_b1k-sampled_single_skill-full",
         num_workers=8,
-        batch_size=16,
+        batch_size=32,
         fsdp_devices=2,
     ),
     # 0. Base Model Configs

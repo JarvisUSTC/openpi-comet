@@ -90,9 +90,10 @@ def main(args: Args) -> None:
     if args.record:
         policy = _policy.PolicyRecorder(policy, "policy_records")
 
-    # Get video_memory_frames from model config.
+    # Reuse training-time memory settings by default.
     config = _config.get_config(args.policy.config)
     video_memory_frames = getattr(config.model, "video_memory_frames", 1)
+    video_memory_stride_s = getattr(config.model, "video_memory_stride_s", 1.0)
 
     policy = B1KPolicyWrapper(
         policy,
@@ -103,6 +104,7 @@ def main(args: Args) -> None:
         temporal_ensemble_max=args.temporal_ensemble_max,
         fine_grained_level=args.fine_grained_level,
         video_memory_frames=video_memory_frames,
+        video_memory_stride_s=video_memory_stride_s,
     )
 
     hostname = socket.gethostname()

@@ -32,6 +32,7 @@ class B1KPolicyWrapper:
         "observation/wrist_image_left",
         "observation/wrist_image_right",
     )
+    _B1K_FPS = 30.0
 
     def __init__(
         self,
@@ -43,13 +44,17 @@ class B1KPolicyWrapper:
         temporal_ensemble_max: int = 3,  # receeding temporal mode
         fine_grained_level: int = 0,
         video_memory_frames: int = 1,
+        video_memory_stride_s: float = 1.0,
     ) -> None:
         self.policy = policy
         self.task_name = task_name
         self.video_memory_frames = video_memory_frames
+        self.video_memory_stride_s = video_memory_stride_s
+        self.history_stride = 1
         # Frame history buffer: stores up to K-1 past frames per camera.
         self._frame_history: dict[str, deque] = {
-            k: deque(maxlen=max(video_memory_frames - 1, 0)) for k in self._HISTORY_CAMERA_KEYS
+            k: deque(maxlen=max(video_memory_frames - 1, 0))
+            for k in self._HISTORY_CAMERA_KEYS
         }
 
         # load the task name from the metadata
@@ -86,6 +91,9 @@ class B1KPolicyWrapper:
         logger.info(f"{self.temporal_ensemble_max=}")
         logger.info(f"{self.replan_interval=}")
         logger.info(f"{self.fine_grained_level=}")
+        logger.info(f"{self.video_memory_frames=}")
+        logger.info(f"{self.video_memory_stride_s=}")
+        logger.info(f"{self.history_stride=}")
         logger.info(f"{self.step_counter=}")
         logger.info(f"{self.action_queue=}")
         logger.info(f"{self.task_prompt=}")
@@ -109,6 +117,20 @@ class B1KPolicyWrapper:
         prompt = str(prompt).strip()
         return prompt or self.task_prompt
 
+    def _maybe_reason_about_subtask(self, batch: dict) -> None:
+        """Best-effort subtask reasoning. Fall back to the current prompt if the reasoner is unavailable."""
+        if self.fine_grained_level <= 0 or self.reasoner is None:
+            return
+        try:
+            reasoner_response = self.reasoner.generate_subtask(
+                high_level_task=self.task_prompt,
+                multi_modals=[batch["observation/egocentric_camera"]],
+            )
+            logger.info(f"* {reasoner_response}")
+            batch["prompt"] = reasoner_response
+        except Exception as exc:
+            logger.warning("Reasoner unavailable, falling back to prompt: %s", exc)
+
     def _attach_history(self, batch: dict) -> dict:
         """Attach frame history to batch and update buffers for K>1 video memory."""
         if self.video_memory_frames <= 1:
@@ -117,8 +139,16 @@ class B1KPolicyWrapper:
             if key in batch:
                 current_frame = batch[key]
                 history = list(self._frame_history[key])
-                valid = [True] * len(history) + [False] * (self.video_memory_frames - 1 - len(history))
-                batch[f"{key}_history"] = history + [np.zeros_like(current_frame)] * (self.video_memory_frames - 1 - len(history))
+                sampled = []
+                valid = []
+                missing = max(self.video_memory_frames - 1 - len(history), 0)
+                if missing > 0:
+                    pad_frame = history[0] if history else current_frame
+                    sampled.extend([pad_frame] * missing)
+                    valid.extend([False] * missing)
+                sampled.extend(history[-(self.video_memory_frames - 1) :])
+                valid.extend([True] * min(len(history), self.video_memory_frames - 1))
+                batch[f"{key}_history"] = sampled
                 batch[f"{key}_history_valid"] = valid
                 self._frame_history[key].append(current_frame.copy())
         return batch
@@ -195,13 +225,7 @@ class B1KPolicyWrapper:
                 "prompt": prompt,
             }
 
-            if self.fine_grained_level > 0:
-                reasoner_response = self.reasoner.generate_subtask(
-                    high_level_task=self.task_prompt,
-                    multi_modals=[batch["observation/egocentric_camera"]],
-                )
-                logger.info(f"* {reasoner_response}")
-                batch["prompt"] = reasoner_response
+            self._maybe_reason_about_subtask(batch)
 
             if "observation/egocentric_depth" in nbatch:
                 batch["observation/egocentric_depth"] = nbatch["observation/egocentric_depth"][0]
@@ -317,14 +341,7 @@ class B1KPolicyWrapper:
 
         batch = self._attach_history(batch)
 
-        if self.fine_grained_level > 0:
-            # skill_prompt = SKILL_PROMPT.format(task_prompt=self.task_prompt, skill_prompts="\n".join(self.skill_prompts))
-            reasoner_response = self.reasoner.generate_subtask(
-                high_level_task=self.task_prompt,
-                multi_modals=[batch["observation/egocentric_camera"]],
-            )
-            logger.info(f"* {reasoner_response}")
-            batch["prompt"] = reasoner_response
+        self._maybe_reason_about_subtask(batch)
 
         try:
             action = self.policy.infer(batch)
