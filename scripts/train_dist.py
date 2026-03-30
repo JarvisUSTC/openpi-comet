@@ -439,7 +439,15 @@ def main(config: _config.TrainConfig):
                 stacked = common_utils.stack_forest(val_metrics_list)
                 val_metrics = {k: float(v) for k, v in jax.device_get(jax.tree.map(jnp.mean, stacked)).items()}
                 if jax.process_index() == 0:
-                    metrics_str = ", ".join(f"{k}={v:.4f}" for k, v in val_metrics.items() if not k.startswith("val/"))
+                    # Print a small, stable subset to logs; full dict still goes to wandb.
+                    keys = [
+                        "val_loss",
+                        "val/flow_loss",
+                        "val/stop/loss_weighted",
+                        "val/stop/pos_frac",
+                        "val/action_mse",
+                    ]
+                    metrics_str = ", ".join(f"{k}={val_metrics[k]:.4f}" for k in keys if k in val_metrics)
                     pbar.write(f"Step {step}: {metrics_str}")
                     wandb.log(val_metrics, step=step)
             except Exception:

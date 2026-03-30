@@ -114,8 +114,10 @@ class Pi0(_model.BaseModel):
             )
             self.pointnet.lazy_init(config.fake_obs().pcd_xyz, rngs=rngs)
 
-        # Weak stop head (skill-end probability). For Pi05, the discrete state input is already included in the
-        # tokenized prompt, so we use pooled prefix hidden states as features.
+        # Weak stop head (skill-end probability).
+        # We predict stop from pooled prefix hidden states (image + language), optionally fused with continuous
+        # proprioceptive state to make the signal learnable even when the visual change is subtle.
+        self.stop_state_proj = nnx.Linear(config.action_dim, paligemma_config.width, rngs=rngs)
         self.stop_head = nnx.Linear(paligemma_config.width, 1, rngs=rngs)
 
         # This attribute gets automatically set by model.train() and model.eval().
@@ -280,6 +282,9 @@ class Pi0(_model.BaseModel):
             "stop/mask_frac": jnp.asarray(0.0, dtype=flow_loss.dtype),
             "stop/pos_frac": jnp.asarray(0.0, dtype=flow_loss.dtype),
             "stop/pos_weight": jnp.asarray(1.0, dtype=flow_loss.dtype),
+            "stop/prob_mean": jnp.asarray(0.0, dtype=flow_loss.dtype),
+            "stop/prob_mean_pos": jnp.asarray(0.0, dtype=flow_loss.dtype),
+            "stop/prob_mean_neg": jnp.asarray(0.0, dtype=flow_loss.dtype),
         }
 
         if observation.stop_label is None or observation.stop_mask is None:
@@ -289,6 +294,10 @@ class Pi0(_model.BaseModel):
         stop_mask = jnp.asarray(observation.stop_mask).reshape(flow_loss.shape[:-1]).astype(jnp.bool_)
 
         pooled_prefix = self._masked_mean_pool(prefix_out, prefix_mask)
+        if self.config.stop_detach_prefix:
+            pooled_prefix = jax.lax.stop_gradient(pooled_prefix)
+        if self.config.stop_use_state:
+            pooled_prefix = pooled_prefix + self.stop_state_proj(observation.state)
         stop_logits = self.stop_head(pooled_prefix).squeeze(-1)
 
         mask_f = stop_mask.astype(stop_logits.dtype)
@@ -306,12 +315,18 @@ class Pi0(_model.BaseModel):
         stop_loss = jnp.sum(bce * mask_f) / (mask_sum + 1e-6)
         stop_loss_weighted = float(self.config.stop_loss_weight) * stop_loss
 
+        stop_prob = jax.nn.sigmoid(stop_logits)
+
         # Logging helpers.
         metrics["stop/loss"] = stop_loss
         metrics["stop/loss_weighted"] = stop_loss_weighted
         metrics["stop/mask_frac"] = jnp.mean(mask_f)
         metrics["stop/pos_frac"] = jnp.sum(stop_label * mask_f) / (mask_sum + 1e-6)
         metrics["stop/pos_weight"] = pos_weight
+        # For debugging calibration / learnability.
+        metrics["stop/prob_mean"] = jnp.sum(stop_prob * mask_f) / (mask_sum + 1e-6)
+        metrics["stop/prob_mean_pos"] = jnp.sum(stop_prob * stop_label * mask_f) / (pos_sum + 1e-6)
+        metrics["stop/prob_mean_neg"] = jnp.sum(stop_prob * (1.0 - stop_label) * mask_f) / (neg_sum + 1e-6)
 
         # Keep the original API contract (per-horizon loss). We add the same stop loss to each horizon element,
         # so that `mean(chunked_loss)` contributes exactly `stop_loss_weight * stop_loss` (not diluted by horizon).
@@ -408,6 +423,8 @@ class Pi0(_model.BaseModel):
         (prefix_out, _), kv_cache = self.PaliGemma.llm([prefix_tokens, None], mask=prefix_attn_mask, positions=prefix_positions)
 
         pooled_prefix = self._masked_mean_pool(prefix_out, prefix_mask)
+        if self.config.stop_use_state:
+            pooled_prefix = pooled_prefix + self.stop_state_proj(observation.state)
         stop_logits = self.stop_head(pooled_prefix).squeeze(-1)
         stop_prob = jax.nn.sigmoid(stop_logits)
 
@@ -450,5 +467,7 @@ class Pi0(_model.BaseModel):
             [prefix_tokens, None], mask=prefix_attn_mask, positions=prefix_positions
         )
         pooled_prefix = self._masked_mean_pool(prefix_out, prefix_mask)
+        if self.config.stop_use_state:
+            pooled_prefix = pooled_prefix + self.stop_state_proj(observation.state)
         stop_logits = self.stop_head(pooled_prefix).squeeze(-1)
         return jax.nn.sigmoid(stop_logits)

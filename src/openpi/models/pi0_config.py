@@ -41,6 +41,11 @@ class Pi0Config(_model.BaseModelConfig):
     stop_loss_weight: float = 0.1
     stop_pos_weight_clip_min: float = 1.0
     stop_pos_weight_clip_max: float = 50.0
+    # Stop head inputs / training behavior.
+    # - stop_use_state: include continuous proprioceptive state features in stop prediction.
+    # - stop_detach_prefix: stop loss does not backprop into the prefix backbone (prevents stop from hurting flow).
+    stop_use_state: bool = True
+    stop_detach_prefix: bool = True
 
     def __post_init__(self):
         if self.max_token_len is None:
