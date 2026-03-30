@@ -468,7 +468,12 @@ class BehaviorLeRobotDataset(LeRobotDataset):
         # calculate the start and end indices of each episode
         self.task_sizes = {}
         try:
-            for ep_id, ep_orch in self.meta.orchestrators.items():
+            # Only build indices for episodes that are actually selected; iterating over all 10k episodes can be slow.
+            episode_ids = self.episodes if self.episodes is not None else list(self.meta.orchestrators.keys())
+            for ep_id in episode_ids:
+                ep_orch = self.meta.orchestrators.get(ep_id)
+                if ep_orch is None:
+                    continue
                 self.task_sizes[ep_id] = [task_info["end_frame"] for task_info in ep_orch[fine_grained_level]]
         except Exception as e:
             print(f"[warn] {self.repo_id} failed to calculate episode subtask cumulate: {e}")
