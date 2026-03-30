@@ -46,6 +46,7 @@ class Pi0Config(_model.BaseModelConfig):
     # - stop_detach_prefix: stop loss does not backprop into the prefix backbone (prevents stop from hurting flow).
     stop_use_state: bool = True
     stop_detach_prefix: bool = True
+    stop_hidden_dim: int = 512
 
     def __post_init__(self):
         if self.max_token_len is None:

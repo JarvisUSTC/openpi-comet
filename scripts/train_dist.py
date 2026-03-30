@@ -136,6 +136,17 @@ def _load_weights_and_validate(loader: _weight_loaders.WeightLoader, params_shap
     expected_flat = traverse_util.flatten_dict(params_shape)
     loaded_flat = traverse_util.flatten_dict(loaded_params)
 
+    # If the checkpoint predates our stop modules (or stop head structure changed),
+    # drop any loaded stop parameters so they get randomly initialized.
+    expected_top = {k[0] for k in expected_flat.keys() if k}
+    loaded_top = {k[0] for k in loaded_flat.keys() if k}
+    missing_top = expected_top - loaded_top
+    if any(str(t).startswith("stop") for t in missing_top):
+        before = len(loaded_flat)
+        loaded_flat = {k: v for k, v in loaded_flat.items() if not (k and str(k[0]).startswith("stop"))}
+        after = len(loaded_flat)
+        logging.info("Weight loader: dropped %d stop params from checkpoint (reset stop head).", before - after)
+
     extra_keys = set(loaded_flat.keys()) - set(expected_flat.keys())
     if extra_keys:
         extra_preview = sorted(extra_keys)[:10]

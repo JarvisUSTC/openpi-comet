@@ -115,10 +115,11 @@ class Pi0(_model.BaseModel):
             self.pointnet.lazy_init(config.fake_obs().pcd_xyz, rngs=rngs)
 
         # Weak stop head (skill-end probability).
-        # We predict stop from pooled prefix hidden states (image + language), optionally fused with continuous
-        # proprioceptive state to make the signal learnable even when the visual change is subtle.
-        self.stop_state_proj = nnx.Linear(config.action_dim, paligemma_config.width, rngs=rngs)
-        self.stop_head = nnx.Linear(paligemma_config.width, 1, rngs=rngs)
+        # Use a small MLP over pooled prefix features, optionally fused with continuous state.
+        stop_h = int(config.stop_hidden_dim)
+        self.stop_prefix_proj = nnx.Linear(paligemma_config.width, stop_h, rngs=rngs)
+        self.stop_state_proj = nnx.Linear(config.action_dim, stop_h, rngs=rngs)
+        self.stop_head = nnx.Linear(stop_h, 1, rngs=rngs)
 
         # This attribute gets automatically set by model.train() and model.eval().
         self.deterministic = True
@@ -296,9 +297,11 @@ class Pi0(_model.BaseModel):
         pooled_prefix = self._masked_mean_pool(prefix_out, prefix_mask)
         if self.config.stop_detach_prefix:
             pooled_prefix = jax.lax.stop_gradient(pooled_prefix)
+        stop_h = self.stop_prefix_proj(pooled_prefix)
         if self.config.stop_use_state:
-            pooled_prefix = pooled_prefix + self.stop_state_proj(observation.state)
-        stop_logits = self.stop_head(pooled_prefix).squeeze(-1)
+            stop_h = stop_h + self.stop_state_proj(observation.state)
+        stop_h = nnx.swish(stop_h)
+        stop_logits = self.stop_head(stop_h).squeeze(-1)
 
         mask_f = stop_mask.astype(stop_logits.dtype)
         mask_sum = jnp.sum(mask_f)
@@ -423,9 +426,11 @@ class Pi0(_model.BaseModel):
         (prefix_out, _), kv_cache = self.PaliGemma.llm([prefix_tokens, None], mask=prefix_attn_mask, positions=prefix_positions)
 
         pooled_prefix = self._masked_mean_pool(prefix_out, prefix_mask)
+        stop_h = self.stop_prefix_proj(pooled_prefix)
         if self.config.stop_use_state:
-            pooled_prefix = pooled_prefix + self.stop_state_proj(observation.state)
-        stop_logits = self.stop_head(pooled_prefix).squeeze(-1)
+            stop_h = stop_h + self.stop_state_proj(observation.state)
+        stop_h = nnx.swish(stop_h)
+        stop_logits = self.stop_head(stop_h).squeeze(-1)
         stop_prob = jax.nn.sigmoid(stop_logits)
 
         def step(carry):
@@ -467,7 +472,9 @@ class Pi0(_model.BaseModel):
             [prefix_tokens, None], mask=prefix_attn_mask, positions=prefix_positions
         )
         pooled_prefix = self._masked_mean_pool(prefix_out, prefix_mask)
+        stop_h = self.stop_prefix_proj(pooled_prefix)
         if self.config.stop_use_state:
-            pooled_prefix = pooled_prefix + self.stop_state_proj(observation.state)
-        stop_logits = self.stop_head(pooled_prefix).squeeze(-1)
+            stop_h = stop_h + self.stop_state_proj(observation.state)
+        stop_h = nnx.swish(stop_h)
+        stop_logits = self.stop_head(stop_h).squeeze(-1)
         return jax.nn.sigmoid(stop_logits)
