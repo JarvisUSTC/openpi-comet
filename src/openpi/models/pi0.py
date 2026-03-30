@@ -269,10 +269,14 @@ class Pi0(_model.BaseModel):
         v_t = self.action_out_proj(suffix_out[:, -self.action_horizon :])
 
         flow_loss = jnp.mean(jnp.square(v_t - u_t), axis=-1)  # (b, ah)
+        flow_loss_mean = jnp.mean(flow_loss)
 
         # Default metrics (always defined so train loop can log them without branching).
         metrics: dict[str, at.Float[at.Array, ""]] = {
+            "flow/loss": jnp.asarray(flow_loss_mean, dtype=flow_loss.dtype),
+            "loss/total": jnp.asarray(flow_loss_mean, dtype=flow_loss.dtype),
             "stop/loss": jnp.asarray(0.0, dtype=flow_loss.dtype),
+            "stop/loss_weighted": jnp.asarray(0.0, dtype=flow_loss.dtype),
             "stop/mask_frac": jnp.asarray(0.0, dtype=flow_loss.dtype),
             "stop/pos_frac": jnp.asarray(0.0, dtype=flow_loss.dtype),
             "stop/pos_weight": jnp.asarray(1.0, dtype=flow_loss.dtype),
@@ -300,17 +304,21 @@ class Pi0(_model.BaseModel):
 
         bce = self._sigmoid_bce_with_logits_pos_weight(stop_logits, stop_label, pos_weight=pos_weight)
         stop_loss = jnp.sum(bce * mask_f) / (mask_sum + 1e-6)
+        stop_loss_weighted = float(self.config.stop_loss_weight) * stop_loss
 
         # Logging helpers.
         metrics["stop/loss"] = stop_loss
+        metrics["stop/loss_weighted"] = stop_loss_weighted
         metrics["stop/mask_frac"] = jnp.mean(mask_f)
         metrics["stop/pos_frac"] = jnp.sum(stop_label * mask_f) / (mask_sum + 1e-6)
         metrics["stop/pos_weight"] = pos_weight
 
         # Keep the original API contract (per-horizon loss). We add the same stop loss to each horizon element,
         # so that `mean(chunked_loss)` contributes exactly `stop_loss_weight * stop_loss` (not diluted by horizon).
-        stop_loss_chunk = (float(self.config.stop_loss_weight) * stop_loss) * jnp.ones_like(flow_loss)
-        return flow_loss + stop_loss_chunk, metrics
+        stop_loss_chunk = stop_loss_weighted * jnp.ones_like(flow_loss)
+        total_loss = flow_loss + stop_loss_chunk
+        metrics["loss/total"] = jnp.mean(total_loss)
+        return total_loss, metrics
 
     @override
     def sample_actions(

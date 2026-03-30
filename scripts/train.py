@@ -192,8 +192,14 @@ def eval_step(
 
     loss_rng, sample_rng = jax.random.split(rng)
 
-    chunked_loss = model.compute_loss(loss_rng, observation, actions, train=False)
-    flow_loss = jnp.mean(chunked_loss)
+    metrics: dict[str, at.Float[at.Array, ""]] = {}
+    if hasattr(model, "compute_loss_and_metrics"):
+        chunked_loss, metrics = model.compute_loss_and_metrics(loss_rng, observation, actions, train=False)  # type: ignore[attr-defined]
+    else:
+        chunked_loss = model.compute_loss(loss_rng, observation, actions, train=False)
+
+    total_loss = jnp.mean(chunked_loss)
+    flow_loss = metrics.get("flow/loss", total_loss)
 
     pred_actions = model.sample_actions(sample_rng, observation, num_steps=num_denoise_steps)
 
@@ -209,14 +215,23 @@ def eval_step(
 
     first_action_mse = jnp.mean(jnp.square(pred_actions[:, 0] - actions[:, 0]))
 
-    return {
-        "val_loss": flow_loss,
+    out: dict[str, at.Float[at.Array, ""]] = {
+        # Backward-compat: keep `val_loss` but make it total loss (flow + stop supervision if enabled).
+        "val_loss": total_loss,
+        "val/total_loss": total_loss,
+        # `val/flow_loss` is flow-matching loss only.
         "val/flow_loss": flow_loss,
         "val/action_mse": action_mse,
         "val/action_mae": action_mae,
         "val/action_cosine_sim": jnp.mean(cos_sim),
         "val/first_action_mse": first_action_mse,
     }
+    if metrics:
+        # Mirror stop metrics under `val/` so dashboards are unambiguous.
+        for k, v in metrics.items():
+            if k.startswith("stop/"):
+                out[f"val/{k}"] = v
+    return out
 
 
 def init_logging():
