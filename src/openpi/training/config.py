@@ -901,11 +901,12 @@ _CONFIGS = [
         model=pi0_config.Pi0Config(pi05=True, action_horizon=32),
         data=LeRobotB1KDataConfig(
             repo_id="behavior-1k/2025-challenge-demos",
-            # B1K is 30fps: use a wider positive window so batches reliably contain stop positives.
-            # - Positive: last ~0.5s of the segment.
-            # - Negative: >= ~2s before the segment boundary.
-            stop_pos_margin_frames=15,
-            stop_neg_margin_frames=60,
+            # B1K is 30fps: use a wider positive window so batches reliably contain stop positives and
+            # the label is more likely to capture post-completion "settled" frames (annotations often overshoot).
+            # - Positive: last ~2s of the segment.
+            # - Negative: >= ~6s before the segment boundary.
+            stop_pos_margin_frames=60,
+            stop_neg_margin_frames=180,
             base_config=DataConfig(
                 prompt_from_task=True,
                 behavior_dataset_root="../DATASETS/behavior/2025-challenge-demos",
@@ -1090,8 +1091,8 @@ _CONFIGS = [
         model=pi0_config.Pi0Config(pi05=True, action_horizon=32, stop_loss_weight=1.0),
         data=LeRobotB1KSkillDataConfig(
             repo_id="behavior-1k/2025-challenge-demos",
-            stop_pos_margin_frames=15,
-            stop_neg_margin_frames=60,
+            stop_pos_margin_frames=60,
+            stop_neg_margin_frames=180,
             check_timestamp_sync=False,
             base_config=DataConfig(
                 prompt_from_task=True,
@@ -1131,8 +1132,8 @@ _CONFIGS = [
         model=pi0_config.Pi0Config(pi05=True, action_horizon=32, stop_loss_weight=1.0),
         data=LeRobotB1KSkillDataConfig(
             repo_id="behavior-1k/2025-challenge-demos",
-            stop_pos_margin_frames=15,
-            stop_neg_margin_frames=60,
+            stop_pos_margin_frames=60,
+            stop_neg_margin_frames=180,
             check_timestamp_sync=False,
             base_config=DataConfig(
                 prompt_from_task=True,
