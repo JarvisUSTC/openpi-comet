@@ -132,6 +132,28 @@ def init_wandb(config: _config.TrainConfig, *, resuming: bool, log_code: bool = 
 def _load_weights_and_validate(loader: _weight_loaders.WeightLoader, params_shape: at.Params) -> at.Params:
     """Loads and validates the weights. Returns a loaded subset of the weights."""
     loaded_params = loader.load(params_shape)
+    # Allow partial restores when the current model has new parameters that are not present in the checkpoint.
+    expected_flat = traverse_util.flatten_dict(params_shape)
+    loaded_flat = traverse_util.flatten_dict(loaded_params)
+
+    extra_keys = set(loaded_flat.keys()) - set(expected_flat.keys())
+    if extra_keys:
+        extra_preview = sorted(extra_keys)[:10]
+        raise ValueError(
+            f"Loaded checkpoint has unexpected parameter keys (showing up to 10): {extra_preview}"
+        )
+
+    missing_keys = set(expected_flat.keys()) - set(loaded_flat.keys())
+    if missing_keys:
+        logging.info(
+            "Weight loader: %d missing keys (will init randomly): %s",
+            len(missing_keys),
+            ", ".join("/".join(map(str, k)) for k in sorted(missing_keys)[:5]),
+        )
+        for k in missing_keys:
+            loaded_flat[k] = expected_flat[k]
+        loaded_params = traverse_util.unflatten_dict(loaded_flat)
+
     at.check_pytree_equality(expected=params_shape, got=loaded_params, check_shapes=True, check_dtypes=True)
 
     # Remove jax.ShapeDtypeStruct from the loaded params. This makes sure that only the loaded params are returned.
