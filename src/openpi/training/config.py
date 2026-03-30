@@ -898,7 +898,7 @@ _CONFIGS = [
         name="pi05_b1k-skill_stop",
         exp_name="openpi",
         project_name="B1K",
-        model=pi0_config.Pi0Config(pi05=True, action_horizon=32),
+        model=pi0_config.Pi0Config(pi05=True, action_horizon=32, stop_detach_prefix=False),
         data=LeRobotB1KDataConfig(
             repo_id="behavior-1k/2025-challenge-demos",
             # B1K is 30fps: use a wider positive window so batches reliably contain stop positives and
@@ -1088,7 +1088,7 @@ _CONFIGS = [
         name="pi05_b1k-sampled_skill_group-stop-full-pretrained",
         exp_name="openpi",
         project_name="B1K",
-        model=pi0_config.Pi0Config(pi05=True, action_horizon=32, stop_loss_weight=1.0),
+        model=pi0_config.Pi0Config(pi05=True, action_horizon=32, stop_loss_weight=1.0, stop_detach_prefix=False),
         data=LeRobotB1KSkillDataConfig(
             repo_id="behavior-1k/2025-challenge-demos",
             stop_pos_margin_frames=60,
@@ -1129,7 +1129,7 @@ _CONFIGS = [
         name="pi05_b1k-sampled_single_skill-stop-full-pretrained",
         exp_name="openpi",
         project_name="B1K",
-        model=pi0_config.Pi0Config(pi05=True, action_horizon=32, stop_loss_weight=1.0),
+        model=pi0_config.Pi0Config(pi05=True, action_horizon=32, stop_loss_weight=1.0, stop_detach_prefix=False),
         data=LeRobotB1KSkillDataConfig(
             repo_id="behavior-1k/2025-challenge-demos",
             stop_pos_margin_frames=60,
