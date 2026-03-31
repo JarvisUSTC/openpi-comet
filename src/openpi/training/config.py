@@ -129,6 +129,10 @@ class DataConfig:
     # fine-grained level of orchestrators to use for training
     fine_grained_level: int = 0  # 0, 1, 2
 
+    # If true, and annotations provide `skill_annotation[].augmented_subtask`, sample a random candidate
+    # prompt per-frame within the skill segment (and prefer loading `annotations_aug_v2/` when present).
+    use_augmented_subtask_prompt: bool = False
+
     # whether to return seg instance
     return_seg_instance: bool = False
 
@@ -1149,6 +1153,52 @@ _CONFIGS = [
         freeze_filter=pi0_config.Pi0Config(pi05=True, action_horizon=32).get_freeze_filter(),
         ema_decay=None,
         checkpoint_base_dir="./outputs/checkpoints/pi05_b1k-sampled_skill_group-stop-full-pretrained",
+        num_workers=8,
+        batch_size=8 * 32,
+    ),
+    TrainConfig(
+        # Full fine-tune (skill-group filtered) + weak stop supervision head (Pi05).
+        # Override via:
+        #   --data.skill-list "place on:1.0" "place under:1.0" ...
+        name="pi05_b1k-sampled_skill_group-stop-full-pretrained-prompt-aug",
+        exp_name="openpi",
+        project_name="B1K",
+        model=pi0_config.Pi0Config(pi05=True, action_horizon=32, stop_loss_weight=0.1, stop_detach_prefix=False),
+        data=LeRobotB1KSkillDataConfig(
+            repo_id="behavior-1k/2025-challenge-demos",
+            stop_pos_margin_frames=60,
+            stop_neg_margin_frames=180,
+            stop_soft_labels=True,
+            check_timestamp_sync=False,
+            base_config=DataConfig(
+                prompt_from_task=True,
+                behavior_dataset_root="../DATASETS/behavior/2025-challenge-demos",
+                # Train/val split: these are PER-TASK positional episode indices (not global episode ids).
+                episodes_index=list(range(0, 180)),
+                fine_grained_level=1,  # skill segments
+                use_augmented_subtask_prompt=True,
+            ),
+        ),
+        weight_loader=weight_loaders.CheckpointWeightLoader(
+            "/root/Training/openpi-comet/outputs/checkpoints/pi05_b1k-all_skills/pi05_b1k-all_skills/49999/params"
+        ),
+        num_train_steps=60_000,
+        lr_schedule=_optimizer.CosineDecaySchedule(
+            peak_lr=2.5e-5,
+            decay_steps=60_000,
+        ),
+        log_interval=100,
+        save_interval=5000,
+        val_log_interval=100,
+        val_num_batches=64,
+        val_batch_size=2 * 32,
+        val_episodes_index=list(range(180, 200)),
+        val_stop_balanced_sampling=True,
+        val_stop_balanced_pos_prob=0.5,
+        val_stop_balanced_cycle=True,
+        freeze_filter=pi0_config.Pi0Config(pi05=True, action_horizon=32).get_freeze_filter(),
+        ema_decay=None,
+        checkpoint_base_dir="./outputs/checkpoints/pi05_b1k-sampled_skill_group-stop-full-pretrained-prompt-aug",
         num_workers=8,
         batch_size=8 * 32,
     ),

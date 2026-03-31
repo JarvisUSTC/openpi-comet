@@ -147,6 +147,7 @@ def create_behavior_dataset(data_config: _config.DataConfig, action_horizon: int
         chunk_streaming_using_keyframe=True,
         shuffle=True,
         fine_grained_level=data_config.fine_grained_level,
+        use_augmented_subtask_prompt=getattr(data_config, "use_augmented_subtask_prompt", False),
         return_seg_instance=data_config.return_seg_instance,
         train_rgb_type=data_config.train_rgb_type,
         stop_pos_margin_frames=data_config.stop_pos_margin_frames,

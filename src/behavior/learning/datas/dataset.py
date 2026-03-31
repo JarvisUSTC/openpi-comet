@@ -56,6 +56,43 @@ from behavior.learning.datas.skill_prompt import format_skill_prompt
 from behavior.learning.datas.stop_supervision import compute_stop_label_and_mask
 
 
+def _coerce_prompt_candidates(v) -> list[str]:
+    """Parse/flatten augmented prompt candidates from annotations (best-effort)."""
+    if v is None:
+        return []
+
+    if isinstance(v, str):
+        s = v.strip()
+        if not s:
+            return []
+        # Some annotations store lists as strings.
+        if s.startswith("[") and "]" in s:
+            try:
+                parsed = json.loads(s.replace("'", '"'))
+                return _coerce_prompt_candidates(parsed)
+            except Exception:
+                return [s]
+        return [s]
+
+    if isinstance(v, (list, tuple)):
+        flat: list[str] = []
+        for item in v:
+            flat.extend(_coerce_prompt_candidates(item))
+        # De-duplicate while preserving order.
+        seen = set()
+        out: list[str] = []
+        for p in flat:
+            p = str(p).strip()
+            if not p or p in seen:
+                continue
+            seen.add(p)
+            out.append(p)
+        return out
+
+    s = str(v).strip()
+    return [s] if s else []
+
+
 
 
 def build_orchestrator_levels_from_annotations(
@@ -101,6 +138,7 @@ def build_orchestrator_levels_from_annotations(
     for i, s in enumerate(skill_annotation):
         skill_desc = _skill_desc_text(s)
         task_text = format_skill_prompt(s)
+        task_candidates = _coerce_prompt_candidates(s.get("augmented_subtask"))
         parsed = _parse_frame_duration(s.get("frame_duration")) if "frame_duration" in s else None
         # 有 frame_duration 但解析为 None（多段或无效）时跳过该 skill，不加入 orchestrator
         if "frame_duration" in s and parsed is None:
@@ -112,18 +150,17 @@ def build_orchestrator_levels_from_annotations(
         else:
             start_frame = (i * episode_len) // n
             end_frame = ((i + 1) * episode_len - 1) // n if i < n - 1 else episode_len - 1
-        output_data[1].append({
+        seg = {
             "task": task_text,
             "skill": skill_desc,
             "start_frame": start_frame,
             "end_frame": end_frame,
-        })
-        output_data[2].append({
-            "task": task_text,
-            "skill": skill_desc,
-            "start_frame": start_frame,
-            "end_frame": end_frame,
-        })
+        }
+        # Store candidates so we can sample a prompt at runtime per-frame.
+        if task_candidates:
+            seg["task_candidates"] = task_candidates
+        output_data[1].append(dict(seg))
+        output_data[2].append(dict(seg))
     # 若所有 skill 均被过滤（如均为多段 frame_duration），则 level 1/2 退化为整段 episode
     if not output_data[1]:
         output_data[1] = list(output_data[0])
@@ -169,6 +206,7 @@ class BehaviorLeRobotDataset(LeRobotDataset):
         shuffle: bool = True,
         seed: int = 42,
         fine_grained_level: int = 0,  # 0, 1, 2, 3
+        use_augmented_subtask_prompt: bool = False,
         train_rgb_type: str = "regular",  # regular | bbox | point
         return_seg_instance: bool = False,
         skill_list: list[str] = ["all"],
@@ -231,6 +269,9 @@ class BehaviorLeRobotDataset(LeRobotDataset):
         self.stop_balanced_pos_prob = float(stop_balanced_pos_prob)
         self.stop_balanced_cycle = bool(stop_balanced_cycle)
         self._stop_balanced_next_is_pos = True
+        self._prompt_rng = None
+        self._prompt_rng_worker_id = None
+        self.use_augmented_subtask_prompt = bool(use_augmented_subtask_prompt)
 
         # Unused attributes
         self.image_writer = None
@@ -254,6 +295,7 @@ class BehaviorLeRobotDataset(LeRobotDataset):
         self.task_names = set(tasks) if tasks is not None else set(TASK_NAMES_TO_INDICES.keys())
         self.task_indices = [TASK_NAMES_TO_INDICES[task] for task in self.task_names]
         # Load metadata
+        ann_dir_candidates = ("annotations_aug_v2", ANNOTATIONS_PATH) if self.use_augmented_subtask_prompt else (ANNOTATIONS_PATH,)
         self.meta = BehaviorLerobotDatasetMetadata(
             repo_id=self.repo_id,
             root=self.root,
@@ -262,6 +304,7 @@ class BehaviorLeRobotDataset(LeRobotDataset):
             tasks=self.task_names,
             modalities=modalities,
             cameras=cameras,
+            annotations_dir_candidates=ann_dir_candidates,
         )
         # overwrite episode based on task
         all_episodes = load_jsonlines(self.root / EPISODES_PATH)
@@ -990,13 +1033,29 @@ class BehaviorLeRobotDataset(LeRobotDataset):
         # Prefer canonical skill label (annotation skill_description) when available.
         return seg.get("skill") or seg["task"]
 
+    def _get_prompt_rng_for_worker(self):
+        worker_info = get_worker_info()
+        worker_id = 0 if worker_info is None else worker_info.id
+        if self._prompt_rng is None or self._prompt_rng_worker_id != worker_id:
+            # Offset seed so prompt sampling stream doesn't correlate with chunk sampling streams.
+            self._prompt_rng = np.random.default_rng(self.seed + 1_000_003 + worker_id)
+            self._prompt_rng_worker_id = worker_id
+        return self._prompt_rng
+
     def _get_fine_grained_task(self, item: dict) -> str:
         ep_idx = item["episode_index"].item()
         task_idx = item["task_index"].item()
         frame_index = round(item["timestamp"].item() * self.fps)
         try:
             sub_idx = bisect.bisect_right(self.task_sizes[ep_idx], frame_index, hi=len(self.task_sizes[ep_idx]) - 1)
-            task_text = self.meta.orchestrators[ep_idx][self.fine_grained_level][sub_idx]["task"]
+            seg = self.meta.orchestrators[ep_idx][self.fine_grained_level][sub_idx]
+            task_text = seg["task"]
+            candidates = seg.get("task_candidates")
+            if self.use_augmented_subtask_prompt and candidates:
+                try:
+                    task_text = str(self._get_prompt_rng_for_worker().choice(candidates)).strip() or task_text
+                except Exception:
+                    task_text = task_text
 
         except Exception as e:
             logger.warning(
@@ -1133,11 +1192,17 @@ class BehaviorLerobotDatasetMetadata(LeRobotDatasetMetadata):
         tasks: Iterable[str] = None,
         modalities: Iterable[str] = None,
         cameras: Iterable[str] = None,
+        annotations_dir_candidates: Iterable[str] | None = None,
     ):
         # ========== Customizations ==========
         self.task_name_candidates = set(tasks) if tasks is not None else set(TASK_NAMES_TO_INDICES.keys())
         self.modalities = set(modalities)
         self.camera_names = set(cameras)
+        self.annotations_dir_candidates = (
+            tuple(str(x) for x in annotations_dir_candidates if str(x))
+            if annotations_dir_candidates is not None
+            else (ANNOTATIONS_PATH,)
+        )
         assert self.modalities.issubset(
             {"rgb", "depth", "seg_instance_id"}
         ), f"Modalities must be a subset of ['rgb', 'depth', 'seg_instance_id'], but got {self.modalities}"
@@ -1236,7 +1301,16 @@ class BehaviorLerobotDatasetMetadata(LeRobotDatasetMetadata):
         }
 
     def load_annotations(self, local_dir: Path) -> dict:
-        annotations = local_dir / ANNOTATIONS_PATH
+        annotations = None
+        for cand in getattr(self, "annotations_dir_candidates", (ANNOTATIONS_PATH,)):
+            p = local_dir / str(cand)
+            if p.exists():
+                annotations = p
+                break
+        if annotations is None:
+            annotations = local_dir / ANNOTATIONS_PATH
+        if not annotations.exists():
+            return {}
         task_list = [task_id for task_id in annotations.iterdir() if task_id.is_dir()]
         return {
             int(episode.stem[8:]): load_json(episode)
