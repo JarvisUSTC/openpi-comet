@@ -41,6 +41,9 @@ class Pi0Config(_model.BaseModelConfig):
     stop_loss_weight: float = 0.1
     stop_pos_weight_clip_min: float = 1.0
     stop_pos_weight_clip_max: float = 50.0
+    # For metrics (and optional downstream thresholding) under soft stop labels.
+    stop_hard_pos_threshold: float = 0.8
+    stop_hard_neg_threshold: float = 0.2
     # Stop head inputs / training behavior.
     # - stop_use_state: include continuous proprioceptive state features in stop prediction.
     # - stop_detach_prefix: stop loss does not backprop into the prefix backbone (prevents stop from hurting flow).

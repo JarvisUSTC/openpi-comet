@@ -581,6 +581,9 @@ def main(config: _config.TrainConfig):
 
         if val_loader is not None and peval_step is not None and (step % config.val_log_interval == 0):
             try:
+                # Reset stateful streaming datasets so validation is comparable across steps.
+                if hasattr(val_loader, "_data_loader") and hasattr(val_loader._data_loader, "reset_dataset_state"):
+                    val_loader._data_loader.reset_dataset_state()
                 val_metrics_list = []
                 val_rng = jax.random.fold_in(train_rng, 1_000_000 + step)
                 for val_batch in val_loader:
@@ -595,6 +598,11 @@ def main(config: _config.TrainConfig):
                     "val/flow_loss",
                     "val/stop/loss_weighted",
                     "val/stop/pos_frac",
+                    "val/stop/prob_mean_pos",
+                    "val/stop/prob_mean_neg",
+                    "val/stop/prob_mean_hard_pos",
+                    "val/stop/prob_mean_hard_neg",
+                    "val/stop/pos_weight",
                     "val/action_mse",
                 ]
                 metrics_str = ", ".join(f"{k}={val_metrics[k]:.4f}" for k in keys if k in val_metrics)

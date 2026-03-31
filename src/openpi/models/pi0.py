@@ -282,10 +282,14 @@ class Pi0(_model.BaseModel):
             "stop/loss_weighted": jnp.asarray(0.0, dtype=flow_loss.dtype),
             "stop/mask_frac": jnp.asarray(0.0, dtype=flow_loss.dtype),
             "stop/pos_frac": jnp.asarray(0.0, dtype=flow_loss.dtype),
+            "stop/hard_pos_frac": jnp.asarray(0.0, dtype=flow_loss.dtype),
+            "stop/hard_neg_frac": jnp.asarray(0.0, dtype=flow_loss.dtype),
             "stop/pos_weight": jnp.asarray(1.0, dtype=flow_loss.dtype),
             "stop/prob_mean": jnp.asarray(0.0, dtype=flow_loss.dtype),
             "stop/prob_mean_pos": jnp.asarray(0.0, dtype=flow_loss.dtype),
             "stop/prob_mean_neg": jnp.asarray(0.0, dtype=flow_loss.dtype),
+            "stop/prob_mean_hard_pos": jnp.asarray(0.0, dtype=flow_loss.dtype),
+            "stop/prob_mean_hard_neg": jnp.asarray(0.0, dtype=flow_loss.dtype),
         }
 
         if observation.stop_label is None or observation.stop_mask is None:
@@ -330,6 +334,22 @@ class Pi0(_model.BaseModel):
         metrics["stop/prob_mean"] = jnp.sum(stop_prob * mask_f) / (mask_sum + 1e-6)
         metrics["stop/prob_mean_pos"] = jnp.sum(stop_prob * stop_label * mask_f) / (pos_sum + 1e-6)
         metrics["stop/prob_mean_neg"] = jnp.sum(stop_prob * (1.0 - stop_label) * mask_f) / (neg_sum + 1e-6)
+
+        # "Hard bucket" diagnostics: useful under soft labels (and still meaningful for hard labels).
+        hard_pos_thr = jnp.asarray(float(self.config.stop_hard_pos_threshold), dtype=stop_label.dtype)
+        hard_neg_thr = jnp.asarray(float(self.config.stop_hard_neg_threshold), dtype=stop_label.dtype)
+        hard_pos_mask = stop_mask & (stop_label >= hard_pos_thr)
+        hard_neg_mask = stop_mask & (stop_label <= hard_neg_thr)
+        hard_pos_sum = jnp.sum(hard_pos_mask.astype(stop_logits.dtype))
+        hard_neg_sum = jnp.sum(hard_neg_mask.astype(stop_logits.dtype))
+        metrics["stop/hard_pos_frac"] = hard_pos_sum / (mask_sum + 1e-6)
+        metrics["stop/hard_neg_frac"] = hard_neg_sum / (mask_sum + 1e-6)
+        metrics["stop/prob_mean_hard_pos"] = jnp.sum(stop_prob * hard_pos_mask.astype(stop_logits.dtype)) / (
+            hard_pos_sum + 1e-6
+        )
+        metrics["stop/prob_mean_hard_neg"] = jnp.sum(stop_prob * hard_neg_mask.astype(stop_logits.dtype)) / (
+            hard_neg_sum + 1e-6
+        )
 
         # Keep the original API contract (per-horizon loss). We add the same stop loss to each horizon element,
         # so that `mean(chunked_loss)` contributes exactly `stop_loss_weight * stop_loss` (not diluted by horizon).

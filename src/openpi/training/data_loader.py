@@ -422,6 +422,28 @@ class TorchDataLoader:
     def torch_loader(self) -> torch.utils.data.DataLoader:
         return self._data_loader
 
+    def reset_dataset_state(self) -> None:
+        """Best-effort reset of underlying stateful datasets (used for stable validation).
+
+        Datasets in this repo may implement internal streaming cursors for performance.
+        During validation, that statefulness can introduce high variance across eval calls.
+        """
+
+        def unwrap(ds):
+            # Unwrap nested TransformedDataset wrappers used by openpi.transforms.
+            depth = 0
+            while hasattr(ds, "_dataset") and depth < 20:
+                ds = getattr(ds, "_dataset")
+                depth += 1
+            return ds
+
+        try:
+            ds = unwrap(self._data_loader.dataset)
+            if hasattr(ds, "reset_streaming_state"):
+                ds.reset_streaming_state()  # type: ignore[attr-defined]
+        except Exception:
+            logging.exception("Failed to reset dataset state for validation.")
+
     def __iter__(self):
         num_items = 0
         while True:

@@ -719,6 +719,9 @@ def train_loop(config: _config.TrainConfig):
 
             if val_loader is not None and (global_step % config.val_log_interval == 0):
                 try:
+                    # Reset stateful streaming datasets so validation is comparable across steps.
+                    if hasattr(val_loader, "_data_loader") and hasattr(val_loader._data_loader, "reset_dataset_state"):
+                        val_loader._data_loader.reset_dataset_state()
                     val_metrics = validate(model, val_loader, device, config)
                     metrics_str = ", ".join(f"{k}={v:.4f}" for k, v in val_metrics.items() if not k.startswith("val/"))
                     if pbar is not None:

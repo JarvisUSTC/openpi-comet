@@ -518,6 +518,50 @@ class BehaviorLeRobotDataset(LeRobotDataset):
         chosen_local = int(local_start) + (chosen_global - int(global_start))
         return chosen_global, global_end, ep_idx, chosen_local, (chosen_local % 250) == 0
 
+    def reset_streaming_state(self) -> None:
+        """Reset internal streaming cursors/RNG so iteration becomes deterministic again.
+
+        This dataset uses stateful streaming for performance (sequential decode within a sampled range).
+        For validation we often want a stable, comparable evaluation slice across training steps. Resetting
+        makes the next samples start from the same RNG seed and segment selection pattern.
+        """
+        # Close any open video loaders.
+        try:
+            for loader in getattr(self, "obs_loaders", {}).values():
+                try:
+                    loader.close()
+                except Exception:
+                    pass
+        except Exception:
+            pass
+        self.obs_loaders = dict()
+        self._should_obs_loaders_reload = True
+
+        # Reset both skill-stream and chunk-stream cursors.
+        self.current_streaming_chunk_idx = None
+        self.current_streaming_frame_idx = None
+        self.current_streaming_episode_idx = None
+
+        # Reset chunk selection cache.
+        if hasattr(self, "_active_chunks"):
+            self._active_chunks = None
+
+        # Reset skill-stream RNG and range.
+        self._skill_stream_rng = None
+        self._skill_stream_rng_worker_id = None
+        self._skill_stream_range_end = None
+        for k in (
+            "_skill_stream_ep_idx",
+            "_skill_stream_local_start",
+            "_skill_stream_is_keyframe",
+        ):
+            if hasattr(self, k):
+                setattr(self, k, None)
+
+        # Reset balanced sampling cycle so pos/neg alternation is stable.
+        if hasattr(self, "_stop_balanced_next_is_pos"):
+            self._stop_balanced_next_is_pos = True
+
     def prepare_task(self, fine_grained_level: int):
         """set train subtask mode for lerobot dataset"""
         self.fine_grained_level = fine_grained_level
