@@ -27,8 +27,17 @@ fi
 # Avoid torch inductor spawning compile worker subprocesses in restricted environments.
 export TORCHINDUCTOR_COMPILE_THREADS="${TORCHINDUCTOR_COMPILE_THREADS:-1}"
 
-GROUP="${1:?missing <group_name>}"
-shift 1
+# Right-click friendly defaults for resuming the current place-on-next-to run.
+DEFAULT_GROUP="place_on_next_to"
+DEFAULT_SKILLS=("place on next to")
+DEFAULT_RESUME_EXP_NAME="pretrain_full_place_on_next_to_20260329_004955"
+
+if [[ $# -gt 0 ]]; then
+  GROUP="${1}"
+  shift 1
+else
+  GROUP="${GROUP:-${DEFAULT_GROUP}}"
+fi
 
 SKILLS=()
 while [[ $# -gt 0 ]]; do
@@ -41,13 +50,11 @@ while [[ $# -gt 0 ]]; do
 done
 
 if [[ ${#SKILLS[@]} -eq 0 ]]; then
-  echo "No skills provided. Usage: scripts/train_skill_group_full.sh \"group\" \"skill1\" [\"skill2\" ...] [-- extra args]" >&2
-  exit 2
+  SKILLS=("${DEFAULT_SKILLS[@]}")
 fi
 
 CONFIG_NAME="${CONFIG_NAME:-pi05_b1k-sampled_skill_group-full}"
 export CONFIG_NAME="${CONFIG_NAME}"
-EXP_NAME="${EXP_NAME:-pretrain_full_${GROUP//[^a-zA-Z0-9_-]/_}_$(date +%Y%m%d_%H%M%S)}"
 
 SKILL_WEIGHT="${SKILL_WEIGHT:-1.0}"
 SKILL_ITEMS=()
@@ -64,12 +71,6 @@ else
     SKILL_ITEMS+=("${s}:${SKILL_WEIGHT}")
   done
 fi
-
-echo "Config: ${CONFIG_NAME}"
-echo "Group: ${GROUP}"
-echo "Skills: ${SKILLS[*]}"
-echo "Skill weight: ${SKILL_WEIGHT}"
-echo "exp_name: ${EXP_NAME}"
 
 # Compute norm stats once for this config if missing (can skip with SKIP_NORM_STATS=1).
 if [[ "${SKIP_NORM_STATS:-0}" != "1" ]]; then
@@ -119,8 +120,23 @@ else
   TRAIN_SCRIPT="scripts/train.py"
 fi
 
+if [[ "${RESUME:-1}" == "1" ]]; then
+  EXP_NAME="${EXP_NAME:-${DEFAULT_RESUME_EXP_NAME}}"
+  MODE_FLAG="--resume"
+else
+  EXP_NAME="${EXP_NAME:-pretrain_full_${GROUP//[^a-zA-Z0-9_-]/_}_$(date +%Y%m%d_%H%M%S)}"
+  MODE_FLAG="--overwrite"
+fi
+
+echo "Config: ${CONFIG_NAME}"
+echo "Group: ${GROUP}"
+echo "Skills: ${SKILLS[*]}"
+echo "Skill weight: ${SKILL_WEIGHT}"
+echo "exp_name: ${EXP_NAME}"
+echo "mode: ${MODE_FLAG}"
+
 python -u "${TRAIN_SCRIPT}" "${CONFIG_NAME}" \
   --exp-name="${EXP_NAME}" \
-  --overwrite \
+  "${MODE_FLAG}" \
   --data.skill-list "${SKILL_ITEMS[@]}" \
   "$@"

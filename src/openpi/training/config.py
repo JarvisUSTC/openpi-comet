@@ -788,6 +788,7 @@ _CONFIGS = [
         batch_size=8 * 32,
     ),
     # Single-skill full fine-tune (filtered by skill list) with K=6 video memory
+    # Single-skill full fine-tune (filtered by skill list) with K=6 video memory
     TrainConfig(
         name="pi05_b1k-sampled_single_skill-full",
         exp_name="openpi",
@@ -803,18 +804,18 @@ _CONFIGS = [
             ),
         ),
         weight_loader=weight_loaders.CheckpointWeightLoader("/root/Models/pi05_base/params"),
-        num_train_steps=60_000,
+        num_train_steps=400000,
         lr_schedule=_optimizer.CosineDecaySchedule(
             peak_lr=2.5e-5,
-            decay_steps=60_000,
+            decay_steps=400000,
         ),
         log_interval=100,
         save_interval=5000,
         val_log_interval=100,
-        val_num_batches=10,
+        val_num_batches=100,
         val_batch_size=16,
         val_episodes_index=list(range(180, 200)),
-        freeze_filter=pi0_config.Pi0Config(pi05=True, action_horizon=16, video_memory_frames=6).get_freeze_filter(),
+        freeze_filter=pi0_config.Pi0Config(pi05=True, action_horizon=32, video_memory_frames=6).get_freeze_filter(),
         ema_decay=None,
         checkpoint_base_dir="./outputs/checkpoints/pi05_b1k-sampled_single_skill-full",
         num_workers=8,

@@ -33,7 +33,6 @@ class B1KPolicyWrapper:
         "observation/wrist_image_right",
     )
     _B1K_FPS = 30.0
-
     def __init__(
         self,
         policy: BasePolicy,
@@ -51,9 +50,13 @@ class B1KPolicyWrapper:
         self.video_memory_frames = video_memory_frames
         self.video_memory_stride_s = video_memory_stride_s
         self.history_stride = 1
+        total_history_frames = max(video_memory_frames - 1, 0)
+        self.near_history_frames = total_history_frames
+        self.sparse_history_frames = 0
+        self.history_offsets = list(range(total_history_frames, 0, -1))
         # Frame history buffer: stores up to K-1 past frames per camera.
         self._frame_history: dict[str, deque] = {
-            k: deque(maxlen=max(video_memory_frames - 1, 0))
+            k: deque(maxlen=max(self.history_offsets, default=0))
             for k in self._HISTORY_CAMERA_KEYS
         }
 
@@ -94,6 +97,9 @@ class B1KPolicyWrapper:
         logger.info(f"{self.video_memory_frames=}")
         logger.info(f"{self.video_memory_stride_s=}")
         logger.info(f"{self.history_stride=}")
+        logger.info(f"{self.near_history_frames=}")
+        logger.info(f"{self.sparse_history_frames=}")
+        logger.info(f"{self.history_offsets=}")
         logger.info(f"{self.step_counter=}")
         logger.info(f"{self.action_queue=}")
         logger.info(f"{self.task_prompt=}")
@@ -141,13 +147,15 @@ class B1KPolicyWrapper:
                 history = list(self._frame_history[key])
                 sampled = []
                 valid = []
-                missing = max(self.video_memory_frames - 1 - len(history), 0)
-                if missing > 0:
-                    pad_frame = history[0] if history else current_frame
-                    sampled.extend([pad_frame] * missing)
-                    valid.extend([False] * missing)
-                sampled.extend(history[-(self.video_memory_frames - 1) :])
-                valid.extend([True] * min(len(history), self.video_memory_frames - 1))
+                pad_frame = history[0] if history else current_frame
+                for offset in self.history_offsets:
+                    idx = len(history) - offset
+                    if idx >= 0:
+                        sampled.append(history[idx])
+                        valid.append(True)
+                    else:
+                        sampled.append(pad_frame)
+                        valid.append(False)
                 batch[f"{key}_history"] = sampled
                 batch[f"{key}_history_valid"] = valid
                 self._frame_history[key].append(current_frame.copy())
