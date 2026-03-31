@@ -174,6 +174,10 @@ class BehaviorLeRobotDataset(LeRobotDataset):
         skill_list: list[str] = ["all"],
         stop_pos_margin_frames: int = 0,
         stop_neg_margin_frames: int = 15,
+        stop_soft_labels: bool = False,
+        stop_balanced_sampling: bool = False,
+        stop_balanced_pos_prob: float = 0.5,
+        stop_balanced_cycle: bool = True,
     ):
         """
         Custom args:
@@ -222,6 +226,11 @@ class BehaviorLeRobotDataset(LeRobotDataset):
         self.skill_list = skill_list
         self.stop_pos_margin_frames = stop_pos_margin_frames
         self.stop_neg_margin_frames = stop_neg_margin_frames
+        self.stop_soft_labels = bool(stop_soft_labels)
+        self.stop_balanced_sampling = bool(stop_balanced_sampling)
+        self.stop_balanced_pos_prob = float(stop_balanced_pos_prob)
+        self.stop_balanced_cycle = bool(stop_balanced_cycle)
+        self._stop_balanced_next_is_pos = True
 
         # Unused attributes
         self.image_writer = None
@@ -459,7 +468,55 @@ class BehaviorLeRobotDataset(LeRobotDataset):
         ranges: list[tuple[int, int, int, int, bool]] = self._skill_stream["ranges"]
         probs: np.ndarray = self._skill_stream["probs"]
         i = int(rng.choice(len(ranges), p=probs))
-        return ranges[i]
+        global_start, global_end, ep_idx, local_start, _is_keyframe = ranges[i]
+
+        if not self.stop_balanced_sampling:
+            return global_start, global_end, ep_idx, local_start, (local_start % 250) == 0
+
+        # Balanced start-point selection: for validation, ensure we regularly see both
+        # "definitely negative" and "near end (positive)" regions so stop metrics are stable.
+        #
+        # Range endpoints are in HF dataset global indices; local_start is the episode frame index.
+        # We assume 1 row == 1 frame within an episode for these challenge demos.
+        n = int(global_end) - int(global_start)
+        if n <= 1:
+            return global_start, global_end, ep_idx, local_start, (local_start % 250) == 0
+
+        local_end = int(local_start) + (n - 1)
+        pos_margin = int(self.stop_pos_margin_frames)
+        neg_margin = int(self.stop_neg_margin_frames)
+
+        # Define safe windows (inclusive) that avoid the ignore region when possible.
+        pos_lo = max(int(local_start), int(local_end) - pos_margin)
+        pos_hi = int(local_end)
+
+        neg_lo = int(local_start)
+        neg_hi = min(int(local_end), int(local_end) - neg_margin)
+
+        want_pos: bool
+        if self.stop_balanced_cycle:
+            want_pos = self._stop_balanced_next_is_pos
+            self._stop_balanced_next_is_pos = not self._stop_balanced_next_is_pos
+        else:
+            want_pos = bool(rng.random() < self.stop_balanced_pos_prob)
+
+        chosen_local = None
+        if want_pos and pos_lo <= pos_hi:
+            chosen_local = int(rng.integers(pos_lo, pos_hi + 1))
+        elif (not want_pos) and neg_lo <= neg_hi:
+            chosen_local = int(rng.integers(neg_lo, neg_hi + 1))
+        elif pos_lo <= pos_hi:
+            chosen_local = int(rng.integers(pos_lo, pos_hi + 1))
+        elif neg_lo <= neg_hi:
+            chosen_local = int(rng.integers(neg_lo, neg_hi + 1))
+
+        if chosen_local is None:
+            chosen_local = int(local_start)
+
+        delta = int(chosen_local) - int(local_start)
+        chosen_global = int(global_start) + max(0, min(delta, n - 1))
+        chosen_local = int(local_start) + (chosen_global - int(global_start))
+        return chosen_global, global_end, ep_idx, chosen_local, (chosen_local % 250) == 0
 
     def prepare_task(self, fine_grained_level: int):
         """set train subtask mode for lerobot dataset"""
@@ -583,6 +640,7 @@ class BehaviorLeRobotDataset(LeRobotDataset):
                 skill_end=skill_end,
                 pos_margin_frames=self.stop_pos_margin_frames,
                 neg_margin_frames=self.stop_neg_margin_frames,
+                soft_labels=self.stop_soft_labels,
             )
             item["stop_label"] = stop_label
             item["stop_mask"] = stop_mask
@@ -720,6 +778,7 @@ class BehaviorLeRobotDataset(LeRobotDataset):
                 skill_end=skill_end,
                 pos_margin_frames=self.stop_pos_margin_frames,
                 neg_margin_frames=self.stop_neg_margin_frames,
+                soft_labels=self.stop_soft_labels,
             )
             item["stop_label"] = stop_label
             item["stop_mask"] = stop_mask
@@ -871,6 +930,7 @@ class BehaviorLeRobotDataset(LeRobotDataset):
             skill_end=skill_end,
             pos_margin_frames=self.stop_pos_margin_frames,
             neg_margin_frames=self.stop_neg_margin_frames,
+            soft_labels=self.stop_soft_labels,
         )
         item["stop_label"] = stop_label
         item["stop_mask"] = stop_mask

@@ -146,6 +146,25 @@ class DataConfig:
     #   otherwise => ignore (mask=0)
     stop_pos_margin_frames: int = 0
     stop_neg_margin_frames: int = 15
+    # If true, uses a soft label within the positive window:
+    #   d = (skill_end - frame_index)
+    #   d <= 0        => label=1
+    #   0 < d <= pos  => label=1 - d/pos  (linear ramp)
+    # Otherwise, uses hard labels (0/1).
+    stop_soft_labels: bool = False
+
+    # Validation-only helpers for stop supervision.
+    #
+    # When using skill streaming, the default sampler tends to start at the beginning of a segment.
+    # With narrow validation windows (small val_num_batches), validation may never reach the segment end,
+    # producing stop/pos_frac==0 even though skill_end exists. Enabling balanced sampling makes the stream
+    # start points alternate (or randomly mix) between "far from end" (negative) and "near end" (positive)
+    # regions so validation stop metrics are stable and interpretable.
+    stop_balanced_sampling: bool = False
+    # Probability of sampling a "near end" start point when balanced sampling is enabled.
+    stop_balanced_pos_prob: float = 0.5
+    # If true, alternates between pos/neg starts (per worker) instead of sampling with probability.
+    stop_balanced_cycle: bool = True
 
 
 class GroupFactory(Protocol):
@@ -252,6 +271,8 @@ class DataConfigFactory(abc.ABC):
     # Weak stop supervision margins (in frames) for skill-end prediction.
     stop_pos_margin_frames: int = 0
     stop_neg_margin_frames: int = 15
+    # If true, uses soft stop labels within the positive window (see DataConfig.stop_soft_labels).
+    stop_soft_labels: bool = False
     # Whether to check timestamp sync when constructing the dataset.
     check_timestamp_sync: bool = True
 
@@ -270,6 +291,7 @@ class DataConfigFactory(abc.ABC):
             use_quantile_norm=model_config.model_type != ModelType.PI0,
             stop_pos_margin_frames=self.stop_pos_margin_frames,
             stop_neg_margin_frames=self.stop_neg_margin_frames,
+            stop_soft_labels=self.stop_soft_labels,
             check_timestamp_sync=self.check_timestamp_sync,
         )
 
@@ -632,6 +654,10 @@ class TrainConfig:
     # Optionally, repo_id for validation set (if different from train)
     val_repo_id: str | None = None
     val_episodes_index: list[int] | None = None
+    # Enable balanced stop sampling for validation (see DataConfig.stop_balanced_*).
+    val_stop_balanced_sampling: bool = False
+    val_stop_balanced_pos_prob: float = 0.5
+    val_stop_balanced_cycle: bool = True
 
     @property
     def assets_dirs(self) -> pathlib.Path:
@@ -1093,6 +1119,7 @@ _CONFIGS = [
             repo_id="behavior-1k/2025-challenge-demos",
             stop_pos_margin_frames=60,
             stop_neg_margin_frames=180,
+            stop_soft_labels=True,
             check_timestamp_sync=False,
             base_config=DataConfig(
                 prompt_from_task=True,
@@ -1116,6 +1143,9 @@ _CONFIGS = [
         val_num_batches=10,
         val_batch_size=2 * 32,
         val_episodes_index=list(range(180, 200)),
+        val_stop_balanced_sampling=True,
+        val_stop_balanced_pos_prob=0.5,
+        val_stop_balanced_cycle=True,
         freeze_filter=pi0_config.Pi0Config(pi05=True, action_horizon=32).get_freeze_filter(),
         ema_decay=None,
         checkpoint_base_dir="./outputs/checkpoints/pi05_b1k-sampled_skill_group-stop-full-pretrained",
@@ -1134,6 +1164,7 @@ _CONFIGS = [
             repo_id="behavior-1k/2025-challenge-demos",
             stop_pos_margin_frames=60,
             stop_neg_margin_frames=180,
+            stop_soft_labels=True,
             check_timestamp_sync=False,
             base_config=DataConfig(
                 prompt_from_task=True,
@@ -1155,6 +1186,9 @@ _CONFIGS = [
         val_num_batches=10,
         val_batch_size=2 * 32,
         val_episodes_index=list(range(180, 200)),
+        val_stop_balanced_sampling=True,
+        val_stop_balanced_pos_prob=0.5,
+        val_stop_balanced_cycle=True,
         freeze_filter=pi0_config.Pi0Config(pi05=True, action_horizon=32).get_freeze_filter(),
         ema_decay=None,
         checkpoint_base_dir="./outputs/checkpoints/pi05_b1k-sampled_single_skill-stop-full-pretrained",

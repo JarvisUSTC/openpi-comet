@@ -151,6 +151,10 @@ def create_behavior_dataset(data_config: _config.DataConfig, action_horizon: int
         train_rgb_type=data_config.train_rgb_type,
         stop_pos_margin_frames=data_config.stop_pos_margin_frames,
         stop_neg_margin_frames=data_config.stop_neg_margin_frames,
+        stop_soft_labels=data_config.stop_soft_labels,
+        stop_balanced_sampling=data_config.stop_balanced_sampling,
+        stop_balanced_pos_prob=data_config.stop_balanced_pos_prob,
+        stop_balanced_cycle=data_config.stop_balanced_cycle,
         **args,
     )
 

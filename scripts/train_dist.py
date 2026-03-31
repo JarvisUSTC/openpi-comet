@@ -46,6 +46,13 @@ def _override_factory_for_val(
     if config.val_episodes_index is not None:
         base = factory.base_config or _config.DataConfig()
         base = dataclasses.replace(base, episodes_index=config.val_episodes_index)
+        if config.val_stop_balanced_sampling:
+            base = dataclasses.replace(
+                base,
+                stop_balanced_sampling=True,
+                stop_balanced_pos_prob=float(config.val_stop_balanced_pos_prob),
+                stop_balanced_cycle=bool(config.val_stop_balanced_cycle),
+            )
         factory = dataclasses.replace(factory, base_config=base)
     return factory
 

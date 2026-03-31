@@ -27,3 +27,16 @@ def test_compute_stop_label_and_mask_ignore_window():
     label, mask = compute_stop_label_and_mask(frame_index=90, skill_end=100, pos_margin_frames=0, neg_margin_frames=15)
     assert bool(mask) is False
 
+
+def test_compute_stop_label_and_mask_soft_label_ramp():
+    # soft label ramps linearly within (0, pos] toward 1 at d=0
+    label, mask = compute_stop_label_and_mask(
+        frame_index=90,
+        skill_end=100,  # d=10
+        pos_margin_frames=60,
+        neg_margin_frames=180,
+        soft_labels=True,
+    )
+    assert bool(mask) is True
+    assert 0.0 < float(label) < 1.0
+    assert np.isclose(float(label), 1.0 - (10.0 / 60.0), atol=1e-6)
