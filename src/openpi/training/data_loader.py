@@ -247,7 +247,19 @@ class FakeDataset(Dataset):
         return self._num_samples
 
 
-def create_behavior_dataset(data_config: _config.DataConfig, action_horizon: int, video_memory_frames: int = 1, video_memory_stride_s: float = 1.0) -> Dataset:
+def create_behavior_dataset(
+    data_config: _config.DataConfig,
+    action_horizon: int,
+    video_memory_frames: int = 1,
+    video_memory_stride_s: float = 1.0,
+    *,
+    terminal_loss_weighting: bool = False,
+    terminal_loss_near_frames: int = 15,
+    terminal_loss_final_frames: int = 5,
+    terminal_loss_near_weight: float = 2.0,
+    terminal_loss_final_weight: float = 4.0,
+    terminal_loss_max_base_motion_norm: float = 0.05,
+) -> Dataset:
     """Create a dataset for training."""
     from behavior.learning.datas.dataset import BehaviorLeRobotDataset
 
@@ -279,6 +291,12 @@ def create_behavior_dataset(data_config: _config.DataConfig, action_horizon: int
         return_seg_instance=data_config.return_seg_instance,
         train_rgb_type=data_config.train_rgb_type,
         check_timestamp_sync=False,
+        terminal_loss_weighting=terminal_loss_weighting,
+        terminal_loss_near_frames=terminal_loss_near_frames,
+        terminal_loss_final_frames=terminal_loss_final_frames,
+        terminal_loss_near_weight=terminal_loss_near_weight,
+        terminal_loss_final_weight=terminal_loss_final_weight,
+        terminal_loss_max_base_motion_norm=terminal_loss_max_base_motion_norm,
         **args,
     )
 
@@ -295,11 +313,14 @@ def create_behavior_dataset(data_config: _config.DataConfig, action_horizon: int
 
 
 def create_multi_behavior_dataset(
-    data_configs: list[_config.DataConfig], sample_weights: list[float] | None, action_horizon: int
+    data_configs: list[_config.DataConfig],
+    sample_weights: list[float] | None,
+    action_horizon: int,
+    **dataset_kwargs,
 ) -> Dataset:
     from behavior.learning.datas.dataset import MultiBehaviorLeRobotDataset
 
-    datasets = [create_behavior_dataset(data_config, action_horizon) for data_config in data_configs]
+    datasets = [create_behavior_dataset(data_config, action_horizon, **dataset_kwargs) for data_config in data_configs]
     return MultiBehaviorLeRobotDataset(datasets, sample_weights=sample_weights)
 
 
@@ -371,11 +392,28 @@ def create_behavior_data_loader(
             data_configs,
             sample_weights=config.sample_weights,
             action_horizon=config.model.action_horizon,
+            terminal_loss_weighting=config.terminal_loss_weighting,
+            terminal_loss_near_frames=config.terminal_loss_near_frames,
+            terminal_loss_final_frames=config.terminal_loss_final_frames,
+            terminal_loss_near_weight=config.terminal_loss_near_weight,
+            terminal_loss_final_weight=config.terminal_loss_final_weight,
+            terminal_loss_max_base_motion_norm=config.terminal_loss_max_base_motion_norm,
         )
         data_config = data_configs[0]
     else:
         data_config = config.data.create(config.assets_dirs, config.model)
-        dataset = create_behavior_dataset(data_config, action_horizon=config.model.action_horizon, video_memory_frames=vm_frames, video_memory_stride_s=vm_stride)
+        dataset = create_behavior_dataset(
+            data_config,
+            action_horizon=config.model.action_horizon,
+            video_memory_frames=vm_frames,
+            video_memory_stride_s=vm_stride,
+            terminal_loss_weighting=config.terminal_loss_weighting,
+            terminal_loss_near_frames=config.terminal_loss_near_frames,
+            terminal_loss_final_frames=config.terminal_loss_final_frames,
+            terminal_loss_near_weight=config.terminal_loss_near_weight,
+            terminal_loss_final_weight=config.terminal_loss_final_weight,
+            terminal_loss_max_base_motion_norm=config.terminal_loss_max_base_motion_norm,
+        )
 
     dataset = transform_dataset(dataset, data_config, skip_norm_stats=skip_norm_stats)
 
@@ -420,11 +458,26 @@ def create_torch_behavior_data_loader(
             data_configs,
             sample_weights=config.sample_weights,
             action_horizon=config.model.action_horizon,
+            terminal_loss_weighting=config.terminal_loss_weighting,
+            terminal_loss_near_frames=config.terminal_loss_near_frames,
+            terminal_loss_final_frames=config.terminal_loss_final_frames,
+            terminal_loss_near_weight=config.terminal_loss_near_weight,
+            terminal_loss_final_weight=config.terminal_loss_final_weight,
+            terminal_loss_max_base_motion_norm=config.terminal_loss_max_base_motion_norm,
         )
         data_config = data_configs[0]
     else:
         data_config = config.data.create(config.assets_dirs, config.model)
-        dataset = create_behavior_dataset(data_config, action_horizon=config.model.action_horizon)
+        dataset = create_behavior_dataset(
+            data_config,
+            action_horizon=config.model.action_horizon,
+            terminal_loss_weighting=config.terminal_loss_weighting,
+            terminal_loss_near_frames=config.terminal_loss_near_frames,
+            terminal_loss_final_frames=config.terminal_loss_final_frames,
+            terminal_loss_near_weight=config.terminal_loss_near_weight,
+            terminal_loss_final_weight=config.terminal_loss_final_weight,
+            terminal_loss_max_base_motion_norm=config.terminal_loss_max_base_motion_norm,
+        )
 
     dataset = transform_dataset(dataset, data_config, skip_norm_stats=skip_norm_stats)
 

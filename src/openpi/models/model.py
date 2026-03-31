@@ -116,6 +116,9 @@ class Observation(Generic[ArrayT]):
     # Temporal validity mask for multi-frame inputs.
     temporal_mask: at.Bool[ArrayT, "*b k"] | None = None
 
+    # Optional sample-level weight used to upweight near-terminal skill frames.
+    terminal_loss_weight: at.Float[ArrayT, "*b"] | None = None
+
     @classmethod
     def from_dict(cls, data: at.PyTree[ArrayT]) -> "Observation[ArrayT]":
         """This method defines the mapping between unstructured data (i.e., nested dict) to the structured Observation format."""
@@ -165,6 +168,7 @@ class Observation(Generic[ArrayT]):
                 token_loss_mask=data.get("token_loss_mask"),
                 pcd_xyz=data.get("pcd_xyz"),
                 temporal_mask=data.get("temporal_mask"),
+                terminal_loss_weight=data.get("terminal_loss_weight"),
             )
 
     def to_dict(self) -> at.PyTree[ArrayT]:
@@ -249,6 +253,7 @@ def preprocess_observation(
             token_loss_mask=observation.token_loss_mask,
             pcd_xyz=observation.pcd_xyz,
             temporal_mask=observation.temporal_mask,
+            terminal_loss_weight=observation.terminal_loss_weight,
         )
 
 

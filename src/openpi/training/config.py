@@ -6,6 +6,7 @@ import dataclasses
 from enum import Enum
 from enum import auto
 import logging
+import os
 import pathlib
 from typing import Any, Literal, Protocol, TypeAlias
 
@@ -611,6 +612,19 @@ class TrainConfig:
     val_repo_id: str | None = None
     val_episodes_index: list[int] | None = None
 
+    # If true, upweight samples close to the end of the current skill segment.
+    terminal_loss_weighting: bool = False
+    # Samples within this many frames of skill end receive the "near" weight.
+    terminal_loss_near_frames: int = 15
+    # Samples within this many frames of skill end receive the "final" weight.
+    terminal_loss_final_frames: int = 5
+    # Weight used for samples in the near-terminal window.
+    terminal_loss_near_weight: float = 2.0
+    # Weight used for samples in the final-terminal window.
+    terminal_loss_final_weight: float = 4.0
+    # Require the terminal target action to have a small base-motion norm before upweighting.
+    terminal_loss_max_base_motion_norm: float = 0.05
+
     @property
     def assets_dirs(self) -> pathlib.Path:
         """Get the assets directory for this config."""
@@ -632,6 +646,11 @@ class TrainConfig:
     def __post_init__(self) -> None:
         if self.resume and self.overwrite:
             raise ValueError("Cannot resume and overwrite at the same time.")
+
+        override_params_path = os.environ.get("OPENPI_INIT_PARAMS_PATH")
+        if override_params_path:
+            logging.info("Overriding weight loader with OPENPI_INIT_PARAMS_PATH=%s", override_params_path)
+            object.__setattr__(self, "weight_loader", weight_loaders.CheckpointWeightLoader(override_params_path))
 
 
 def eps_index_fn(*indexs):
@@ -815,6 +834,12 @@ _CONFIGS = [
         val_num_batches=100,
         val_batch_size=16,
         val_episodes_index=list(range(180, 200)),
+        terminal_loss_weighting=True,
+        terminal_loss_near_frames=15,
+        terminal_loss_final_frames=5,
+        terminal_loss_near_weight=2.0,
+        terminal_loss_final_weight=4.0,
+        terminal_loss_max_base_motion_norm=0.05,
         freeze_filter=pi0_config.Pi0Config(pi05=True, action_horizon=32, video_memory_frames=6).get_freeze_filter(),
         ema_decay=None,
         checkpoint_base_dir="./outputs/checkpoints/pi05_b1k-sampled_single_skill-full",

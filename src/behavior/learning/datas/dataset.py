@@ -55,6 +55,41 @@ from behavior.learning.datas.skill_prompt import _skill_desc_text
 from behavior.learning.datas.skill_prompt import format_skill_prompt
 
 
+def compute_terminal_loss_weight(
+    *,
+    frame_index: int,
+    skill_end: int | None,
+    action_chunk=None,
+    final_window_frames: int = 5,
+    near_window_frames: int = 15,
+    final_weight: float = 4.0,
+    near_weight: float = 2.0,
+    max_base_motion_norm: float = 0.05,
+) -> np.float32:
+    """Return a sample-level weight that emphasizes terminal frames with small base motion."""
+    if skill_end is None:
+        return np.float32(1.0)
+
+    d = int(skill_end) - int(frame_index)
+    if action_chunk is None:
+        return np.float32(1.0)
+
+    arr = np.asarray(action_chunk)
+    if arr.ndim < 2 or arr.shape[0] == 0 or arr.shape[-1] < 3:
+        return np.float32(1.0)
+
+    end_offset = max(0, min(int(d), arr.shape[0] - 1))
+    base_motion_norm = np.linalg.norm(arr[end_offset, :3])
+    if base_motion_norm > float(max_base_motion_norm):
+        return np.float32(1.0)
+
+    if d <= int(final_window_frames):
+        return np.float32(final_weight)
+    if d <= int(near_window_frames):
+        return np.float32(near_weight)
+    return np.float32(1.0)
+
+
 
 
 def build_orchestrator_levels_from_annotations(
@@ -171,6 +206,12 @@ class BehaviorLeRobotDataset(LeRobotDataset):
         train_rgb_type: str = "regular",  # regular | bbox | point
         return_seg_instance: bool = False,
         skill_list: list[str] = ["all"],
+        terminal_loss_weighting: bool = False,
+        terminal_loss_near_frames: int = 15,
+        terminal_loss_final_frames: int = 5,
+        terminal_loss_near_weight: float = 2.0,
+        terminal_loss_final_weight: float = 4.0,
+        terminal_loss_max_base_motion_norm: float = 0.05,
     ):
         """
         Custom args:
@@ -217,6 +258,12 @@ class BehaviorLeRobotDataset(LeRobotDataset):
         self.return_seg_instance = return_seg_instance
         self.train_rgb_type = train_rgb_type
         self.skill_list = skill_list
+        self.terminal_loss_weighting = terminal_loss_weighting
+        self.terminal_loss_near_frames = terminal_loss_near_frames
+        self.terminal_loss_final_frames = terminal_loss_final_frames
+        self.terminal_loss_near_weight = terminal_loss_near_weight
+        self.terminal_loss_final_weight = terminal_loss_final_weight
+        self.terminal_loss_max_base_motion_norm = terminal_loss_max_base_motion_norm
 
         # Unused attributes
         self.image_writer = None
@@ -564,6 +611,7 @@ class BehaviorLeRobotDataset(LeRobotDataset):
             ep_idx = item["episode_index"].item()
             frame_index = round(item["timestamp"].item() * self.fps)
             skill_end = self._get_skill_end_frame(ep_idx, frame_index)
+            self._attach_terminal_loss_weight(item, frame_index, skill_end)
             if skill_end is not None:
                 self._mask_action_chunks_to_skill_end(item, frame_index, skill_end)
             return item
@@ -693,6 +741,7 @@ class BehaviorLeRobotDataset(LeRobotDataset):
             item["task"] = self._get_fine_grained_task(item)
             frame_index = round(item["timestamp"].item() * self.fps)
             skill_end = self._get_skill_end_frame(ep_idx, frame_index)
+            self._attach_terminal_loss_weight(item, frame_index, skill_end)
             if skill_end is not None:
                 self._mask_action_chunks_to_skill_end(item, frame_index, skill_end)
 
@@ -836,6 +885,7 @@ class BehaviorLeRobotDataset(LeRobotDataset):
         ep_idx = item["episode_index"].item()
         frame_index = round(item["timestamp"].item() * self.fps)
         skill_end = self._get_skill_end_frame(ep_idx, frame_index)
+        self._attach_terminal_loss_weight(item, frame_index, skill_end)
         if skill_end is not None:
             self._mask_action_chunks_to_skill_end(item, frame_index, skill_end)
         self.current_streaming_frame_idx += 1
@@ -923,6 +973,30 @@ class BehaviorLeRobotDataset(LeRobotDataset):
                 else:
                     arr[i] = np.copy(last_action) if isinstance(arr, np.ndarray) else last_action.copy()
             item[key] = arr
+
+    def _attach_terminal_loss_weight(self, item: dict, frame_index: int, skill_end: int | None) -> None:
+        if not self.terminal_loss_weighting:
+            return
+        action_chunk = None
+        if self.delta_indices is not None:
+            for key in self.delta_indices:
+                arr = item.get(key)
+                if arr is None:
+                    continue
+                arr_shape = getattr(arr, "shape", None) or (len(arr),)
+                if arr_shape and arr_shape[0] == len(self.delta_indices[key]):
+                    action_chunk = arr
+                    break
+        item["terminal_loss_weight"] = compute_terminal_loss_weight(
+            frame_index=frame_index,
+            skill_end=skill_end,
+            action_chunk=action_chunk,
+            final_window_frames=self.terminal_loss_final_frames,
+            near_window_frames=self.terminal_loss_near_frames,
+            final_weight=self.terminal_loss_final_weight,
+            near_weight=self.terminal_loss_near_weight,
+            max_base_motion_norm=self.terminal_loss_max_base_motion_norm,
+        )
 
     def _get_query_indices(self, idx: int, ep_idx: int) -> tuple[dict[str, list[int | bool]]]:
         ep_idx = self.episode_data_index_pos[ep_idx]

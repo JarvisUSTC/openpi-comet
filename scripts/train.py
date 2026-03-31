@@ -26,6 +26,20 @@ import openpi.training.utils as training_utils
 import openpi.training.weight_loaders as _weight_loaders
 
 
+def _reduce_chunked_loss(
+    chunked_loss: at.Array,
+    observation: _model.Observation,
+    *,
+    terminal_loss_weighting: bool,
+) -> at.Array:
+    if not terminal_loss_weighting or observation.terminal_loss_weight is None:
+        return jnp.mean(chunked_loss)
+
+    weights = jnp.asarray(observation.terminal_loss_weight, dtype=chunked_loss.dtype)
+    sample_loss = jnp.mean(chunked_loss, axis=-1)
+    return jnp.sum(sample_loss * weights) / (jnp.sum(weights) + 1e-8)
+
+
 def _validation_is_enabled(config: _config.TrainConfig) -> bool:
     if config.val_log_interval <= 0 or config.val_num_batches <= 0:
         return False
@@ -65,6 +79,11 @@ def eval_step(
 
     chunked_loss = model.compute_loss(loss_rng, observation, actions, train=False)
     flow_loss = jnp.mean(chunked_loss)
+    weighted_flow_loss = _reduce_chunked_loss(
+        chunked_loss,
+        observation,
+        terminal_loss_weighting=observation.terminal_loss_weight is not None,
+    )
 
     pred_actions = model.sample_actions(sample_rng, observation, num_steps=num_denoise_steps)
 
@@ -80,6 +99,7 @@ def eval_step(
     return {
         "val_loss": flow_loss,
         "val/flow_loss": flow_loss,
+        "val/terminal_weighted_loss": weighted_flow_loss,
         "val/action_mse": action_mse,
         "val/action_cosine_sim": jnp.mean(cos_sim),
     }
@@ -209,7 +229,11 @@ def train_step(
         actions: _model.Actions,
     ):
         chunked_loss = model.compute_loss(rng, observation, actions, train=True)
-        return jnp.mean(chunked_loss)
+        return _reduce_chunked_loss(
+            chunked_loss,
+            observation,
+            terminal_loss_weighting=config.terminal_loss_weighting,
+        )
 
     train_rng = jax.random.fold_in(rng, state.step)
     observation, actions = batch
@@ -251,6 +275,10 @@ def train_step(
         "grad_norm": optax.global_norm(grads),
         "param_norm": optax.global_norm(kernel_params),
     }
+    if observation.terminal_loss_weight is not None:
+        weights = jnp.asarray(observation.terminal_loss_weight)
+        info["terminal_loss_weight_mean"] = jnp.mean(weights)
+        info["terminal_loss_weight_max"] = jnp.max(weights)
     return new_state, info
 
 
