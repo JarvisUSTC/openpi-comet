@@ -78,7 +78,7 @@ class Args:
     stop_enabled: bool = False
     stop_threshold: float = 0.6
     stop_patience: int = 3
-    stop_action: str = "hold"  # hold | zero
+    stop_action: str = "hold"  # hold | zero | hold_last
     stop_warmup_steps: int = 0
     stop_log_interval: int = 1
     stop_check_every_step: bool = False

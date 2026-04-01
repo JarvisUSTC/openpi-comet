@@ -75,6 +75,10 @@ class B1KPolicyWrapper:
         self.stop_enabled = stop_enabled
         self.stop_threshold = float(stop_threshold)
         self.stop_patience = int(stop_patience)
+        # stop_action semantics:
+        # - "hold": best-effort "freeze" using current proprio (zero base velocity, hold joint positions/grippers)
+        # - "zero": all-zero action
+        # - "hold_last": repeat last commanded action (legacy; may drift if action is delta/velocity-like)
         self.stop_action = str(stop_action)
         self.stop_warmup_steps = int(stop_warmup_steps)
         self.stop_log_interval = int(stop_log_interval)
@@ -120,10 +124,46 @@ class B1KPolicyWrapper:
         self._last_stop_prob = None
         self._last_prompt = None
 
-    def _make_stop_action(self) -> torch.Tensor:
-        if self.stop_action == "hold" and self._stop_hold_action is not None:
+    def _compute_hold_action_from_proprio(self, proprio: np.ndarray) -> np.ndarray | None:
+        """Compute a best-effort "freeze" action from current proprioception.
+
+        BEHAVIOR-1K / OmniGibson control stacks can use mixed action conventions. Empirically, repeating
+        the last action ("hold_last") can still move the robot if the action space is delta/velocity-like.
+        Here we attempt to construct a stable hold:
+          - base velocity -> 0
+          - trunk/arm/gripper -> current positions/widths (in the same 23-dim representation used by B1K inputs)
+        """
+        try:
+            from openpi.policies.b1k_policy import extract_state_from_proprio
+
+            state = np.asarray(extract_state_from_proprio(np.asarray(proprio)), dtype=np.float64).reshape(-1)
+            if state.shape[0] != 23:
+                return None
+            hold = state.copy()
+            # First 3 dims are base_qvel in our B1K state extractor.
+            hold[:3] = 0.0
+            return hold
+        except Exception:
+            return None
+
+    def _make_stop_action(self, input_obs: dict | None = None) -> torch.Tensor:
+        if self.stop_action == "zero":
+            return torch.from_numpy(np.zeros((1, 23), dtype=np.float64))
+
+        if self.stop_action == "hold_last":
+            if self._stop_hold_action is not None:
+                return torch.from_numpy(self._stop_hold_action[None])
+            return torch.from_numpy(np.zeros((1, 23), dtype=np.float64))
+
+        # Default: "hold" (best-effort freeze). Prefer computing from the latest obs.
+        if input_obs is not None and "proprio" in input_obs:
+            hold = self._compute_hold_action_from_proprio(np.asarray(input_obs["proprio"])[0])
+            if hold is not None:
+                self._stop_hold_action = hold
+                return torch.from_numpy(hold[None])
+
+        if self._stop_hold_action is not None:
             return torch.from_numpy(self._stop_hold_action[None])
-        # Default: output zeros (acts like "no-op" for many controllers, but verify in your env).
         return torch.from_numpy(np.zeros((1, 23), dtype=np.float64))
 
     def _maybe_update_stop(self, stop_prob: float | None) -> None:
@@ -205,7 +245,7 @@ class B1KPolicyWrapper:
         if self._stop_active:
             # Still advance the internal step counter for consistent logging / warmup behavior.
             self.step_counter += 1
-            return self._make_stop_action()
+            return self._make_stop_action(input_obs)
 
         # Step 1: check if we should re-run policy
         if self.step_counter % self.replan_interval == 0:
@@ -292,8 +332,10 @@ class B1KPolicyWrapper:
         except Exception:
             pass
         if self._stop_active:
-            self._stop_hold_action = np.asarray(final_action[0]).copy()
-            return self._make_stop_action()
+            # Prefer a stable hold computed from current proprio rather than repeating last delta-like action.
+            hold = self._compute_hold_action_from_proprio(np.asarray(input_obs["proprio"])[0])
+            self._stop_hold_action = hold if hold is not None else np.asarray(final_action[0]).copy()
+            return self._make_stop_action(input_obs)
 
         self.step_counter += 1
 
@@ -333,7 +375,7 @@ class B1KPolicyWrapper:
         if self._stop_active:
             # Still advance the internal step counter for consistent logging / warmup behavior.
             self.step_counter += 1
-            return self._make_stop_action()
+            return self._make_stop_action(input_obs)
 
         if self.control_mode == "receeding_temporal":
             return self.act_receeding_temporal(input_obs)
@@ -376,9 +418,10 @@ class B1KPolicyWrapper:
                             )
                         self._maybe_update_stop(float(stop_prob))
                         if self._stop_active:
-                            self._stop_hold_action = np.asarray(final_action[0]).copy()
+                            hold = self._compute_hold_action_from_proprio(np.asarray(input_obs["proprio"])[0])
+                            self._stop_hold_action = hold if hold is not None else np.asarray(final_action[0]).copy()
                             self.step_counter += 1
-                            return self._make_stop_action()
+                            return self._make_stop_action(input_obs)
                 self.step_counter += 1
                 return torch.from_numpy(final_action)
 
