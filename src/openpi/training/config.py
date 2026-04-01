@@ -931,7 +931,7 @@ _CONFIGS = [
             repo_id="behavior-1k/2025-challenge-demos",
             base_config=DataConfig(
                 prompt_from_task=True,
-                behavior_dataset_root="../DATASETS/behavior/2025-challenge-demos",
+                behavior_dataset_root="/root/Training/DATASETS/behavior/2025-challenge-demos",
                 # Train/val split: these are PER-TASK positional episode indices (not global episode ids).
                 episodes_index=list(range(0, 180)),
                 fine_grained_level=1,  # 0, 1, 2
@@ -983,7 +983,7 @@ _CONFIGS = [
             repo_id="behavior-1k/2025-challenge-demos",
             base_config=DataConfig(
                 prompt_from_task=True,
-                behavior_dataset_root="../DATASETS/behavior/2025-challenge-demos",
+                behavior_dataset_root="/root/Training/DATASETS/behavior/2025-challenge-demos",
                 # Train/val split: these are PER-TASK positional episode indices (not global episode ids).
                 episodes_index=list(range(0, 180)),
                 fine_grained_level=1,  # 0, 1, 2

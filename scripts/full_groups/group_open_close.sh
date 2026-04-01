@@ -1,5 +1,6 @@
 #!/usr/bin/env bash
 # Skill group: open_close
+git branch --show-current
 set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "${SCRIPT_DIR}/../.." && pwd)"
