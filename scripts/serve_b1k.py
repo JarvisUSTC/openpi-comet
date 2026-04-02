@@ -74,11 +74,10 @@ class Args:
     # Denoising steps for pi0/pi05 sampling.
     denoise_steps: int = 10
 
-    # Stop gating (Option A): stop action generation and keep sending hold/zero actions once stop triggers.
+    # Stop gating: after stop triggers, send B1K-aligned hold_pose actions.
     stop_enabled: bool = False
     stop_threshold: float = 0.6
     stop_patience: int = 3
-    stop_action: str = "hold"  # hold | zero | hold_last | hold_pose
     stop_warmup_steps: int = 0
     stop_log_interval: int = 1
     stop_check_every_step: bool = False
@@ -120,7 +119,6 @@ def main(args: Args) -> None:
         stop_enabled=args.stop_enabled,
         stop_threshold=args.stop_threshold,
         stop_patience=args.stop_patience,
-        stop_action=args.stop_action,
         stop_warmup_steps=args.stop_warmup_steps,
         stop_log_interval=args.stop_log_interval,
         stop_check_every_step=args.stop_check_every_step,
