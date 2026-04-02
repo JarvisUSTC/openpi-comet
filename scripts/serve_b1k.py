@@ -79,6 +79,7 @@ class Args:
     stop_threshold: float = 0.6
     stop_patience: int = 3
     stop_warmup_steps: int = 0
+    stop_min_steps: int = 0
     stop_log_interval: int = 1
     stop_check_every_step: bool = False
 
@@ -120,6 +121,7 @@ def main(args: Args) -> None:
         stop_threshold=args.stop_threshold,
         stop_patience=args.stop_patience,
         stop_warmup_steps=args.stop_warmup_steps,
+        stop_min_steps=args.stop_min_steps,
         stop_log_interval=args.stop_log_interval,
         stop_check_every_step=args.stop_check_every_step,
     )
