@@ -156,6 +156,17 @@ def create_behavior_dataset(data_config: _config.DataConfig, action_horizon: int
         stop_balanced_sampling=data_config.stop_balanced_sampling,
         stop_balanced_pos_prob=data_config.stop_balanced_pos_prob,
         stop_balanced_cycle=data_config.stop_balanced_cycle,
+        frame_sampling=data_config.frame_sampling,
+        frame_stride=data_config.frame_stride,
+        frame_stride_jitter=data_config.frame_stride_jitter,
+        frame_dense_boundary_margin_frames=data_config.frame_dense_boundary_margin_frames,
+        smart_action_key=data_config.smart_action_key,
+        smart_num_action_events=data_config.smart_num_action_events,
+        smart_action_event_window_frames=data_config.smart_action_event_window_frames,
+        smart_scan_stride=data_config.smart_scan_stride,
+        smart_contact_action_indices=data_config.smart_contact_action_indices,
+        smart_contact_num_events=data_config.smart_contact_num_events,
+        smart_contact_window_frames=data_config.smart_contact_window_frames,
         **args,
     )
 

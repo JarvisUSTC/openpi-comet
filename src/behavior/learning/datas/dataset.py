@@ -216,6 +216,18 @@ class BehaviorLeRobotDataset(LeRobotDataset):
         stop_balanced_sampling: bool = False,
         stop_balanced_pos_prob: float = 0.5,
         stop_balanced_cycle: bool = True,
+        # === Frame sampling (streaming) ===
+        frame_sampling: str = "all",
+        frame_stride: int = 1,
+        frame_stride_jitter: bool = True,
+        frame_dense_boundary_margin_frames: int = 0,
+        smart_action_key: str = "action",
+        smart_num_action_events: int = 0,
+        smart_action_event_window_frames: int = 8,
+        smart_scan_stride: int | None = None,
+        smart_contact_action_indices: list[int] | None = None,
+        smart_contact_num_events: int = 0,
+        smart_contact_window_frames: int = 8,
     ):
         """
         Custom args:
@@ -272,6 +284,47 @@ class BehaviorLeRobotDataset(LeRobotDataset):
         self._prompt_rng = None
         self._prompt_rng_worker_id = None
         self.use_augmented_subtask_prompt = bool(use_augmented_subtask_prompt)
+
+        self.frame_sampling = str(frame_sampling).strip().lower()
+        if self.frame_sampling not in {"all", "stride", "smart"}:
+            raise ValueError(
+                "Invalid frame_sampling. Expected one of {'all','stride','smart'} "
+                f"but got {frame_sampling!r}."
+            )
+        self.frame_stride = int(frame_stride)
+        if self.frame_stride < 1:
+            raise ValueError(f"frame_stride must be >= 1, got {frame_stride}.")
+        self.frame_stride_jitter = bool(frame_stride_jitter)
+        self.frame_dense_boundary_margin_frames = int(frame_dense_boundary_margin_frames)
+        if self.frame_dense_boundary_margin_frames < 0:
+            raise ValueError(
+                "frame_dense_boundary_margin_frames must be >= 0, "
+                f"got {self.frame_dense_boundary_margin_frames}."
+            )
+
+        self.smart_action_key = str(smart_action_key)
+        self.smart_num_action_events = int(smart_num_action_events)
+        self.smart_action_event_window_frames = int(smart_action_event_window_frames)
+        self.smart_scan_stride = None if smart_scan_stride is None else int(smart_scan_stride)
+        self.smart_contact_action_indices = (
+            None if smart_contact_action_indices is None else [int(x) for x in smart_contact_action_indices]
+        )
+        self.smart_contact_num_events = int(smart_contact_num_events)
+        self.smart_contact_window_frames = int(smart_contact_window_frames)
+        if self.smart_contact_action_indices is None and self.smart_contact_num_events > 0:
+            # BEHAVIOR-1K R1-Pro default 23-dim action uses grippers at dims 14 and 22 (0-based).
+            # Only used when the user enables contact densification but doesn't specify indices.
+            self.smart_contact_action_indices = [14, 22]
+        if self.smart_num_action_events < 0 or self.smart_contact_num_events < 0:
+            raise ValueError("smart_num_action_events and smart_contact_num_events must be >= 0.")
+        if self.smart_action_event_window_frames < 0 or self.smart_contact_window_frames < 0:
+            raise ValueError("smart_*_window_frames must be >= 0.")
+
+        # Internal state for skill-stream frame sampling windows.
+        # Each entry: (global_start, global_end, local_start, start_is_keyframe, stride)
+        self._skill_stream_windows = None
+        self._skill_stream_window_idx = None
+        self._skill_stream_stride = 1
 
         # Unused attributes
         self.image_writer = None
@@ -561,6 +614,188 @@ class BehaviorLeRobotDataset(LeRobotDataset):
         chosen_local = int(local_start) + (chosen_global - int(global_start))
         return chosen_global, global_end, ep_idx, chosen_local, (chosen_local % 250) == 0
 
+    def _get_action_vec_from_hf_row(self, row: dict) -> th.Tensor | None:
+        key = self.smart_action_key
+        if key in row:
+            return th.as_tensor(row[key])
+        # Best-effort fallback for common schemas.
+        for k in ("action", "actions"):
+            if k in row:
+                return th.as_tensor(row[k])
+        return None
+
+    def _detect_action_delta_events(
+        self,
+        *,
+        rng: np.random.Generator,
+        global_start: int,
+        global_end: int,
+        num_events: int,
+        scan_stride: int,
+        window_frames: int,
+        action_indices: list[int] | None = None,
+    ) -> list[tuple[int, int]]:
+        """Return dense windows [lo, hi) around the largest action deltas."""
+        if num_events <= 0 or window_frames <= 0:
+            return []
+        if scan_stride < 1:
+            scan_stride = 1
+
+        candidates: list[tuple[float, int]] = []
+        # Need idx-1 for diff.
+        start_i = max(int(global_start) + 1, 1)
+        for idx in range(start_i, int(global_end), int(scan_stride)):
+            try:
+                cur = self._get_action_vec_from_hf_row(self.hf_dataset[idx])
+                prev = self._get_action_vec_from_hf_row(self.hf_dataset[idx - 1])
+            except Exception:
+                continue
+            if cur is None or prev is None:
+                continue
+            d = cur.to(th.float32) - prev.to(th.float32)
+            if action_indices is not None:
+                try:
+                    d = d[action_indices]
+                except Exception:
+                    continue
+            if d.numel() == 0:
+                continue
+            score = float(th.linalg.vector_norm(d).item())
+            if not np.isfinite(score):
+                continue
+            candidates.append((score, idx))
+
+        if not candidates:
+            return []
+        candidates.sort(key=lambda x: x[0], reverse=True)
+        top = candidates[: min(num_events, len(candidates))]
+        # Break ties randomly (stable-ish across workers).
+        if len(top) > 1:
+            i = 0
+            while i < len(top):
+                j = i + 1
+                while j < len(top) and top[j][0] == top[i][0]:
+                    j += 1
+                if j - i > 1:
+                    block = top[i:j]
+                    rng.shuffle(block)
+                    top[i:j] = block
+                i = j
+
+        windows: list[tuple[int, int]] = []
+        for _score, idx in top:
+            lo = max(int(global_start), int(idx) - int(window_frames))
+            hi = min(int(global_end), int(idx) + int(window_frames) + 1)
+            if hi > lo:
+                windows.append((lo, hi))
+        return windows
+
+    def _merge_windows(self, windows: list[tuple[int, int]]) -> list[tuple[int, int]]:
+        if not windows:
+            return []
+        windows = [(int(a), int(b)) for a, b in windows if int(b) > int(a)]
+        if not windows:
+            return []
+        windows.sort()
+        merged: list[tuple[int, int]] = []
+        cur_a, cur_b = windows[0]
+        for a, b in windows[1:]:
+            if a <= cur_b:
+                cur_b = max(cur_b, b)
+            else:
+                merged.append((cur_a, cur_b))
+                cur_a, cur_b = a, b
+        merged.append((cur_a, cur_b))
+        return merged
+
+    def _build_skill_stream_windows(
+        self,
+        *,
+        rng: np.random.Generator,
+        global_start: int,
+        global_end: int,
+        local_start: int,
+    ) -> list[tuple[int, int, int, bool, int]]:
+        """Build (global_start, global_end, local_start, is_keyframe, stride) windows for this sampled range."""
+        global_start = int(global_start)
+        global_end = int(global_end)
+        local_start = int(local_start)
+        if global_end <= global_start:
+            return [(global_start, global_end, local_start, (local_start % 250) == 0, 1)]
+
+        if self.frame_sampling == "all" or self.frame_stride == 1:
+            return [(global_start, global_end, local_start, (local_start % 250) == 0, 1)]
+
+        base_stride = int(self.frame_stride)
+        dense_margin = int(self.frame_dense_boundary_margin_frames)
+
+        # Smart mode defaults to a small boundary margin even if not explicitly set.
+        if self.frame_sampling == "smart" and dense_margin == 0:
+            dense_margin = max(15, int(self.stop_pos_margin_frames))
+
+        dense_windows: list[tuple[int, int]] = []
+        if dense_margin > 0:
+            dense_windows.append((global_start, min(global_end, global_start + dense_margin)))
+            dense_windows.append((max(global_start, global_end - dense_margin), global_end))
+
+        if self.frame_sampling == "smart":
+            scan_stride = base_stride if self.smart_scan_stride is None else int(self.smart_scan_stride)
+            dense_windows.extend(
+                self._detect_action_delta_events(
+                    rng=rng,
+                    global_start=global_start,
+                    global_end=global_end,
+                    num_events=self.smart_num_action_events,
+                    scan_stride=scan_stride,
+                    window_frames=self.smart_action_event_window_frames,
+                    action_indices=None,
+                )
+            )
+            if self.smart_contact_action_indices is not None:
+                dense_windows.extend(
+                    self._detect_action_delta_events(
+                        rng=rng,
+                        global_start=global_start,
+                        global_end=global_end,
+                        num_events=self.smart_contact_num_events,
+                        scan_stride=scan_stride,
+                        window_frames=self.smart_contact_window_frames,
+                        action_indices=self.smart_contact_action_indices,
+                    )
+                )
+
+        dense_windows = self._merge_windows(dense_windows)
+
+        def phase_shift(start: int, end: int) -> int:
+            if not self.frame_stride_jitter or base_stride <= 1:
+                return start
+            if end - start <= 1:
+                return start
+            phase = int(rng.integers(0, base_stride).item())
+            s = start + phase
+            return start if s >= end else s
+
+        windows: list[tuple[int, int, int, bool, int]] = []
+        cur = global_start
+        for a, b in dense_windows:
+            if cur < a:
+                s = phase_shift(cur, a)
+                if s < a:
+                    l = local_start + (s - global_start)
+                    windows.append((s, a, l, (l % 250) == 0, base_stride))
+            l = local_start + (a - global_start)
+            windows.append((a, b, l, (l % 250) == 0, 1))
+            cur = b
+        if cur < global_end:
+            s = phase_shift(cur, global_end)
+            if s < global_end:
+                l = local_start + (s - global_start)
+                windows.append((s, global_end, l, (l % 250) == 0, base_stride))
+
+        if not windows:
+            return [(global_start, global_end, local_start, (local_start % 250) == 0, 1)]
+        return windows
+
     def reset_streaming_state(self) -> None:
         """Reset internal streaming cursors/RNG so iteration becomes deterministic again.
 
@@ -593,6 +828,9 @@ class BehaviorLeRobotDataset(LeRobotDataset):
         self._skill_stream_rng = None
         self._skill_stream_rng_worker_id = None
         self._skill_stream_range_end = None
+        self._skill_stream_windows = None
+        self._skill_stream_window_idx = None
+        self._skill_stream_stride = 1
         for k in (
             "_skill_stream_ep_idx",
             "_skill_stream_local_start",
@@ -744,29 +982,57 @@ class BehaviorLeRobotDataset(LeRobotDataset):
                 self._skill_stream_rng_worker_id = worker_id
             rng = self._skill_stream_rng
 
-            if self._skill_stream_range_end is None or self.current_streaming_frame_idx is None:
-                self.current_streaming_frame_idx = None
+            def _start_new_skill_range() -> int:
+                start, end, ep_idx_, local_start, _is_keyframe = self._sample_skill_stream_range(rng=rng)
+                self._skill_stream_range_end = end
+                self._skill_stream_ep_idx = ep_idx_
+                self._skill_stream_windows = self._build_skill_stream_windows(
+                    rng=rng,
+                    global_start=start,
+                    global_end=end,
+                    local_start=local_start,
+                )
+                self._skill_stream_window_idx = 0
+                w0 = self._skill_stream_windows[0]
+                self.current_streaming_frame_idx = w0[0]
+                self._skill_stream_local_start = w0[2]
+                self._skill_stream_is_keyframe = w0[3]
+                self._skill_stream_stride = w0[4]
+                self.current_streaming_episode_idx = None
+                self._should_obs_loaders_reload = True
+                return ep_idx_
 
-            if self.current_streaming_frame_idx is None or self._skill_stream_range_end is None:
-                start, end, ep_idx, local_start, is_keyframe = self._sample_skill_stream_range(rng=rng)
-                self.current_streaming_frame_idx = start
-                self._skill_stream_range_end = end
-                self.current_streaming_episode_idx = None
-                self._should_obs_loaders_reload = True
-                self._skill_stream_local_start = local_start
-                self._skill_stream_is_keyframe = is_keyframe
-                self._skill_stream_ep_idx = ep_idx
-            elif self.current_streaming_frame_idx >= self._skill_stream_range_end:
-                start, end, ep_idx, local_start, is_keyframe = self._sample_skill_stream_range(rng=rng)
-                self.current_streaming_frame_idx = start
-                self._skill_stream_range_end = end
-                self.current_streaming_episode_idx = None
-                self._should_obs_loaders_reload = True
-                self._skill_stream_local_start = local_start
-                self._skill_stream_is_keyframe = is_keyframe
-                self._skill_stream_ep_idx = ep_idx
+            # Initialize range/windows if needed, or advance windows when exhausted.
+            if (
+                self.current_streaming_frame_idx is None
+                or self._skill_stream_range_end is None
+                or self._skill_stream_windows is None
+                or self._skill_stream_window_idx is None
+            ):
+                ep_idx = _start_new_skill_range()
             else:
                 ep_idx = self._skill_stream_ep_idx
+
+            # Advance to the next window (or next sampled range) if needed.
+            while True:
+                assert self._skill_stream_windows is not None
+                assert self._skill_stream_window_idx is not None
+                w = self._skill_stream_windows[self._skill_stream_window_idx]
+                w_end = w[1]
+                if self.current_streaming_frame_idx is None or self.current_streaming_frame_idx >= w_end:
+                    self._skill_stream_window_idx += 1
+                    if self._skill_stream_window_idx >= len(self._skill_stream_windows):
+                        ep_idx = _start_new_skill_range()
+                        continue
+                    w = self._skill_stream_windows[self._skill_stream_window_idx]
+                    self.current_streaming_frame_idx = w[0]
+                    self._skill_stream_local_start = w[2]
+                    self._skill_stream_is_keyframe = w[3]
+                    self._skill_stream_stride = w[4]
+                    self.current_streaming_episode_idx = None
+                    self._should_obs_loaders_reload = True
+                    continue
+                break
 
             item = self.hf_dataset[self.current_streaming_frame_idx]
             item.pop("observation.task_info", None)
@@ -776,6 +1042,13 @@ class BehaviorLeRobotDataset(LeRobotDataset):
                 ep_idx = ep_idx_from_item
                 self._should_obs_loaders_reload = True
                 self.current_streaming_episode_idx = None
+                # Best-effort realignment for local_start if this ever happens.
+                try:
+                    frame_index = int(round(item["timestamp"].item() * self.fps))
+                    self._skill_stream_local_start = frame_index
+                    self._skill_stream_is_keyframe = (frame_index % 250) == 0
+                except Exception:
+                    pass
 
             if self._should_obs_loaders_reload:
                 for loader in self.obs_loaders.values():
@@ -810,7 +1083,7 @@ class BehaviorLeRobotDataset(LeRobotDataset):
                             start_idx=self._skill_stream_local_start,
                             start_idx_is_keyframe=self._skill_stream_is_keyframe,
                             batch_size=1,
-                            stride=1,
+                            stride=int(self._skill_stream_stride),
                             **kwargs,
                         )
                     )
@@ -870,7 +1143,7 @@ class BehaviorLeRobotDataset(LeRobotDataset):
             item["stop_label"] = stop_label
             item["stop_mask"] = stop_mask
 
-            self.current_streaming_frame_idx += 1
+            self.current_streaming_frame_idx += int(self._skill_stream_stride)
             return item
 
         # Streaming mode: we will load the episode at the current streaming index, and then increment the index for next call

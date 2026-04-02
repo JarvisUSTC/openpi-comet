@@ -170,6 +170,45 @@ class DataConfig:
     # If true, alternates between pos/neg starts (per worker) instead of sampling with probability.
     stop_balanced_cycle: bool = True
 
+    # ==========================
+    # Frame sampling (B1K only)
+    # ==========================
+    #
+    # NOTE: These options currently affect BEHAVIOR-1K streaming mode when `skill_list` filtering/weighting
+    # is active (i.e. the dataset uses skill-segment streaming).
+    #
+    # - "all": sample every frame (default)
+    # - "stride": sample every `frame_stride` frames (uses the video loader stride)
+    # - "smart": stride in the middle + dense windows near important regions
+    frame_sampling: Literal["all", "stride", "smart"] = "all"
+
+    # Base stride for "stride" and "smart" sampling modes.
+    frame_stride: int = 1
+
+    # If true, choose a random phase offset in [0, frame_stride) per sampled range (per worker) to improve coverage.
+    frame_stride_jitter: bool = True
+
+    # When >0, forces dense (stride=1) sampling within this many frames of a skill segment boundary (start/end).
+    frame_dense_boundary_margin_frames: int = 0
+
+    # ----- Smart sampling knobs -----
+    # Column name for per-frame action vectors in the HF dataset.
+    smart_action_key: str = "action"
+
+    # Number of high-action-change events to densify around (per sampled skill segment range). 0 disables.
+    smart_num_action_events: int = 0
+
+    # Half-window size (in frames) for dense sampling around selected action-change events.
+    smart_action_event_window_frames: int = 8
+
+    # Scan stride used to detect action-change events. If None, defaults to frame_stride.
+    smart_scan_stride: int | None = None
+
+    # Optional action indices to use as a proxy for "contact" events (e.g., gripper dims).
+    smart_contact_action_indices: Sequence[int] | None = None
+    smart_contact_num_events: int = 0
+    smart_contact_window_frames: int = 8
+
 
 class GroupFactory(Protocol):
     def __call__(self, model_config: _model.BaseModelConfig) -> _transforms.Group:
@@ -398,11 +437,36 @@ class LeRobotB1KSkillDataConfig(LeRobotB1KDataConfig):
     """
 
     skill_list: list[str] = dataclasses.field(default_factory=lambda: ["all"])
+    frame_sampling: Literal["all", "stride", "smart"] = "all"
+    frame_stride: int = 1
+    frame_stride_jitter: bool = True
+    frame_dense_boundary_margin_frames: int = 0
+    smart_action_key: str = "action"
+    smart_num_action_events: int = 0
+    smart_action_event_window_frames: int = 8
+    smart_scan_stride: int | None = None
+    smart_contact_action_indices: Sequence[int] | None = None
+    smart_contact_num_events: int = 0
+    smart_contact_window_frames: int = 8
 
     @override
     def create(self, assets_dirs: pathlib.Path, model_config: _model.BaseModelConfig) -> DataConfig:
         data_config = super().create(assets_dirs, model_config)
-        return dataclasses.replace(data_config, skill_list=self.skill_list)
+        return dataclasses.replace(
+            data_config,
+            skill_list=self.skill_list,
+            frame_sampling=self.frame_sampling,
+            frame_stride=self.frame_stride,
+            frame_stride_jitter=self.frame_stride_jitter,
+            frame_dense_boundary_margin_frames=self.frame_dense_boundary_margin_frames,
+            smart_action_key=self.smart_action_key,
+            smart_num_action_events=self.smart_num_action_events,
+            smart_action_event_window_frames=self.smart_action_event_window_frames,
+            smart_scan_stride=self.smart_scan_stride,
+            smart_contact_action_indices=self.smart_contact_action_indices,
+            smart_contact_num_events=self.smart_contact_num_events,
+            smart_contact_window_frames=self.smart_contact_window_frames,
+        )
 
 
 @dataclasses.dataclass(frozen=True)
