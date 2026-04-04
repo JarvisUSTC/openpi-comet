@@ -37,10 +37,18 @@ def initialize_checkpoint_dir(
         elif jax.process_index() != 0:
             pass
         else:
-            raise FileExistsError(
-                f"Checkpoint directory {checkpoint_dir} already exists. Use --overwrite or --resume "
-                "to indicate how to handle it."
-            )
+            # In multi-host runs, non-primary processes may race to create the directory.
+            # If it's empty, treat it as "new" and proceed. If it contains files, assume
+            # it's from a prior run and require explicit --overwrite/--resume.
+            try:
+                has_any = next(iter(checkpoint_dir.iterdir()), None) is not None
+            except Exception:
+                has_any = True
+            if has_any:
+                raise FileExistsError(
+                    f"Checkpoint directory {checkpoint_dir} already exists. Use --overwrite or --resume "
+                    "to indicate how to handle it."
+                )
 
     checkpoint_dir.mkdir(parents=True, exist_ok=True)
 

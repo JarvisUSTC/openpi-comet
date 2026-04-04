@@ -20,8 +20,15 @@ fi
 
 POD="$(
   bash scripts/aladdin/kubectl.sh get pods --show-labels \
-    | awk -v id="${TASK_ID}" 'NR>1 && $0 ~ id {print $1; exit}'
+    | awk -v id="${TASK_ID}" 'NR>1 && $0 ~ id && index($0, "dc.com/serverless.pod-index=0") > 0 {print $1; exit}'
 )"
+
+if [[ -z "${POD}" ]]; then
+  POD="$(
+    bash scripts/aladdin/kubectl.sh get pods --show-labels \
+      | awk -v id="${TASK_ID}" 'NR>1 && $0 ~ id {print $1; exit}'
+  )"
+fi
 
 if [[ -z "${POD}" ]]; then
   # Fallback: some tasks may finish/fail before pods are discoverable (or be auto-deleted),

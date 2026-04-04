@@ -67,12 +67,35 @@ def _make_val_config(config: _config.TrainConfig) -> _config.TrainConfig:
 
 
 def _decode_prompt_for_logging(observation: Any, tokenizer: _tokenizer.PaligemmaTokenizer) -> str:
-    tokens = jax.device_get(observation.tokenized_prompt)[0]
-    token_mask = getattr(observation, "tokenized_prompt_mask", None)
-    token_mask = None if token_mask is None else jax.device_get(token_mask)[0].astype(bool)
+    def _first_example_to_host(x: Any) -> np.ndarray | None:
+        if x is None:
+            return None
+        if isinstance(x, jax.Array):
+            # In multi-host runs, x may be sharded across non-addressable devices, and
+            # jax.device_get(x) will fail. Use any local shard instead.
+            try:
+                if getattr(x, "is_fully_addressable", False):
+                    return np.asarray(jax.device_get(x)[0])
+            except Exception:
+                pass
+            shards = getattr(x, "addressable_shards", None)
+            if shards:
+                return np.asarray(jax.device_get(shards[0].data)[0])
+            # Best-effort fallback.
+            return None
+        try:
+            return np.asarray(x)[0]
+        except Exception:
+            return None
 
-    token_ar_mask = getattr(observation, "token_ar_mask", None)
-    token_ar_mask = None if token_ar_mask is None else jax.device_get(token_ar_mask)[0]
+    tokens = _first_example_to_host(observation.tokenized_prompt)
+    if tokens is None:
+        return "<prompt_unavailable>"
+
+    token_mask = _first_example_to_host(getattr(observation, "tokenized_prompt_mask", None))
+    token_mask = None if token_mask is None else token_mask.astype(bool)
+
+    token_ar_mask = _first_example_to_host(getattr(observation, "token_ar_mask", None))
     if token_ar_mask is not None:
         prompt_mask = token_ar_mask == 0
         if token_mask is not None:
@@ -460,7 +483,7 @@ def main(config: _config.TrainConfig):
     logging.info(f"[P{jax.process_index()}] Steps per epoch: {N}")
 
     for step in pbar:
-        if prompt_tokenizer is not None and (step % _PROMPT_LOG_INTERVAL == 0):
+        if jax.process_index() == 0 and prompt_tokenizer is not None and (step % _PROMPT_LOG_INTERVAL == 0):
             try:
                 observation, _actions = batch
                 prompt_text = _decode_prompt_for_logging(observation, prompt_tokenizer)

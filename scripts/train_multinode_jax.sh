@@ -40,12 +40,19 @@ fi
 # ---------- 配置 ----------
 CONFIG_NAME="${1:-pi05_b1k-pt50_cs32_bs64_lr2.5e-5_step50k_gpu40}"
 EXP_NAME="${2:-}"
+if [[ $# -ge 2 ]]; then
+  shift 2
+elif [[ $# -ge 1 ]]; then
+  shift 1
+fi
 
 # ---------- 分布式环境变量 ----------
 ALADDIN_MASTER_ADDR="${master_addr:-${MASTER_ADDR:-}}"
 ALADDIN_MASTER_PORT="${master_port:-${MASTER_PORT:-}}"
-ALADDIN_NNODES="${nnodes:-${WORLD_SIZE:-}}"
-ALADDIN_NODE_RANK="${node_rank:-${WORLD_RANK:-${RANK:-}}}"
+# On Aladdin, prefer the exported GROUP_* env vars (they are reliably set per replica).
+# Some runtimes also inject non-exported shell vars like `node_rank`/`nnodes`, which may be unreliable.
+ALADDIN_NNODES="${GROUP_POD_SIZE:-${nnodes:-${WORLD_SIZE:-}}}"
+ALADDIN_NODE_RANK="${GROUP_POD_INDEX:-${node_rank:-${WORLD_RANK:-${RANK:-}}}}"
 ALADDIN_NPROC_PER_NODE="${nproc_per_node:-${NPROC_PER_NODE:-}}"
 
 if [[ -z "${ALADDIN_MASTER_ADDR}" ]]; then
@@ -161,8 +168,8 @@ export JAX_TRACEBACK_FILTERING="${JAX_TRACEBACK_FILTERING:-off}"
 if [[ "${USE_UV:-0}" == "1" ]]; then
   # 若确实需要 uv，可显式设置一个可写 cache 目录（例如 /tmp）以避免权限问题
   export UV_CACHE_DIR="${UV_CACHE_DIR:-/tmp/uv-cache}"
-  uv run scripts/train_dist.py "${CONFIG_NAME}" --exp_name="${EXP_NAME}" "${TRAIN_ARGS[@]}"
+  uv run scripts/train_dist.py "${CONFIG_NAME}" --exp_name="${EXP_NAME}" "${TRAIN_ARGS[@]}" "$@"
 else
   # 用 venv python（若已激活则 python 即是 venv）
-  python -u scripts/train_dist.py "${CONFIG_NAME}" --exp_name="${EXP_NAME}" "${TRAIN_ARGS[@]}"
+  python -u scripts/train_dist.py "${CONFIG_NAME}" --exp_name="${EXP_NAME}" "${TRAIN_ARGS[@]}" "$@"
 fi
