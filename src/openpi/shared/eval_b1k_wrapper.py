@@ -40,6 +40,7 @@ class B1KPolicyWrapper:
         stop_threshold: float = 0.6,
         stop_patience: int = 3,
         stop_warmup_steps: int = 0,
+        stop_min_steps: int = 0,
         stop_log_interval: int = 1,
         stop_check_every_step: bool = False,
     ) -> None:
@@ -75,6 +76,7 @@ class B1KPolicyWrapper:
         self.stop_threshold = float(stop_threshold)
         self.stop_patience = int(stop_patience)
         self.stop_warmup_steps = int(stop_warmup_steps)
+        self.stop_min_steps = int(stop_min_steps)
         self.stop_log_interval = int(stop_log_interval)
         self.stop_check_every_step = bool(stop_check_every_step)
         self._stop_counter = 0
@@ -96,6 +98,7 @@ class B1KPolicyWrapper:
         logger.info(f"{self.stop_threshold=}")
         logger.info(f"{self.stop_patience=}")
         logger.info(f"{self.stop_warmup_steps=}")
+        logger.info(f"{self.stop_min_steps=}")
         logger.info(f"{self.stop_log_interval=}")
         logger.info(f"{self.stop_check_every_step=}")
         logger.info(f"{self.step_counter=}")
@@ -152,6 +155,10 @@ class B1KPolicyWrapper:
         self._last_stop_prob = float(stop_prob)
 
         if self.step_counter < self.stop_warmup_steps:
+            self._stop_counter = 0
+            return
+
+        if self.step_counter < self.stop_min_steps:
             self._stop_counter = 0
             return
 
