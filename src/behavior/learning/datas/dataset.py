@@ -487,6 +487,30 @@ class BehaviorLeRobotDataset(LeRobotDataset):
         # Default case: no filtering/weighting.
         return bool(self.skill_list) and len(self.skill_list) == 1 and str(self.skill_list[0]).strip() == "all"
 
+    def _summarize_skill_list(self) -> tuple[int, float, bool]:
+        """Return (num_explicit_items, max_weight, has_all)."""
+        num_items = 0
+        max_w = 0.0
+        has_all = False
+        for raw_item in self.skill_list or []:
+            if raw_item == "all":
+                has_all = True
+                continue
+            item = str(raw_item).strip()
+            if not item:
+                continue
+            num_items += 1
+            w = 1.0
+            if ":" in item:
+                _skill, w_str = item.split(":", 1)
+                try:
+                    w = float(w_str.strip())
+                except Exception:
+                    w = 1.0
+            if w > max_w:
+                max_w = w
+        return num_items, float(max_w), bool(has_all)
+
     def _maybe_build_skill_stream(self) -> None:
         """
         Precompute weighted skill-segment ranges for streaming when skill_list filtering is active.
@@ -501,6 +525,24 @@ class BehaviorLeRobotDataset(LeRobotDataset):
         if self._skill_list_is_trivial_all():
             self._skill_stream = None
             return
+
+        # Heuristic: building the global (episode, segment) range table can take a long time when the dataset
+        # contains thousands of episodes. If the requested `skill_list` is "broad" (covers most skills) and the
+        # weights are <=1.0 (keep-probabilities), we can skip this precompute and rely on the sequential
+        # streaming + per-frame accept/reject path instead.
+        #
+        # This is especially useful for "rebalance all skills" runs (stage-1 pretraining).
+        if self.frame_sampling == "all":
+            num_items, max_w, has_all = self._summarize_skill_list()
+            if (has_all or num_items >= 24) and max_w <= 1.0:
+                logger.info(
+                    "Skipping skill-stream precompute (broad skill_list: num_items=%d max_w=%.3g has_all=%s).",
+                    num_items,
+                    max_w,
+                    has_all,
+                )
+                self._skill_stream = None
+                return
 
         # We rely on orchestrators (skill segments) to identify eligible frame ranges.
         # meta.orchestrators[ep_idx][1] corresponds to skill-level segments.
@@ -847,20 +889,26 @@ class BehaviorLeRobotDataset(LeRobotDataset):
         """set train subtask mode for lerobot dataset"""
         self.fine_grained_level = fine_grained_level
 
-        # calculate the start and end indices of each episode
+        # Lazily computed per-episode segment end indices (see _ensure_task_sizes_for_episode).
+        # Eagerly materializing this for thousands of episodes can take a long time and blocks training startup.
         self.task_sizes = {}
-        try:
-            # Only build indices for episodes that are actually selected; iterating over all 10k episodes can be slow.
-            episode_ids = self.episodes if self.episodes is not None else list(self.meta.orchestrators.keys())
-            for ep_id in episode_ids:
-                ep_orch = self.meta.orchestrators.get(ep_id)
-                if ep_orch is None:
-                    continue
-                self.task_sizes[ep_id] = [task_info["end_frame"] for task_info in ep_orch[fine_grained_level]]
-        except Exception as e:
-            print(f"[warn] {self.repo_id} failed to calculate episode subtask cumulate: {e}")
-
         print(f"prepare task with fine_grained_level {self.fine_grained_level} for {self.root}")
+
+    def _ensure_task_sizes_for_episode(self, ep_idx: int) -> None:
+        if self.fine_grained_level < 0:
+            return
+        ep_idx = int(ep_idx)
+        if ep_idx in self.task_sizes:
+            return
+        try:
+            ep_orch = self.meta.orchestrators.get(ep_idx)
+            if ep_orch is None:
+                return
+            segs = ep_orch[self.fine_grained_level]
+            self.task_sizes[ep_idx] = [int(task_info["end_frame"]) for task_info in segs]
+        except Exception:
+            # Leave missing; callers will fallback.
+            return
 
     def get_episodes_file_paths(self) -> list[str]:
         """
@@ -1109,6 +1157,7 @@ class BehaviorLeRobotDataset(LeRobotDataset):
                     instance_mapping = {instance_name: id for id, instance_name in instance_mapping.items()}
 
                     frame_index = round(item["timestamp"].item() * self.fps)
+                    self._ensure_task_sizes_for_episode(ep_idx)
                     sub_idx = bisect.bisect_right(self.task_sizes[ep_idx], frame_index, hi=len(self.task_sizes[ep_idx]) - 1)
                     skill_annotation = self.meta.annotations[ep_idx]["skill_annotation"]
                     relative_obj_names = _flatten_objs(skill_annotation[sub_idx].get("object_id") or [])
@@ -1231,7 +1280,15 @@ class BehaviorLeRobotDataset(LeRobotDataset):
 
             last_task_skill = self._get_current_task_skill(item)
             weight = skill_weight(last_task_skill, self.skill_list)
-            if random.choices([True, False], weights=[weight, 1 - weight])[0]:
+            # `weight` is interpreted as a keep-probability in [0,1] for this streaming path.
+            # Be robust to out-of-range values (e.g., if users pass "skill:2.0" intending upsampling).
+            try:
+                w = float(weight)
+            except Exception:
+                w = 1.0
+            if w >= 1.0:
+                break
+            if w > 0.0 and random.random() < w:
                 break
 
             # Skip this frame (and advance video iterators to keep alignment).
@@ -1258,6 +1315,7 @@ class BehaviorLeRobotDataset(LeRobotDataset):
                 instance_mapping = {instance_name: id for id, instance_name in instance_mapping.items()}
 
                 frame_index = round(item["timestamp"].item() * self.fps)
+                self._ensure_task_sizes_for_episode(ep_idx)
                 sub_idx = bisect.bisect_right(self.task_sizes[ep_idx], frame_index, hi=len(self.task_sizes[ep_idx]) - 1)
                 skill_annotation = self.meta.annotations[ep_idx]["skill_annotation"]
                 relative_obj_names = _flatten_objs(skill_annotation[sub_idx].get("object_id") or [])
@@ -1300,6 +1358,7 @@ class BehaviorLeRobotDataset(LeRobotDataset):
 
     def _get_current_task_skill(self, item: dict) -> str:
         ep_idx = item["episode_index"].item()
+        self._ensure_task_sizes_for_episode(ep_idx)
         frame_index = round(item["timestamp"].item() * self.fps)
         sub_idx = bisect.bisect_right(self.task_sizes[ep_idx], frame_index, hi=len(self.task_sizes[ep_idx]) - 1)
         seg = self.meta.orchestrators[ep_idx][1][sub_idx]
@@ -1317,6 +1376,7 @@ class BehaviorLeRobotDataset(LeRobotDataset):
 
     def _get_fine_grained_task(self, item: dict) -> str:
         ep_idx = item["episode_index"].item()
+        self._ensure_task_sizes_for_episode(ep_idx)
         task_idx = item["task_index"].item()
         frame_index = round(item["timestamp"].item() * self.fps)
         try:
@@ -1345,7 +1405,10 @@ class BehaviorLeRobotDataset(LeRobotDataset):
 
     def _get_skill_end_frame(self, ep_idx: int, frame_index: int) -> int | None:
         """Return the end_frame of the skill segment containing this frame, or None if not using segments."""
-        if self.fine_grained_level < 1 or ep_idx not in self.task_sizes:
+        if self.fine_grained_level < 1:
+            return None
+        self._ensure_task_sizes_for_episode(ep_idx)
+        if ep_idx not in self.task_sizes:
             return None
         try:
             sub_idx = bisect.bisect_right(
