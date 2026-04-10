@@ -1,0 +1,10 @@
+#!/usr/bin/env bash
+set -eo pipefail
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+source "${SCRIPT_DIR}/_bootstrap.sh"
+
+bb_load_config_exports
+
+cd "$(bb_project_root)"
+"${PYTHON_BIN}" -m benchmark.judge.cli "$@"

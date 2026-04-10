@@ -1,0 +1,29 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "behavior-benchmark"
+version = "0.1.0"
+description = "Benchmark orchestration repo for snapshot, serve, eval, and judge flows."
+readme = "README.md"
+requires-python = ">=3.10"
+dependencies = []
+
+[project.scripts]
+behavior-benchmark-judge = "benchmark.judge.cli:main"
+behavior-benchmark-eval = "benchmark.eval.cli:main"
+behavior-benchmark-snapshot = "benchmark.snapshot.cli:main"
+behavior-benchmark-serve = "benchmark.serve.cli:main"
+
+[tool.setuptools]
+packages = [
+  "benchmark",
+  "benchmark.config",
+  "benchmark.core",
+  "benchmark.judge",
+  "benchmark.eval",
+  "benchmark.snapshot",
+  "benchmark.serve",
+  "benchmark.serve.backends",
+]
