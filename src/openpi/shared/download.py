@@ -18,15 +18,61 @@ import tqdm_loggable.auto as tqdm
 if not hasattr(datetime, "UTC"):
     datetime.UTC = datetime.UTC
 
-# Environment variable to control cache directory path, ~/.cache/openpi will be used by default.
+# Environment variable to control cache directory path. If unset, prefer the shared `/vepfs-C`
+# mount so caches can be reused across training jobs and machines. Fall back to `~/.cache/openpi`.
 _OPENPI_DATA_HOME = "OPENPI_DATA_HOME"
+_OPENPI_HF_DATASETS_CACHE = "OPENPI_HF_DATASETS_CACHE"
+_OPENPI_BEHAVIOR_CACHE_DIR = "OPENPI_BEHAVIOR_CACHE_DIR"
 DEFAULT_CACHE_DIR = "~/.cache/openpi"
+_SHARED_CACHE_DIR = "/vepfs-C/.cache/openpi"
 
 logger = logging.getLogger(__name__)
 
 
 def get_cache_dir() -> pathlib.Path:
-    cache_dir = pathlib.Path(os.getenv(_OPENPI_DATA_HOME, DEFAULT_CACHE_DIR)).expanduser().resolve()
+    explicit = os.getenv(_OPENPI_DATA_HOME)
+    if explicit:
+        cache_dir = pathlib.Path(explicit).expanduser().resolve()
+    else:
+        shared_cache_dir = pathlib.Path(_SHARED_CACHE_DIR)
+        shared_root = shared_cache_dir.parents[1]
+        cache_dir = shared_cache_dir if shared_root.exists() else pathlib.Path(DEFAULT_CACHE_DIR).expanduser().resolve()
+    cache_dir.mkdir(parents=True, exist_ok=True)
+    _set_folder_permission(cache_dir)
+    return cache_dir
+
+
+def get_hf_datasets_cache_dir() -> pathlib.Path:
+    explicit = os.getenv(_OPENPI_HF_DATASETS_CACHE) or os.getenv("HF_DATASETS_CACHE")
+    if explicit:
+        cache_dir = pathlib.Path(explicit).expanduser().resolve()
+    elif hf_home := os.getenv("HF_HOME"):
+        cache_dir = pathlib.Path(hf_home).expanduser().resolve() / "datasets"
+    else:
+        cache_dir = get_cache_dir() / "hf_datasets"
+    cache_dir.mkdir(parents=True, exist_ok=True)
+    _set_folder_permission(cache_dir)
+    return cache_dir
+
+
+def get_dataset_cache_dir(root: str | pathlib.Path | None = None) -> pathlib.Path:
+    if root is None:
+        cache_dir = get_cache_dir() / "datasets"
+    else:
+        cache_dir = pathlib.Path(root).expanduser().resolve() / ".openpi_cache"
+    cache_dir.mkdir(parents=True, exist_ok=True)
+    _set_folder_permission(cache_dir)
+    return cache_dir
+
+
+def get_behavior_cache_dir(root: str | pathlib.Path | None = None) -> pathlib.Path:
+    explicit = os.getenv(_OPENPI_BEHAVIOR_CACHE_DIR)
+    if explicit:
+        cache_dir = pathlib.Path(explicit).expanduser().resolve()
+    elif root is not None:
+        cache_dir = get_dataset_cache_dir(root)
+    else:
+        cache_dir = get_cache_dir() / "behavior"
     cache_dir.mkdir(parents=True, exist_ok=True)
     _set_folder_permission(cache_dir)
     return cache_dir

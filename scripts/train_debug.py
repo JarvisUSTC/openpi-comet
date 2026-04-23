@@ -1,7 +1,9 @@
 import dataclasses
 import functools
 import logging
+import os
 import platform
+import time
 from typing import Any
 
 import etils.epath as epath
@@ -9,9 +11,8 @@ import flax.nnx as nnx
 from flax.training import common_utils
 import flax.traverse_util as traverse_util
 import jax
+import jax.experimental
 import jax.numpy as jnp
-import time
-
 import numpy as np
 import optax
 import tqdm_loggable.auto as tqdm
@@ -21,12 +22,12 @@ import openpi.models.model as _model
 import openpi.models.tokenizer as _tokenizer
 import openpi.shared.array_typing as at
 import openpi.shared.nnx_utils as nnx_utils
-import openpi.training.checkpoints as _checkpoints
+import openpi.training.checkpoints_dist as _checkpoints
 import openpi.training.config as _config
 import openpi.training.data_loader as _data_loader
 import openpi.training.jax_train_step as _jax_train_step
-import openpi.training.wandb_log as _wandb_log
 import openpi.training.optimizer as _optimizer
+import openpi.training.wandb_log as _wandb_log
 import openpi.training.sharding as sharding
 import openpi.training.utils as training_utils
 import openpi.training.weight_loaders as _weight_loaders
@@ -34,19 +35,40 @@ import openpi.training.weight_loaders as _weight_loaders
 _PROMPT_LOG_INTERVAL = 10
 
 
-def _format_metric_value(key: str, value: float) -> str:
-    if key == "lr":
-        return f"{value:.3e}"
-    return f"{value:.4f}"
+def _leaf_size_bytes(leaf: Any) -> int:
+    if hasattr(leaf, "shape") and hasattr(leaf, "dtype"):
+        return int(np.prod(leaf.shape)) * np.dtype(leaf.dtype).itemsize
+    if hasattr(leaf, "size") and hasattr(leaf, "dtype"):
+        return int(leaf.size) * np.dtype(leaf.dtype).itemsize
+    return 0
+
+
+def _tree_size_bytes(tree: Any) -> int:
+    return sum(_leaf_size_bytes(leaf) for leaf in jax.tree.leaves(tree))
+
+
+def _batch_leading_row_numpy(x: Any) -> Any:
+    """First row of batch dim as host numpy; supports multi-host sharded jax.Array."""
+    if x is None:
+        return None
+    if isinstance(x, jax.Array):
+        if x.is_fully_addressable:
+            return np.asarray(jax.device_get(x))[0]
+        shards = x.addressable_shards
+        if not shards:
+            return np.asarray(jax.device_get(x))[0]
+        local = np.asarray(shards[0].data)
+        return local[0]
+    return np.asarray(x)[0]
 
 
 def _decode_prompt_for_logging(observation: Any, tokenizer: _tokenizer.PaligemmaTokenizer) -> str:
-    tokens = jax.device_get(observation.tokenized_prompt)[0]
+    tokens = _batch_leading_row_numpy(observation.tokenized_prompt)
     token_mask = getattr(observation, "tokenized_prompt_mask", None)
-    token_mask = None if token_mask is None else jax.device_get(token_mask)[0].astype(bool)
+    token_mask = None if token_mask is None else _batch_leading_row_numpy(token_mask).astype(bool)
 
     token_ar_mask = getattr(observation, "token_ar_mask", None)
-    token_ar_mask = None if token_ar_mask is None else jax.device_get(token_ar_mask)[0]
+    token_ar_mask = None if token_ar_mask is None else _batch_leading_row_numpy(token_ar_mask)
     if token_ar_mask is not None:
         prompt_mask = token_ar_mask == 0
         if token_mask is not None:
@@ -57,10 +79,25 @@ def _decode_prompt_for_logging(observation: Any, tokenizer: _tokenizer.Paligemma
         return tokenizer.decode(tokens, mask=token_mask)
     return tokenizer.decode(tokens)
 
+
+def _broadcast_str_from_primary(s: str, max_len: int = 512) -> str:
+    """Broadcast a string from process 0 to all processes."""
+    if jax.process_count() == 1:
+        return s
+    from jax.experimental.multihost_utils import broadcast_one_to_all
+
+    # Encode to fixed-size numpy array
+    encoded = np.zeros(max_len, dtype=np.uint8)
+    s_bytes = s.encode("utf-8")[:max_len]
+    encoded[: len(s_bytes)] = list(s_bytes)
+    # Broadcast and decode (using int(x) to avoid jax.Array.tobytes() quirks)
+    broadcasted = broadcast_one_to_all(encoded)
+    return bytes(int(x) for x in broadcasted).rstrip(b"\x00").decode("utf-8")
+
+
 def _validation_is_enabled(config: _config.TrainConfig) -> bool:
     if config.val_log_interval <= 0 or config.val_num_batches <= 0:
         return False
-    # Require an explicit validation split/dataset override to avoid silently "validating" on the train set.
     return (config.val_repo_id is not None) or (config.val_episodes_index is not None)
 
 
@@ -121,18 +158,12 @@ def init_wandb(config: _config.TrainConfig, *, resuming: bool, log_code: bool = 
         return
 
     ckpt_dir = config.checkpoint_dir
-    if not ckpt_dir.exists():
-        raise FileNotFoundError(f"Checkpoint directory {ckpt_dir} does not exist.")
+    os.makedirs(ckpt_dir, exist_ok=True)
     if resuming:
         run_id = (ckpt_dir / "wandb_id.txt").read_text().strip()
         wandb.init(id=run_id, resume="must", project=config.project_name)
     else:
-        wandb.init(
-            name=config.exp_name,
-            config=dataclasses.asdict(config),
-            project=config.project_name,
-            group="openpi",
-        )
+        wandb.init(name=config.exp_name, config=dataclasses.asdict(config), project=config.project_name, group="openpi")
         (ckpt_dir / "wandb_id.txt").write_text(wandb.run.id)
 
     if log_code:
@@ -157,7 +188,7 @@ def init_train_state(
     tx = _optimizer.create_optimizer(config.optimizer, config.lr_schedule, weight_decay_mask=None)
     accum_steps = int(getattr(config, "gradient_accumulation_steps", 1))
     if accum_steps > 1:
-        tx = optax.MultiSteps(tx, every_k_schedule=accum_steps, use_grad_mean=True)
+        tx = optax.MultiSteps(tx, every_k_schedule=accum_steps, use_grad_mean=True, accumulator_dtype=jnp.bfloat16)
 
     def init(rng: at.KeyArrayLike, partial_params: at.Params | None = None) -> training_utils.TrainState:
         rng, model_rng = jax.random.split(rng)
@@ -187,6 +218,15 @@ def init_train_state(
 
     train_state_shape = jax.eval_shape(init, init_rng)
     state_sharding = sharding.fsdp_sharding(train_state_shape, mesh, log=True)
+    trainable_params_shape = train_state_shape.params.filter(config.trainable_filter)
+    logging.info(
+        "[P%s] Host-side train state estimate: trainable_params=%.2f GiB full_params=%.2f GiB opt_state=%.2f GiB ema_params=%.2f GiB",
+        jax.process_index(),
+        _tree_size_bytes(trainable_params_shape) / 2**30,
+        _tree_size_bytes(train_state_shape.params) / 2**30,
+        _tree_size_bytes(train_state_shape.opt_state) / 2**30,
+        0.0 if train_state_shape.ema_params is None else _tree_size_bytes(train_state_shape.ema_params) / 2**30,
+    )
 
     if resume:
         return train_state_shape, state_sharding
@@ -207,11 +247,21 @@ def init_train_state(
 
 def main(config: _config.TrainConfig):
     init_logging()
+    num_local_devices = len(os.environ["CUDA_VISIBLE_DEVICES"].split(","))
+    jax.distributed.initialize(
+        coordinator_address=f"{os.environ['MASTER_ADDR']}:{os.environ['MASTER_PORT']}",
+        process_id=int(os.environ["WORLD_RANK"]),
+        num_processes=int(os.environ["WORLD_SIZE"]),
+        local_device_ids=list(range(num_local_devices)),
+    )
     logging.info(f"Running on: {platform.node()}")
     logging.info(f"JAX process index: {jax.process_index()}")
     logging.info(f"JAX process count: {jax.process_count()}")
     logging.info(f"JAX local device count: {jax.local_device_count()}")
     logging.info(f"JAX global device count: {jax.device_count()}")
+
+    config = dataclasses.replace(config, exp_name=_broadcast_str_from_primary(config.exp_name))
+    logging.info(f"[P{jax.process_index()}] checkpoint_dir: {config.checkpoint_dir}")
 
     accum_steps = int(getattr(config, "gradient_accumulation_steps", 1))
     if accum_steps < 1:
@@ -227,7 +277,8 @@ def main(config: _config.TrainConfig):
             f"(batch_size={config.batch_size}, gradient_accumulation_steps={accum_steps})."
         )
     logging.info(
-        "Gradient accumulation: steps=%s micro_batch_size=%s effective_batch_size=%s",
+        "[P%s] Gradient accumulation: steps=%s micro_batch_size=%s effective_batch_size=%s",
+        jax.process_index(),
         accum_steps,
         micro_batch_size,
         config.batch_size,
@@ -235,8 +286,10 @@ def main(config: _config.TrainConfig):
 
     jax.config.update("jax_compilation_cache_dir", str(epath.Path("~/.cache/jax").expanduser()))
 
-    rng = jax.random.key(config.seed)
-    train_rng, init_rng = jax.random.split(rng)
+    base_rng = jax.random.fold_in(jax.random.key(config.seed), jax.process_index())
+    train_rng, _ = jax.random.split(base_rng)
+
+    init_rng = jax.random.key(config.seed)
 
     mesh = sharding.make_mesh(config.fsdp_devices)
     data_sharding = jax.sharding.NamedSharding(mesh, jax.sharding.PartitionSpec(sharding.DATA_AXIS))
@@ -248,25 +301,16 @@ def main(config: _config.TrainConfig):
         overwrite=config.overwrite,
         resume=config.resume,
     )
-    init_wandb(config, resuming=resuming, enabled=config.wandb_enabled)
+
+    if jax.process_index() == 0:
+        init_wandb(config, resuming=resuming, enabled=config.wandb_enabled)
 
     train_data_config = dataclasses.replace(config, batch_size=micro_batch_size) if accum_steps > 1 else config
     data_loader = _data_loader.create_behavior_data_loader(
-        train_data_config, sharding=data_sharding, shuffle=True, skip_norm_stats=False
+        train_data_config, sharding=data_sharding, shuffle=True, skip_norm_stats=False, seed_shift=int(jax.process_index())
     )
     data_iter = iter(data_loader)
     micro_batch = next(data_iter)
-    logging.info(
-        "Data config: fine_grained_level=%s (0=global task, 1=subtask, 2=skill)",
-        getattr(data_loader.data_config(), "fine_grained_level", "?"),
-    )
-    logging.info(
-        "Initialized data loader (micro_batch_size=%s, gradient_accumulation_steps=%s, effective_batch_size=%s):\n%s",
-        micro_batch_size,
-        accum_steps,
-        config.batch_size,
-        training_utils.array_tree_to_info(micro_batch),
-    )
 
     prompt_tokenizer = None
     if jax.process_index() == 0:
@@ -274,10 +318,22 @@ def main(config: _config.TrainConfig):
 
     train_state, train_state_sharding = init_train_state(config, init_rng, mesh, resume=resuming)
     jax.block_until_ready(train_state)
-    logging.info(f"Initialized train state:\n{training_utils.array_tree_to_info(train_state.params)}")
+    trainable_params = train_state.params.filter(config.trainable_filter)
+    logging.info(
+        "[P%s] Train state sizes: trainable_params=%.2f GiB full_params=%.2f GiB opt_state=%.2f GiB ema_params=%.2f GiB",
+        jax.process_index(),
+        _tree_size_bytes(trainable_params) / 2**30,
+        _tree_size_bytes(train_state.params) / 2**30,
+        _tree_size_bytes(train_state.opt_state) / 2**30,
+        0.0 if train_state.ema_params is None else _tree_size_bytes(train_state.ema_params) / 2**30,
+    )
+    logging.info(
+        f"[P{jax.process_index()}] Initialized train state:\n{training_utils.array_tree_to_info(train_state.params)}"
+    )
 
     if resuming:
         train_state = _checkpoints.restore_state(checkpoint_manager, train_state, data_loader)
+        logging.info(f"[P{jax.process_index()}] Restored train state from checkpoint")
 
     ptrain_step = jax.jit(
         functools.partial(_jax_train_step.train_step, config),
@@ -303,7 +359,8 @@ def main(config: _config.TrainConfig):
             out_shardings=replicated_sharding,
         )
         logging.info(
-            "Validation enabled: val_repo_id=%s val_episodes_index=%s val_batch_size=%s val_num_batches=%s val_log_interval=%s",
+            "[P%s] Validation enabled: val_repo_id=%s val_episodes_index=%s val_batch_size=%s val_num_batches=%s val_log_interval=%s",
+            jax.process_index(),
             val_config.val_repo_id,
             val_config.val_episodes_index,
             val_config.batch_size,
@@ -321,6 +378,11 @@ def main(config: _config.TrainConfig):
 
     infos = []
     log_window_t0 = time.monotonic()
+
+    N = len(data_loader._data_loader._data_loader)
+    logging.info(f"{type(data_loader._data_loader), type(data_loader._data_loader._data_loader)}")
+    logging.info(f"[P{jax.process_index()}] Steps per epoch: {N}")
+
     for step in pbar:
         if prompt_tokenizer is not None and (step % _PROMPT_LOG_INTERVAL == 0):
             try:
@@ -342,28 +404,34 @@ def main(config: _config.TrainConfig):
                 val_loss_mean = float(jnp.mean(val_stack))
                 val_loss_std = float(jnp.std(val_stack))
                 pbar.write(f"Step {step}: val_loss={val_loss_mean:.4f} (std={val_loss_std:.4f})")
-                wandb.log(
-                    {
-                        "val_loss": val_loss_mean,
-                        "val_loss_std": val_loss_std,
-                        "val_loss_min": float(jnp.min(val_stack)),
-                        "val_loss_max": float(jnp.max(val_stack)),
-                        "val_num_batches": float(len(val_losses)),
-                    },
-                    step=step,
-                )
+                if jax.process_index() == 0:
+                    wandb.log(
+                        {
+                            "val_loss": val_loss_mean,
+                            "val_loss_std": val_loss_std,
+                            "val_loss_min": float(jnp.min(val_stack)),
+                            "val_loss_max": float(jnp.max(val_stack)),
+                            "val_num_batches": float(len(val_losses)),
+                        },
+                        step=step,
+                    )
             except Exception:
                 logging.exception("Validation failed at step=%s", step)
 
         if accum_steps > 1:
-            # When using optax.MultiSteps, run `accum_steps` micro-steps. The optimizer updates
-            # the parameters only on the last micro-step; state.step tracks optimizer (gradient) steps.
-            info = None
-            for _ in range(accum_steps):
+            micro_infos = []
+            for _micro_i in range(accum_steps):
                 with sharding.set_mesh(mesh):
-                    train_state, info = ptrain_step(train_rng, train_state, micro_batch)
+                    train_state, micro_info = ptrain_step(train_rng, train_state, micro_batch)
+                micro_infos.append(micro_info)
                 micro_batch = next(data_iter)
-            assert info is not None
+            stacked = common_utils.stack_forest(micro_infos)
+            info = jax.tree.map(lambda x: jnp.mean(x, axis=0), stacked)
+            # Override update-related metrics with the last micro-step, since
+            # optax.MultiSteps returns zero updates on intermediate steps.
+            info["update_norm"] = micro_infos[-1]["update_norm"]
+            info["update_param_ratio"] = micro_infos[-1]["update_param_ratio"]
+            info["grad_param_ratio"] = micro_infos[-1]["grad_param_ratio"]
         else:
             with sharding.set_mesh(mesh):
                 train_state, info = ptrain_step(train_rng, train_state, micro_batch)
@@ -382,21 +450,20 @@ def main(config: _config.TrainConfig):
                     "log_window_steps": float(n_steps),
                 },
             )
-            reduced_info = {str(k): wandb_payload[str(k)] for k in stacked_infos}
-            info_str = ", ".join(f"{k}={_format_metric_value(k, float(v))}" for k, v in reduced_info.items())
-            pbar.write(f"Step {step}: {info_str}")
-            wandb.log(wandb_payload, step=step)
+            if jax.process_index() == 0:
+                reduced_info = {str(k): wandb_payload[str(k)] for k in stacked_infos}
+                info_str = ", ".join(f"{k}={v:.4f}" for k, v in reduced_info.items())
+                pbar.write(f"Step {step}: {info_str}")
+                wandb.log(wandb_payload, step=step)
             infos = []
         if accum_steps <= 1:
             micro_batch = next(data_iter)
 
-        should_save_periodic = config.save_interval > 0 and (step % config.save_interval == 0) and (step > start_step)
-        should_save_final = bool(getattr(config, "save_final_checkpoint", True)) and (step == config.num_train_steps - 1)
-        if should_save_periodic or should_save_final:
+        if (step % config.save_interval == 0 and step > start_step) or step == config.num_train_steps - 1:
             _checkpoints.save_state(checkpoint_manager, train_state, data_loader, step)
 
-    logging.info("Waiting for checkpoint manager to finish")
     checkpoint_manager.wait_until_finished()
+    checkpoint_manager.close()
 
 
 if __name__ == "__main__":

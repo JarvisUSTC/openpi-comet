@@ -5,6 +5,23 @@ import openpi.models.tokenizer as _tokenizer
 import openpi.transforms as _transforms
 
 
+class _DummyFASTTokenizer:
+    def __init__(self):
+        self.last_state = object()
+
+    def tokenize(self, prompt, state, actions, *, answer=None):
+        self.last_state = state
+        base = np.arange(6, dtype=np.int32)
+        return (
+            base,
+            np.ones_like(base, dtype=bool),
+            np.array([0, 0, 1, 1, 1, 1], dtype=np.int32),
+            np.array([0, 0, 0, 1, 1, 1], dtype=bool),
+            np.arange(4, dtype=np.int32),
+            np.ones((4,), dtype=bool),
+        )
+
+
 def test_repack_transform():
     transform = _transforms.RepackTransform(
         structure={
@@ -83,6 +100,41 @@ def test_tokenize_no_prompt():
 
     with pytest.raises(ValueError, match="Prompt is required"):
         transform({})
+
+
+def test_tokenize_fast_inputs_robot():
+    tokenizer = _DummyFASTTokenizer()
+    transform = _transforms.TokenizeFASTInputs(tokenizer)
+    data = transform(
+        {
+            "prompt": "Pick up the mug",
+            "state": np.zeros((8,), dtype=np.float32),
+            "actions": np.zeros((3, 2), dtype=np.float32),
+        }
+    )
+
+    assert data["tokenized_prompt"].shape == (6,)
+    assert data["flow_tokenized_prompt"].shape == (4,)
+    assert bool(data["flow_loss_mask"]) is True
+    assert bool(data["is_vqa"]) is False
+    assert tokenizer.last_state is not None
+
+
+def test_tokenize_fast_inputs_vqa():
+    tokenizer = _DummyFASTTokenizer()
+    transform = _transforms.TokenizeFASTInputs(tokenizer)
+    data = transform(
+        {
+            "prompt": "What color is the mug?",
+            "answer": "blue",
+            "state": np.zeros((8,), dtype=np.float32),
+            "actions": np.zeros((3, 2), dtype=np.float32),
+        }
+    )
+
+    assert bool(data["flow_loss_mask"]) is False
+    assert bool(data["is_vqa"]) is True
+    assert tokenizer.last_state is None
 
 
 def test_transform_dict():

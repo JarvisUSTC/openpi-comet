@@ -7,7 +7,6 @@ import orbax.checkpoint as ocp
 import sentencepiece
 from transformers import AutoProcessor
 
-import openpi.models.utils.fsq_tokenizer as fsq_tokenizer
 import openpi.shared.download as download
 
 
@@ -91,40 +90,72 @@ class FASTTokenizer:
         self._fast_skip_tokens = 128  # Skip last 128 tokens in PaliGemma vocab since they are special tokens
 
     def tokenize(
-        self, prompt: str, state: np.ndarray, actions: np.ndarray | None
-    ) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+        self,
+        prompt: str,
+        state: np.ndarray | None,
+        actions: np.ndarray | None,
+        *,
+        answer: str | None = None,
+    ) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+        if actions is not None and answer is not None:
+            raise ValueError("FASTTokenizer only supports one supervision target at a time: actions or answer.")
+
+        prefix_tokens = self._tokenize_prefix(prompt, state)
+        postfix_tokens = self._tokenize_postfix(actions=actions, answer=answer)
+
+        tokens, token_mask, ar_mask, loss_mask = self._pad_token_sequence(prefix_tokens + postfix_tokens, len(prefix_tokens))
+        flow_tokens, flow_token_mask = self._pad_flow_prefix(prefix_tokens)
+
+        return (
+            tokens,
+            token_mask,
+            ar_mask,
+            loss_mask,
+            flow_tokens,
+            flow_token_mask,
+        )
+
+    def _tokenize_prefix(self, prompt: str, state: np.ndarray | None) -> list[int]:
         cleaned_text = prompt.lower().strip().replace("_", " ")
 
-        # Convention: state gets discretized into 256 discrete bins (assumed range after normalization: [-1, 1])
-        discretized_state = np.digitize(state, bins=np.linspace(-1, 1, 256 + 1)[:-1]) - 1
+        if state is None:
+            state_str = "<no_state>"
+        else:
+            # Convention: state gets discretized into 256 discrete bins (assumed range after normalization: [-1, 1])
+            discretized_state = np.digitize(state, bins=np.linspace(-1, 1, 256 + 1)[:-1]) - 1
+            state_str = " ".join(map(str, discretized_state))
 
-        # Convention: prefix includes prompt and string-representation of state, followed by ';'
-        state_str = " ".join(map(str, discretized_state))
+        # Convention: prefix includes prompt and state text, followed by ';'
         prefix = f"Task: {cleaned_text}, State: {state_str};\n"
-        prefix_tokens = self._paligemma_tokenizer.encode(prefix, add_bos=True)
+        return self._paligemma_tokenizer.encode(prefix, add_bos=True)
 
+    def _tokenize_postfix(self, *, actions: np.ndarray | None, answer: str | None) -> list[int]:
         if actions is not None:
             # Tokenize actions with FAST tokenizer --> map to last tokens in PaliGemma vocab
             action_tokens = self._fast_tokenizer(actions[None])[0]
             action_tokens_in_pg = self._act_tokens_to_paligemma_tokens(action_tokens)
 
             # Convention: postfix contains 'Action:' followed by FAST tokens, followed by '|'
-            postfix_tokens = (
+            return (
                 self._paligemma_tokenizer.encode("Action: ")
                 + action_tokens_in_pg.tolist()
                 + self._paligemma_tokenizer.encode("|", add_eos=True)
             )
-        else:
-            postfix_tokens = []
+        if answer is not None:
+            cleaned_answer = answer.strip().replace("\n", " ")
+            return self._paligemma_tokenizer.encode(f"Answer: {cleaned_answer}", add_eos=True)
+        return []
 
-        # Create output token sequence & masks
-        # AR mask is 0 on prefix (bidirectional attention) and 1 on postfix (causal attention to all previous tokens)
-        tokens = prefix_tokens + postfix_tokens
+    def _pad_token_sequence(
+        self,
+        tokens: list[int],
+        prefix_len: int,
+    ) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+        postfix_len = len(tokens) - prefix_len
         token_mask = [True] * len(tokens)
-        ar_mask = [0] * len(prefix_tokens) + [1] * len(postfix_tokens)
-        loss_mask = [False] * len(prefix_tokens) + [True] * len(postfix_tokens)  # Loss on postfix only
+        ar_mask = [0] * prefix_len + [1] * postfix_len
+        loss_mask = [False] * prefix_len + [True] * postfix_len
 
-        # Pad tokens to max length
         tokens_len = len(tokens)
         if tokens_len < self._max_len:
             padding = [False] * (self._max_len - tokens_len)
@@ -138,12 +169,72 @@ class FASTTokenizer:
                     f"Token length ({len(tokens)}) exceeds max length ({self._max_len}), truncating. "
                     "Consider increasing the `max_token_len` in your model config if this happens frequently."
                 )
-            tokens = tokens[: self._max_len]
-            token_mask = token_mask[: self._max_len]
-            ar_mask = ar_mask[: self._max_len]
-            loss_mask = loss_mask[: self._max_len]
+            if postfix_len <= 0:
+                # No supervised postfix to preserve; fall back to simple truncation.
+                tokens = tokens[: self._max_len]
+                token_mask = token_mask[: self._max_len]
+                ar_mask = ar_mask[: self._max_len]
+                loss_mask = loss_mask[: self._max_len]
+            else:
+                # Preserve postfix (the supervised region) and truncate only the prefix portion.
+                prefix_tokens = tokens[:prefix_len]
+                postfix_tokens = tokens[prefix_len:]
+
+                if postfix_len >= self._max_len:
+                    tokens = postfix_tokens[-self._max_len :]
+                    token_mask = [True] * self._max_len
+                    ar_mask = [1] * self._max_len
+                    loss_mask = [True] * self._max_len
+                else:
+                    keep_prefix_len = self._max_len - postfix_len
+                    prefix_body = prefix_tokens[1:] if prefix_tokens else []
+                    if keep_prefix_len <= 0:
+                        kept_prefix = []
+                    elif keep_prefix_len == 1:
+                        kept_prefix = prefix_tokens[:1]
+                    else:
+                        # Keep some context from both the beginning and the end of the prefix.
+                        remaining = keep_prefix_len - 1
+                        head = remaining // 2
+                        tail = remaining - head
+                        kept_prefix = prefix_tokens[:1] + prefix_body[:head] + (prefix_body[-tail:] if tail else [])
+
+                    tokens = kept_prefix + postfix_tokens
+                    token_mask = [True] * len(tokens)
+                    ar_mask = [0] * len(kept_prefix) + [1] * postfix_len
+                    loss_mask = [False] * len(kept_prefix) + [True] * postfix_len
+
+                    # Safety: if something unexpected changed lengths, pad/truncate to max_len.
+                    if len(tokens) < self._max_len:
+                        padding = [False] * (self._max_len - len(tokens))
+                        tokens = tokens + padding
+                        token_mask = token_mask + padding
+                        ar_mask = ar_mask + padding
+                        loss_mask = loss_mask + padding
+                    elif len(tokens) > self._max_len:
+                        tokens = tokens[: self._max_len]
+                        token_mask = token_mask[: self._max_len]
+                        ar_mask = ar_mask[: self._max_len]
+                        loss_mask = loss_mask[: self._max_len]
 
         return np.asarray(tokens), np.asarray(token_mask), np.asarray(ar_mask), np.asarray(loss_mask)
+
+    def _pad_flow_prefix(self, prefix_tokens: list[int]) -> tuple[np.ndarray, np.ndarray]:
+        tokens = list(prefix_tokens)
+        token_mask = [True] * len(tokens)
+        if len(tokens) < self._max_len:
+            padding = [False] * (self._max_len - len(tokens))
+            tokens = tokens + padding
+            token_mask = token_mask + padding
+        else:
+            if len(tokens) > self._max_len:
+                logging.warning(
+                    f"Flow token length ({len(tokens)}) exceeds max length ({self._max_len}), truncating. "
+                    "Consider increasing the `max_token_len` in your model config if this happens frequently."
+                )
+            tokens = tokens[: self._max_len]
+            token_mask = token_mask[: self._max_len]
+        return np.asarray(tokens), np.asarray(token_mask)
 
     def extract_actions(self, tokens: np.ndarray, action_horizon: int, action_dim: int) -> np.ndarray:
         # Decode predicted output tokens
@@ -278,6 +369,8 @@ class FSQTokenizer:
     """
 
     def __init__(self, max_len: int = 256, fsq_tokenizer_path: str | None = None):
+        import openpi.models.utils.fsq_tokenizer as fsq_tokenizer
+
         self._max_len = max_len
 
         assert fsq_tokenizer_path is not None, "fsq_tokenizer_path must be provided"

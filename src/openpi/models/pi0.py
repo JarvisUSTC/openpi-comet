@@ -5,6 +5,7 @@ import flax.nnx as nnx
 import flax.nnx.bridge as nnx_bridge
 import jax
 import jax.numpy as jnp
+import optax
 from typing_extensions import override
 
 from openpi.models import model as _model
@@ -70,6 +71,9 @@ class Pi0(_model.BaseModel):
         self.pi05 = config.pi05
         self.pcd = config.pcd
         self.knowledge_insulation = getattr(config, "knowledge_insulation", False)
+        self.fast_loss_weight = getattr(config, "fast_loss_weight", 1.0)
+        self.flow_loss_weight = getattr(config, "flow_loss_weight", 1.0)
+        self.vqa_loss_weight = getattr(config, "vqa_loss_weight", 1.0)
         paligemma_config = _gemma.get_config(config.paligemma_variant)
         action_expert_config = _gemma.get_config(config.action_expert_variant)
         # TODO: rewrite gemma in NNX. For now, use bridge.
@@ -118,16 +122,14 @@ class Pi0(_model.BaseModel):
         self.deterministic = True
 
     @at.typecheck
-    def embed_prefix(
+    def _embed_visual_prefix(
         self, obs: _model.Observation
-    ) -> tuple[at.Float[at.Array, "b s emb"], at.Bool[at.Array, "b s"], at.Bool[at.Array, " s"]]:
+    ) -> tuple[list[at.Float[at.Array, "b s emb"]], list[at.Bool[at.Array, "b s"]], list[bool]]:
+        tokens = []
         input_mask = []
         ar_mask = []
-        tokens = []
-        # embed images
         for name in obs.images:
             image_tokens, _ = self.PaliGemma.img(obs.images[name], train=False)
-
             tokens.append(image_tokens)
             input_mask.append(
                 einops.repeat(
@@ -136,8 +138,24 @@ class Pi0(_model.BaseModel):
                     s=image_tokens.shape[1],
                 )
             )
-            # image tokens attend to each other
             ar_mask += [False] * image_tokens.shape[1]
+
+        if self.pcd:
+            pcd_tokens = self.pointnet(obs.pcd_xyz)
+            tokens.append(pcd_tokens)
+            input_mask.append(jnp.ones(pcd_tokens.shape[:2], dtype=jnp.bool_))
+            ar_mask += [False] * pcd_tokens.shape[1]
+
+        return tokens, input_mask, ar_mask
+
+    @at.typecheck
+    def embed_prefix(
+        self, obs: _model.Observation, visual: tuple[list, list, list] | None = None
+    ) -> tuple[at.Float[at.Array, "b s emb"], at.Bool[at.Array, "b s"], at.Bool[at.Array, " s"]]:
+        if visual is not None:
+            tokens, input_mask, ar_mask = list(visual[0]), list(visual[1]), list(visual[2])
+        else:
+            tokens, input_mask, ar_mask = self._embed_visual_prefix(obs)
 
         # add language (aka tokenized inputs)
         if obs.tokenized_prompt is not None:
@@ -147,13 +165,6 @@ class Pi0(_model.BaseModel):
             # full attention between image and language inputs
             ar_mask += [False] * tokenized_inputs.shape[1]
 
-        # add point cloud
-        if self.pcd:
-            pcd_tokens = self.pointnet(obs.pcd_xyz)  # (b s=16 2048)
-            tokens.append(pcd_tokens)
-            input_mask.append(jnp.ones(pcd_tokens.shape[:2], dtype=jnp.bool_))
-            ar_mask += [False] * pcd_tokens.shape[1]
-
         tokens = jnp.concatenate(tokens, axis=1)
         input_mask = jnp.concatenate(input_mask, axis=1)
         ar_mask = jnp.array(ar_mask)
@@ -161,22 +172,13 @@ class Pi0(_model.BaseModel):
 
     @at.typecheck
     def embed_prefix_for_fast(
-        self, obs: _model.Observation
+        self, obs: _model.Observation, visual: tuple[list, list, list] | None = None
     ) -> tuple[at.Float[at.Array, "b s emb"], at.Bool[at.Array, "b s"], at.Bool[at.Array, "b s"]]:
         """Prefix for π0.5 + KI: image + full token sequence (lang + action tokens) with causal mask on tokens."""
-        input_mask_list = []
-        tokens_list = []
-        # embed images (same as embed_prefix)
-        for name in obs.images:
-            image_tokens, _ = self.PaliGemma.img(obs.images[name], train=False)
-            tokens_list.append(image_tokens)
-            input_mask_list.append(
-                einops.repeat(
-                    obs.image_masks[name],
-                    "b -> b s",
-                    s=image_tokens.shape[1],
-                )
-            )
+        if visual is not None:
+            tokens_list, input_mask_list, _ = list(visual[0]), list(visual[1]), list(visual[2])
+        else:
+            tokens_list, input_mask_list, _ = self._embed_visual_prefix(obs)
         # full token sequence (lang + action tokens) for FAST loss
         assert obs.tokenized_prompt is not None and obs.token_ar_mask is not None
         tokenized_inputs = self.PaliGemma.llm(obs.tokenized_prompt, method="embed")
@@ -188,6 +190,30 @@ class Pi0(_model.BaseModel):
         image_len = tokens.shape[1] - tokenized_inputs.shape[1]
         image_ar = jnp.zeros((tokens.shape[0], image_len), dtype=jnp.bool_)  # False = full attention
         ar_mask = jnp.concatenate([image_ar, obs.token_ar_mask.astype(jnp.bool_)], axis=1)
+        return tokens, input_mask, ar_mask
+
+    @at.typecheck
+    def embed_prefix_for_flow(
+        self, obs: _model.Observation, visual: tuple[list, list, list] | None = None
+    ) -> tuple[at.Float[at.Array, "b s emb"], at.Bool[at.Array, "b s"], at.Bool[at.Array, " s"]]:
+        if visual is not None:
+            tokens, input_mask, ar_mask = list(visual[0]), list(visual[1]), list(visual[2])
+        else:
+            tokens, input_mask, ar_mask = self._embed_visual_prefix(obs)
+        if obs.flow_tokenized_prompt is not None:
+            tokenized_inputs = self.PaliGemma.llm(obs.flow_tokenized_prompt, method="embed")
+            tokens.append(tokenized_inputs)
+            input_mask.append(obs.flow_tokenized_prompt_mask)
+            ar_mask += [False] * tokenized_inputs.shape[1]
+        elif obs.tokenized_prompt is not None:
+            tokenized_inputs = self.PaliGemma.llm(obs.tokenized_prompt, method="embed")
+            tokens.append(tokenized_inputs)
+            input_mask.append(obs.tokenized_prompt_mask)
+            ar_mask += [False] * tokenized_inputs.shape[1]
+
+        tokens = jnp.concatenate(tokens, axis=1)
+        input_mask = jnp.concatenate(input_mask, axis=1)
+        ar_mask = jnp.array(ar_mask)
         return tokens, input_mask, ar_mask
 
     @at.typecheck
@@ -233,42 +259,46 @@ class Pi0(_model.BaseModel):
         tokens.append(action_expert_tokens)
         input_mask.append(jnp.ones(action_expert_tokens.shape[:2], dtype=jnp.bool_))
         # image/language/state inputs do not attend to action tokens
-        # ar_mask += [True] + ([False] * (self.action_horizon - 1))
+        # The suffix AR mask should only cover the newly appended action tokens.
+        # Using the full suffix length here double-counts the state token in pi0.
         tokens = jnp.concatenate(tokens, axis=1)
         input_mask = jnp.concatenate(input_mask, axis=1)
-        ar_mask += [True] + ([False] * (input_mask.shape[1] - 1))
+        ar_mask += [True] + ([False] * (action_expert_tokens.shape[1] - 1))
         ar_mask = jnp.array(ar_mask)
         return tokens, input_mask, ar_mask, adarms_cond
 
-    def _compute_loss_fast(
-        self, observation: _model.Observation
+    def _compute_language_loss(
+        self, observation: _model.Observation, prefix_out: at.Float[at.Array, "b s d"] | None = None
     ) -> at.Float[at.Array, "*b"]:
-        """FAST (discrete action token) CE loss for KI: updates backbone only."""
-        prefix_tokens, prefix_mask, prefix_ar_mask = self.embed_prefix_for_fast(observation)
-        attn_mask = make_attn_mask(prefix_mask, prefix_ar_mask)
-        positions = jnp.cumsum(prefix_mask, axis=1) - 1
-        (prefix_out, _), _ = self.PaliGemma.llm(
-            [prefix_tokens, None],
-            mask=attn_mask,
-            positions=positions,
-            adarms_cond=[None, None],
-        )
-        # prefix_out is (output, None); use first expert's hidden for next-token logits
-        logits = self.PaliGemma.llm(prefix_out[:, :-1], method="decode_logits")
-        targets = jax.nn.one_hot(
-            observation.tokenized_prompt[:, 1:],
-            logits.shape[-1],
-        )
-        logp = jax.nn.log_softmax(logits, axis=-1)
-        token_pplx = jnp.sum(targets * logp, axis=-1)
+        """Backbone next-token CE loss for KI, shared by FAST action tokens and VQA answers."""
+        if prefix_out is None:
+            prefix_tokens, prefix_mask, prefix_ar_mask = self.embed_prefix_for_fast(observation)
+            attn_mask = make_attn_mask(prefix_mask, prefix_ar_mask)
+            positions = jnp.cumsum(prefix_mask, axis=1) - 1
+            (prefix_out, _), _ = self.PaliGemma.llm(
+                [prefix_tokens, None],
+                mask=attn_mask,
+                positions=positions,
+                adarms_cond=[None, None],
+            )
+        # Only decode token positions to avoid wasting work on image tokens.
+        labels = observation.tokenized_prompt[:, 1:]
+        logits = self.PaliGemma.llm(prefix_out[:, -labels.shape[1] - 1 : -1], method="decode_logits")
+        token_ce = optax.softmax_cross_entropy_with_integer_labels(logits, labels)
         assert observation.token_loss_mask is not None
         loss_mask = observation.token_loss_mask[:, 1:]
-        return -jnp.sum(token_pplx * loss_mask, axis=-1) / jnp.clip(jnp.sum(loss_mask, axis=-1), 1)
+        return jnp.sum(token_ce * loss_mask, axis=-1) / jnp.clip(jnp.sum(loss_mask, axis=-1), 1)
 
     @override
     def compute_loss(
         self, rng: at.KeyArrayLike, observation: _model.Observation, actions: _model.Actions, *, train: bool = False
     ) -> at.Float[at.Array, "*b ah"]:
+        total_loss, _ = self.compute_loss_and_metrics(rng, observation, actions, train=train)
+        return total_loss
+
+    def compute_loss_and_metrics(
+        self, rng: at.KeyArrayLike, observation: _model.Observation, actions: _model.Actions, *, train: bool = False
+    ) -> tuple[at.Float[at.Array, "*b ah"], dict[str, at.Array]]:
         preprocess_rng, noise_rng, time_rng = jax.random.split(rng, 3)
         observation = _model.preprocess_observation(preprocess_rng, observation, train=train)
 
@@ -279,26 +309,92 @@ class Pi0(_model.BaseModel):
         x_t = time_expanded * noise + (1 - time_expanded) * actions
         u_t = noise - actions
 
-        # one big forward pass of prefix + suffix at once
-        prefix_tokens, prefix_mask, prefix_ar_mask = self.embed_prefix(observation)
-        suffix_tokens, suffix_mask, suffix_ar_mask, adarms_cond = self.embed_suffix(observation, x_t, time)
-        input_mask = jnp.concatenate([prefix_mask, suffix_mask], axis=1)
-        ar_mask = jnp.concatenate([prefix_ar_mask, suffix_ar_mask], axis=0)
-        attn_mask = make_attn_mask(input_mask, ar_mask)
-        positions = jnp.cumsum(input_mask, axis=1) - 1
-        (prefix_out, suffix_out), _ = self.PaliGemma.llm(
-            [prefix_tokens, suffix_tokens], mask=attn_mask, positions=positions, adarms_cond=[None, adarms_cond]
-        )
-        # Knowledge insulation: stop gradient from action expert to backbone
         if self.knowledge_insulation:
-            suffix_out = jax.lax.stop_gradient(suffix_out)
+            # Pre-compute visual tokens once, shared by flow and CE branches.
+            visual = self._embed_visual_prefix(observation)
+            # Flow prefix: images + language-only prompt (no action tokens, leakage-free).
+            flow_tokens, flow_mask, flow_ar_mask = self.embed_prefix_for_flow(observation, visual=visual)
+            # Full prefix: images + language + action tokens for CE loss.
+            full_tokens, full_mask, full_ar_mask = self.embed_prefix_for_fast(observation, visual=visual)
+
+            # Single backbone forward pass on the full prefix.
+            full_prefix_attn_mask = make_attn_mask(full_mask, full_ar_mask)
+            full_prefix_positions = jnp.cumsum(full_mask, axis=1) - 1
+            (prefix_out, _), full_kv_cache = self.PaliGemma.llm(
+                [full_tokens, None], mask=full_prefix_attn_mask, positions=full_prefix_positions
+            )
+
+            # Slice KV cache to flow prefix length and apply stop_gradient.
+            flow_prefix_len = flow_tokens.shape[1]
+            kv_cache = jax.tree.map(lambda x: x[:, :, :flow_prefix_len, :], full_kv_cache)
+            kv_cache = jax.tree.map(jax.lax.stop_gradient, kv_cache)
+
+            # Flow suffix: noisy actions + timestep, conditioned on frozen backbone KV cache.
+            suffix_tokens, suffix_mask, suffix_ar_mask, adarms_cond = self.embed_suffix(observation, x_t, time)
+            suffix_attn_mask = make_attn_mask(suffix_mask, suffix_ar_mask)
+            prefix_to_suffix_mask = einops.repeat(flow_mask, "b p -> b s p", s=suffix_tokens.shape[1])
+            flow_suffix_attn_mask = jnp.concatenate([prefix_to_suffix_mask, suffix_attn_mask], axis=-1)
+            positions = jnp.sum(flow_mask, axis=-1)[:, None] + jnp.cumsum(suffix_mask, axis=-1) - 1
+            (prefix_out2, suffix_out), _ = self.PaliGemma.llm(
+                [None, suffix_tokens],
+                mask=flow_suffix_attn_mask,
+                positions=positions,
+                kv_cache=kv_cache,
+                adarms_cond=[None, adarms_cond],
+            )
+            assert prefix_out2 is None
+        else:
+            # one big forward pass of prefix + suffix at once
+            prefix_tokens, prefix_mask, prefix_ar_mask = self.embed_prefix(observation)
+            suffix_tokens, suffix_mask, suffix_ar_mask, adarms_cond = self.embed_suffix(observation, x_t, time)
+            input_mask = jnp.concatenate([prefix_mask, suffix_mask], axis=1)
+            ar_mask = jnp.concatenate([prefix_ar_mask, suffix_ar_mask], axis=0)
+            attn_mask = make_attn_mask(input_mask, ar_mask)
+            positions = jnp.cumsum(input_mask, axis=1) - 1
+            (_, suffix_out), _ = self.PaliGemma.llm(
+                [prefix_tokens, suffix_tokens], mask=attn_mask, positions=positions, adarms_cond=[None, adarms_cond]
+            )
+
         v_t = self.action_out_proj(suffix_out[:, -self.action_horizon :])
 
         loss_flow = jnp.mean(jnp.square(v_t - u_t), axis=-1)  # (*b, ah)
         if self.knowledge_insulation:
-            loss_fast = self._compute_loss_fast(observation)  # (*b,)
-            return loss_fast[..., None] + loss_flow
-        return loss_flow
+            flow_loss_mask = (
+                observation.flow_loss_mask.astype(loss_flow.dtype)[..., None]
+                if observation.flow_loss_mask is not None
+                else jnp.ones(loss_flow.shape[:-1] + (1,), dtype=loss_flow.dtype)
+            )
+            token_loss = self._compute_language_loss(observation, prefix_out=prefix_out)
+            is_vqa = observation.is_vqa.astype(jnp.bool_) if observation.is_vqa is not None else jnp.zeros_like(token_loss, dtype=jnp.bool_)
+            loss_fast_raw = jnp.where(is_vqa, 0.0, token_loss)
+            loss_vqa_raw = jnp.where(is_vqa, token_loss, 0.0)
+            loss_fast = loss_fast_raw * self.fast_loss_weight
+            loss_vqa = loss_vqa_raw * self.vqa_loss_weight
+            loss_flow_weighted = loss_flow * flow_loss_mask * self.flow_loss_weight
+
+            non_vqa_mask = (~is_vqa).astype(token_loss.dtype)
+            vqa_mask = is_vqa.astype(token_loss.dtype)
+            flow_mask = jnp.broadcast_to(flow_loss_mask, loss_flow.shape)
+
+            metrics = {
+                "loss_flow": jnp.sum(loss_flow * flow_mask) / jnp.clip(jnp.sum(flow_mask), 1.0),
+                "loss_flow_weighted": jnp.sum(loss_flow_weighted) / jnp.clip(jnp.sum(flow_mask), 1.0),
+                "loss_token": jnp.mean(token_loss),
+                "loss_fast": jnp.sum(loss_fast_raw * non_vqa_mask) / jnp.clip(jnp.sum(non_vqa_mask), 1.0),
+                "loss_fast_weighted": jnp.sum(loss_fast * non_vqa_mask) / jnp.clip(jnp.sum(non_vqa_mask), 1.0),
+                "loss_vqa": jnp.sum(loss_vqa_raw * vqa_mask) / jnp.clip(jnp.sum(vqa_mask), 1.0),
+                "loss_vqa_weighted": jnp.sum(loss_vqa * vqa_mask) / jnp.clip(jnp.sum(vqa_mask), 1.0),
+                "noise_time_mean": jnp.mean(time),
+                "noise_time_std": jnp.std(time),
+            }
+            return loss_flow_weighted + loss_fast[..., None] + loss_vqa[..., None], metrics
+        metrics = {
+            "loss_flow": jnp.mean(loss_flow),
+            "loss_flow_weighted": jnp.mean(loss_flow),
+            "noise_time_mean": jnp.mean(time),
+            "noise_time_std": jnp.std(time),
+        }
+        return loss_flow, metrics
 
     @override
     def sample_actions(
@@ -318,7 +414,9 @@ class Pi0(_model.BaseModel):
             noise = jax.random.normal(rng, (batch_size, self.action_horizon, self.action_dim))
 
         # first fill KV cache with a forward pass of the prefix
-        prefix_tokens, prefix_mask, prefix_ar_mask = self.embed_prefix(observation)
+        prefix_tokens, prefix_mask, prefix_ar_mask = (
+            self.embed_prefix_for_flow(observation) if self.knowledge_insulation else self.embed_prefix(observation)
+        )
         prefix_attn_mask = make_attn_mask(prefix_mask, prefix_ar_mask)
         positions = jnp.cumsum(prefix_mask, axis=1) - 1
         _, kv_cache = self.PaliGemma.llm([prefix_tokens, None], mask=prefix_attn_mask, positions=positions)

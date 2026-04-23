@@ -128,6 +128,9 @@ celerybeat.pid
 # SageMath parsed files
 *.sage.py
 
+# uv：托管 Python 与缓存（体积大，且与机器无关地放在 vepfs 仓库旁）
+.uv/
+
 # Environments
 .env
 .venv

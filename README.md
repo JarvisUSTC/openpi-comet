@@ -108,6 +108,10 @@ uv pip install -e bddl
 uv pip install -e OmniGibson[eval]
 ```
 
+## Training Notes
+
+For distributed training defaults, shared cache locations, offline FAST tokenizer setup, and how to migrate training to a new machine or mount path, see [TRAINING.md](TRAINING.md).
+
 ## Model Zoo
 
 We provide a suite of base VLA model checkpoints trained on 1.5K hours robot trajectories, ideal for BEHAVIOR-1K fine-tuning.

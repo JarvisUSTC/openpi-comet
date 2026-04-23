@@ -45,9 +45,14 @@ class Pi0Config(_model.BaseModelConfig):
     # 需包含 config.json 等，与 HuggingFace physical-intelligence/fast 目录结构一致。
     fast_tokenizer_path: str | None = None
 
+    # Loss weights for the KI setting.
+    fast_loss_weight: float = 1.0
+    flow_loss_weight: float = 1.0
+    vqa_loss_weight: float = 1.0
+
     def __post_init__(self):
         if self.max_token_len is None:
-            object.__setattr__(self, "max_token_len", 200 if self.pi05 else 48)
+            object.__setattr__(self, "max_token_len", 256 if self.pi05 else 48)
         if self.discrete_state_input is None:
             object.__setattr__(self, "discrete_state_input", self.pi05)
 
@@ -90,6 +95,14 @@ class Pi0Config(_model.BaseModelConfig):
                 token_loss_mask=jax.ShapeDtypeStruct([batch_size, self.max_token_len], bool)
                 if self.knowledge_insulation
                 else None,
+                flow_tokenized_prompt=jax.ShapeDtypeStruct([batch_size, self.max_token_len], jnp.int32)
+                if self.knowledge_insulation
+                else None,
+                flow_tokenized_prompt_mask=jax.ShapeDtypeStruct([batch_size, self.max_token_len], bool)
+                if self.knowledge_insulation
+                else None,
+                flow_loss_mask=jax.ShapeDtypeStruct([batch_size], bool) if self.knowledge_insulation else None,
+                is_vqa=jax.ShapeDtypeStruct([batch_size], bool) if self.knowledge_insulation else None,
                 pcd_xyz=jax.ShapeDtypeStruct([batch_size, 16, 2025, 3], jnp.float32),
             )
         action_spec = jax.ShapeDtypeStruct([batch_size, self.action_horizon, self.action_dim], jnp.float32)

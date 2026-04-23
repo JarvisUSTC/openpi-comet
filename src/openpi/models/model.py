@@ -64,10 +64,14 @@ IMAGE_RESOLUTION = (224, 224)
 #         ...  # Masks for additional views
 #     },
 #     "state": float32[*b, s],  # Low-dimensional robot state
-#     "tokenized_prompt": int32[*b, l],  # Optional, tokenized language prompt
+#     "tokenized_prompt": int32[*b, l],  # Optional, tokenized language prompt for CE
 #     "tokenized_prompt_mask": bool[*b, l],  # Optional, mask for tokenized prompt
-#     "token_ar_mask": int32[*b, l],  # Optional, autoregressive mask for FAST model
-#     "token_loss_mask": bool[*b, l],  # Optional, loss mask for FAST model
+#     "token_ar_mask": int32[*b, l],  # Optional, autoregressive mask for CE prompt
+#     "token_loss_mask": bool[*b, l],  # Optional, loss mask for CE prompt
+#     "flow_tokenized_prompt": int32[*b, l],  # Optional, leakage-free prompt for flow
+#     "flow_tokenized_prompt_mask": bool[*b, l],  # Optional, mask for flow prompt
+#     "flow_loss_mask": bool[*b],  # Optional, whether this sample participates in flow loss
+#     "is_vqa": bool[*b],  # Optional, whether token CE counts as VQA LM loss
 #
 #      # Actions data.
 #      "actions": float32[*b ah ad]
@@ -110,6 +114,18 @@ class Observation(Generic[ArrayT]):
     # Token loss mask (for FAST autoregressive model).
     token_loss_mask: at.Bool[ArrayT, "*b l"] | None = None
 
+    # Leakage-free prompt for the flow branch under KI.
+    flow_tokenized_prompt: at.Int[ArrayT, "*b l"] | None = None
+
+    # Mask for the leakage-free flow prompt.
+    flow_tokenized_prompt_mask: at.Bool[ArrayT, "*b l"] | None = None
+
+    # Whether the sample should contribute to the flow loss.
+    flow_loss_mask: at.Bool[ArrayT, "*b"] | None = None
+
+    # Whether the sample belongs to the VQA language loss branch.
+    is_vqa: at.Bool[ArrayT, "*b"] | None = None
+
     # Point cloud.
     pcd_xyz: at.Float[ArrayT, "*b pc_s n 3"] | None = None
 
@@ -119,6 +135,8 @@ class Observation(Generic[ArrayT]):
         # Ensure that tokenized_prompt and tokenized_prompt_mask are provided together.
         if ("tokenized_prompt" in data) != ("tokenized_prompt_mask" in data):
             raise ValueError("tokenized_prompt and tokenized_prompt_mask must be provided together.")
+        if ("flow_tokenized_prompt" in data) != ("flow_tokenized_prompt_mask" in data):
+            raise ValueError("flow_tokenized_prompt and flow_tokenized_prompt_mask must be provided together.")
         # If images are uint8, convert them to [-1, 1] float32.
         for key in data["image"]:
             if data["image"][key].dtype == np.uint8:
@@ -133,6 +151,10 @@ class Observation(Generic[ArrayT]):
             tokenized_prompt_mask=data.get("tokenized_prompt_mask"),
             token_ar_mask=data.get("token_ar_mask"),
             token_loss_mask=data.get("token_loss_mask"),
+            flow_tokenized_prompt=data.get("flow_tokenized_prompt"),
+            flow_tokenized_prompt_mask=data.get("flow_tokenized_prompt_mask"),
+            flow_loss_mask=data.get("flow_loss_mask"),
+            is_vqa=data.get("is_vqa"),
             pcd_xyz=data.get("pcd_xyz"),
         )
 
@@ -213,6 +235,10 @@ def preprocess_observation(
         tokenized_prompt_mask=observation.tokenized_prompt_mask,
         token_ar_mask=observation.token_ar_mask,
         token_loss_mask=observation.token_loss_mask,
+        flow_tokenized_prompt=observation.flow_tokenized_prompt,
+        flow_tokenized_prompt_mask=observation.flow_tokenized_prompt_mask,
+        flow_loss_mask=observation.flow_loss_mask,
+        is_vqa=observation.is_vqa,
         pcd_xyz=observation.pcd_xyz,
     )
 

@@ -18,6 +18,7 @@ import openpi.models.model as _model
 import openpi.models.pi0_config as pi0_config
 import openpi.models.tokenizer as _tokenizer
 import openpi.policies.b1k_policy as b1k_policy
+import openpi.policies.vqa_policy as vqa_policy
 import openpi.shared.download as _download
 import openpi.shared.normalize as _normalize
 import openpi.training.optimizer as _optimizer
@@ -65,6 +66,8 @@ class AssetsConfig:
 
 @dataclasses.dataclass(frozen=True)
 class DataConfig:
+    dataset_type: Literal["behavior", "hf_vqa", "local_vqa_schema", "robointer_vqa", "fake"] = "behavior"
+
     # LeRobot repo id. If None, fake data will be created.
     repo_id: str | None = None
 
@@ -73,6 +76,9 @@ class DataConfig:
 
     # Contains precomputed normalization stats. If None, normalization will not be performed.
     norm_stats: dict[str, _transforms.NormStats] | None = None
+
+    # If true, missing norm stats will be treated as an error.
+    requires_norm_stats: bool = True
 
     # Used to adopt the inputs from a dataset specific format to a common format
     # which is expected by the data transforms.
@@ -121,6 +127,11 @@ class DataConfig:
     # tolerance decoding
     tolerance_s: float = 1e-4
 
+    # Whether to perform a full timestamp synchronization scan when constructing
+    # the BEHAVIOR dataset. This is useful when validating a new dataset export,
+    # but is very expensive on the full cached training set.
+    check_timestamp_sync: bool = False
+
     # fine-grained level of orchestrators to use for training
     fine_grained_level: int = 0  # 0, 1, 2
 
@@ -132,6 +143,22 @@ class DataConfig:
 
     # skill list to use for training
     skill_list: list[str] = dataclasses.field(default_factory=lambda: ["all"])
+
+    # Hugging Face VQA dataset parameters.
+    hf_dataset_name: str | None = None
+    hf_dataset_config_name: str | None = None
+    hf_dataset_split: str = "train"
+    hf_image_column: str = "image"
+    hf_question_column: str = "question"
+    hf_answer_column: str = "answer"
+
+    # Local VQA schema parameters.
+    local_vqa_schema_paths: Sequence[str] = ()
+
+    # RoboInter-VQA raw dataset parameters.
+    local_vqa_root: str | None = None
+    robointer_annotation_paths: Sequence[str] = ()
+    robointer_max_samples_per_annotation: int | None = None
 
 
 class GroupFactory(Protocol):
@@ -295,7 +322,98 @@ class FakeDataConfig(DataConfigFactory):
 
     @override
     def create(self, assets_dirs: pathlib.Path, model_config: _model.BaseModelConfig) -> DataConfig:
-        return DataConfig(repo_id=self.repo_id)
+        return DataConfig(repo_id=self.repo_id, dataset_type="fake", requires_norm_stats=False)
+
+
+@dataclasses.dataclass(frozen=True)
+class HuggingFaceVQADataConfig(DataConfigFactory):
+    hf_dataset_config_name: str | None = None
+    hf_dataset_split: str = "train"
+    hf_image_column: str = "image"
+    hf_question_column: str = "question"
+    hf_answer_column: str = "answer"
+
+    @override
+    def create(self, assets_dirs: pathlib.Path, model_config: _model.BaseModelConfig) -> DataConfig:
+        data_transforms = _transforms.Group(
+            inputs=[
+                vqa_policy.VQAInputs(
+                    action_dim=model_config.action_dim,
+                    action_horizon=model_config.action_horizon,
+                )
+            ]
+        )
+        model_transforms = ModelTransformFactory()(model_config)
+        return dataclasses.replace(
+            self.create_base_config(assets_dirs, model_config),
+            dataset_type="hf_vqa",
+            requires_norm_stats=False,
+            data_transforms=data_transforms,
+            model_transforms=model_transforms,
+            use_quantile_norm=False,
+            hf_dataset_name=self.repo_id,
+            hf_dataset_config_name=self.hf_dataset_config_name,
+            hf_dataset_split=self.hf_dataset_split,
+            hf_image_column=self.hf_image_column,
+            hf_question_column=self.hf_question_column,
+            hf_answer_column=self.hf_answer_column,
+        )
+
+
+@dataclasses.dataclass(frozen=True)
+class LocalVQASchemaDataConfig(DataConfigFactory):
+    local_vqa_schema_paths: Sequence[str] = tyro.MISSING
+
+    @override
+    def create(self, assets_dirs: pathlib.Path, model_config: _model.BaseModelConfig) -> DataConfig:
+        data_transforms = _transforms.Group(
+            inputs=[
+                vqa_policy.VQAInputs(
+                    action_dim=model_config.action_dim,
+                    action_horizon=model_config.action_horizon,
+                )
+            ]
+        )
+        model_transforms = ModelTransformFactory()(model_config)
+        return dataclasses.replace(
+            self.create_base_config(assets_dirs, model_config),
+            dataset_type="local_vqa_schema",
+            requires_norm_stats=False,
+            data_transforms=data_transforms,
+            model_transforms=model_transforms,
+            use_quantile_norm=False,
+            local_vqa_schema_paths=self.local_vqa_schema_paths,
+        )
+
+
+@dataclasses.dataclass(frozen=True)
+class RoboInterVQADataConfig(DataConfigFactory):
+    local_vqa_root: str = tyro.MISSING
+    robointer_annotation_paths: Sequence[str] = tyro.MISSING
+    robointer_max_samples_per_annotation: int | None = None
+
+    @override
+    def create(self, assets_dirs: pathlib.Path, model_config: _model.BaseModelConfig) -> DataConfig:
+        data_transforms = _transforms.Group(
+            inputs=[
+                vqa_policy.VQAInputs(
+                    action_dim=model_config.action_dim,
+                    action_horizon=model_config.action_horizon,
+                )
+            ]
+        )
+        model_transforms = ModelTransformFactory()(model_config)
+        return dataclasses.replace(
+            self.create_base_config(assets_dirs, model_config),
+            dataset_type="robointer_vqa",
+            requires_norm_stats=False,
+            data_transforms=data_transforms,
+            model_transforms=model_transforms,
+            use_quantile_norm=False,
+            local_vqa_root=self.local_vqa_root,
+            robointer_annotation_paths=self.robointer_annotation_paths,
+            robointer_max_samples_per_annotation=self.robointer_max_samples_per_annotation,
+        )
 
 
 @dataclasses.dataclass(frozen=True)
@@ -356,6 +474,7 @@ class LeRobotB1KDataConfig(DataConfigFactory):
 
         return dataclasses.replace(
             self.create_base_config(assets_dirs, model_config),
+            dataset_type="behavior",
             repack_transforms=repack_transform,
             data_transforms=data_transforms,
             model_transforms=model_transforms,
@@ -435,6 +554,7 @@ class LeRobotB1KRGBDDataConfig(DataConfigFactory):
 
         return dataclasses.replace(
             self.create_base_config(assets_dirs, model_config),
+            dataset_type="behavior",
             repack_transforms=repack_transform,
             data_transforms=data_transforms,
             model_transforms=model_transforms,
@@ -510,6 +630,7 @@ class LeRobotB1KRGBSegmentationDataConfig(DataConfigFactory):
 
         return dataclasses.replace(
             self.create_base_config(assets_dirs, model_config),
+            dataset_type="behavior",
             repack_transforms=repack_transform,
             data_transforms=data_transforms,
             model_transforms=model_transforms,
@@ -561,6 +682,10 @@ class TrainConfig:
     # sample weights for each data config
     sample_weights: list[float] | None = None
 
+    # When True, WeightedBatchSampler mixes samples from multiple dataset sources
+    # within each batch (proportional to sample_weights) for more stable gradients.
+    mix_sources: bool = False
+
     # Base directory for config assets (e.g., norm stats).
     assets_base_dir: str = "./outputs/assets/train"
 
@@ -571,6 +696,9 @@ class TrainConfig:
     seed: int = 42
     # Global batch size.
     batch_size: int = 32
+    # Number of micro-steps to accumulate gradients before applying an optimizer update.
+    # Effective batch size = batch_size, micro batch size = batch_size / gradient_accumulation_steps.
+    gradient_accumulation_steps: int = 1
     # Number of workers to use for the data loader. Increasing this number will speed up data loading but
     # will increase memory and CPU usage.
     num_workers: int = 2
@@ -581,6 +709,9 @@ class TrainConfig:
     log_interval: int = 100
     # How often (in steps) to save checkpoints.
     save_interval: int = 5000
+    # If false, do not save a checkpoint at the final step (useful for smoke tests or disk-limited runs).
+    # Note: periodic saves still happen when save_interval > 0.
+    save_final_checkpoint: bool = True
     # If set, any existing checkpoints matching step % keep_period == 0 will not be deleted.
     keep_period: int | None = 5000
 
@@ -908,15 +1039,20 @@ _CONFIGS = [
         model=pi0_config.Pi0Config(pi05=True, action_horizon=32, knowledge_insulation=True),
         data=LeRobotB1KDataConfig(
             repo_id="behavior-1k/2025-challenge-demos",
+            assets=AssetsConfig(
+                assets_dir="/vepfs-C/model_pretrained/pi/pi05_base/assets"
+            ),
             base_config=DataConfig(
                 prompt_from_task=True,
-                behavior_dataset_root="../DATASETS/behavior/2025-challenge-demos",
+                behavior_dataset_root="/vepfs-C/dataset/Behavior-1k",
                 # Train/val split: these are PER-TASK positional episode indices (not global episode ids).
                 episodes_index=list(range(0, 180)),
                 fine_grained_level=1,  # 0, 1, 2
             ),
         ),
-        weight_loader=weight_loaders.CheckpointWeightLoader("/root/Models/pi05_base/params"),
+        weight_loader=weight_loaders.CheckpointWeightLoader(
+            "/vepfs-C/model_pretrained/pi/pi05_base/params"
+        ),
         num_train_steps=50_000,
         lr_schedule=_optimizer.CosineDecaySchedule(
             peak_lr=2.5e-5,
@@ -935,6 +1071,248 @@ _CONFIGS = [
         ema_decay=None,
         checkpoint_base_dir="./outputs/checkpoints/pi05_b1k-ki-all_skills",
         num_workers=8,
+        batch_size=8 * 32,
+    ),
+    TrainConfig(
+        name="pi05_b1k-knowledge_insulation-vqa-joint",
+        exp_name="openpi_knowledge_insulation-vqa-joint",
+        project_name="B1K",
+        model=pi0_config.Pi0Config(
+            pi05=True,
+            action_horizon=32,
+            knowledge_insulation=True,
+            fast_loss_weight=1.0,
+            flow_loss_weight=1.0,
+            vqa_loss_weight=1.0,
+        ),
+        data=[
+            LeRobotB1KDataConfig(
+                repo_id="behavior-1k/2025-challenge-demos",
+                assets=AssetsConfig(
+                    assets_dir="/vepfs-C/model_pretrained/pi/pi05_base/assets"
+                ),
+                base_config=DataConfig(
+                    prompt_from_task=True,
+                    behavior_dataset_root="/vepfs-C/dataset/Behavior-1k",
+                    episodes_index=list(range(0, 180)),
+                    fine_grained_level=1,
+                ),
+            ),
+            RoboInterVQADataConfig(
+                repo_id="RoboInter-VQA",
+                local_vqa_root="/vepfs-C/dataset/RoboInter-VQA",
+                robointer_annotation_paths=(
+                    "Task_planning/meta/train/manipvqa/task_planning.json",
+                    "Understanding/meta/train/droid/contact_decide.json",
+                    "Understanding/meta/train/droid/grounding_choice.json",
+                    "Understanding/meta/train/droid/traj_choice.json",
+                    "Understanding/meta/train/droid/traj_direction_choice.json",
+                    "Understanding/meta/train/droid/trajlang_choice.json",
+                    "Understanding/meta/train/rh20t/contact_decide.json",
+                    "Understanding/meta/train/rh20t/grasppose_choice.json",
+                    "Understanding/meta/train/rh20t/grounding_choice.json",
+                    "Understanding/meta/train/rh20t/traj_choice.json",
+                    "Understanding/meta/train/rh20t/traj_direction_choice.json",
+                    "Understanding/meta/train/rh20t/trajlang_choice.json",
+                    "Generation/meta/train/droid/smart_resize_format/full_single_multi_contact_obj_contact_box_qa.json",
+                    "Generation/meta/train/droid/smart_resize_format/full_single_multi_contact_obj_contact_point_qa.json",
+                    "Generation/meta/train/droid/smart_resize_format/full_single_multi_contact_obj_current_box_qa.json",
+                    "Generation/meta/train/droid/smart_resize_format/full_single_multi_contact_obj_final_box_qa.json",
+                    "Generation/meta/train/droid/smart_resize_format/full_single_multi_contact_obj_gripper_det_qa.json",
+                    "Generation/meta/train/droid/smart_resize_format/full_single_multi_contact_obj_traj_qa.json",
+                    "Generation/meta/train/droid/smart_resize_format/full_single_multi_contact_obj_traj_qa_wo_init_pos.json",
+                    "Generation/meta/train/rh20t/smart_resize_format/full_single_multi_contact_obj_contact_box_qa.json",
+                    "Generation/meta/train/rh20t/smart_resize_format/full_single_multi_contact_obj_contact_point_qa.json",
+                    "Generation/meta/train/rh20t/smart_resize_format/full_single_multi_contact_obj_current_box_qa.json",
+                    "Generation/meta/train/rh20t/smart_resize_format/full_single_multi_contact_obj_final_box_qa.json",
+                    "Generation/meta/train/rh20t/smart_resize_format/full_single_multi_contact_obj_gripper_det_qa.json",
+                    "Generation/meta/train/rh20t/smart_resize_format/full_single_multi_contact_obj_traj_qa.json",
+                    "Generation/meta/train/rh20t/smart_resize_format/full_single_multi_contact_obj_traj_qa_wo_init_pos.json",
+                ),
+                base_config=DataConfig(prompt_from_task=False),
+            ),
+        ],
+        sample_weights=[0.85, 0.15],
+        weight_loader=weight_loaders.CheckpointWeightLoader(
+            "/vepfs-C/model_pretrained/pi/pi05_base/params"
+        ),
+        num_train_steps=50_000,
+        lr_schedule=_optimizer.CosineDecaySchedule(
+            peak_lr=2.5e-5,
+            decay_steps=50_000,
+        ),
+        log_interval=100,
+        save_interval=5000,
+        val_log_interval=100,
+        val_num_batches=10,
+        val_batch_size=2 * 32,
+        val_episodes_index=list(range(180, 200)),
+        freeze_filter=pi0_config.Pi0Config(
+            pi05=True,
+            action_horizon=32,
+            knowledge_insulation=True,
+        ).get_freeze_filter(),
+        ema_decay=None,
+        checkpoint_base_dir="./outputs/checkpoints/pi05_b1k-ki-vqa-joint",
+        num_workers=8,
+        batch_size=8 * 32,
+    ),
+    TrainConfig(
+        name="pi05_b1k-knowledge_insulation-vqa-joint-skill-pick-up-from",
+        exp_name="openpi_knowledge_insulation-vqa-joint-pick-up-from",
+        project_name="B1K",
+        model=pi0_config.Pi0Config(
+            pi05=True,
+            action_horizon=32,
+            knowledge_insulation=True,
+            fast_loss_weight=1.0,
+            flow_loss_weight=1.0,
+            vqa_loss_weight=1.0,
+        ),
+        data=[
+            LeRobotB1KDataConfig(
+                repo_id="behavior-1k/2025-challenge-demos",
+                assets=AssetsConfig(
+                    assets_dir="/vepfs-C/model_pretrained/pi/pi05_base/assets"
+                ),
+                base_config=DataConfig(
+                    prompt_from_task=True,
+                    behavior_dataset_root="/vepfs-C/dataset/Behavior-1k",
+                    episodes_index=list(range(0, 180)),
+                    fine_grained_level=1,
+                    skill_list=["pick up from"],
+                ),
+            ),
+            RoboInterVQADataConfig(
+                repo_id="RoboInter-VQA",
+                local_vqa_root="/vepfs-C/dataset/RoboInter-VQA",
+                robointer_annotation_paths=(
+                    "Task_planning/meta/train/manipvqa/task_planning.json",
+                    "Understanding/meta/train/droid/contact_decide.json",
+                    "Understanding/meta/train/droid/grounding_choice.json",
+                    "Understanding/meta/train/droid/traj_choice.json",
+                    "Understanding/meta/train/droid/traj_direction_choice.json",
+                    "Understanding/meta/train/droid/trajlang_choice.json",
+                    "Understanding/meta/train/rh20t/contact_decide.json",
+                    "Understanding/meta/train/rh20t/grasppose_choice.json",
+                    "Understanding/meta/train/rh20t/grounding_choice.json",
+                    "Understanding/meta/train/rh20t/traj_choice.json",
+                    "Understanding/meta/train/rh20t/traj_direction_choice.json",
+                    "Understanding/meta/train/rh20t/trajlang_choice.json",
+                    "Generation/meta/train/droid/smart_resize_format/full_single_multi_contact_obj_contact_box_qa.json",
+                    "Generation/meta/train/droid/smart_resize_format/full_single_multi_contact_obj_contact_point_qa.json",
+                    "Generation/meta/train/droid/smart_resize_format/full_single_multi_contact_obj_current_box_qa.json",
+                    "Generation/meta/train/droid/smart_resize_format/full_single_multi_contact_obj_final_box_qa.json",
+                    "Generation/meta/train/droid/smart_resize_format/full_single_multi_contact_obj_gripper_det_qa.json",
+                    "Generation/meta/train/droid/smart_resize_format/full_single_multi_contact_obj_traj_qa.json",
+                    "Generation/meta/train/droid/smart_resize_format/full_single_multi_contact_obj_traj_qa_wo_init_pos.json",
+                    "Generation/meta/train/rh20t/smart_resize_format/full_single_multi_contact_obj_contact_box_qa.json",
+                    "Generation/meta/train/rh20t/smart_resize_format/full_single_multi_contact_obj_contact_point_qa.json",
+                    "Generation/meta/train/rh20t/smart_resize_format/full_single_multi_contact_obj_current_box_qa.json",
+                    "Generation/meta/train/rh20t/smart_resize_format/full_single_multi_contact_obj_final_box_qa.json",
+                    "Generation/meta/train/rh20t/smart_resize_format/full_single_multi_contact_obj_gripper_det_qa.json",
+                    "Generation/meta/train/rh20t/smart_resize_format/full_single_multi_contact_obj_traj_qa.json",
+                    "Generation/meta/train/rh20t/smart_resize_format/full_single_multi_contact_obj_traj_qa_wo_init_pos.json",
+                ),
+                base_config=DataConfig(prompt_from_task=False),
+            ),
+        ],
+        sample_weights=[0.85, 0.15],
+        weight_loader=weight_loaders.CheckpointWeightLoader(
+            "/vepfs-C/model_pretrained/pi/pi05_base/params"
+        ),
+        num_train_steps=50_000,
+        lr_schedule=_optimizer.CosineDecaySchedule(
+            peak_lr=2.5e-5,
+            decay_steps=50_000,
+        ),
+        log_interval=100,
+        save_interval=5000,
+        val_log_interval=100,
+        val_num_batches=10,
+        val_batch_size=2 * 32,
+        val_episodes_index=list(range(180, 200)),
+        freeze_filter=pi0_config.Pi0Config(
+            pi05=True,
+            action_horizon=32,
+            knowledge_insulation=True,
+        ).get_freeze_filter(),
+        ema_decay=None,
+        checkpoint_base_dir="./outputs/checkpoints/pi05_b1k-ki-vqa-joint-pick-up-from",
+        num_workers=8,
+        batch_size=8 * 32,
+    ),
+    TrainConfig(
+        name="pi05_b1k-knowledge_insulation-vqa-joint-skill-pick-up-from-no-task-planning",
+        exp_name="openpi_knowledge_insulation-vqa-joint-pick-up-from-no-task-planning",
+        project_name="B1K",
+        model=pi0_config.Pi0Config(
+            pi05=True,
+            action_horizon=32,
+            knowledge_insulation=True,
+            fast_loss_weight=1.0,
+            flow_loss_weight=1.0,
+            vqa_loss_weight=1.0,
+        ),
+        data=[
+            LeRobotB1KDataConfig(
+                repo_id="behavior-1k/2025-challenge-demos",
+                assets=AssetsConfig(
+                    assets_dir="/vepfs-C/model_pretrained/pi/pi05_base/assets"
+                ),
+                base_config=DataConfig(
+                    prompt_from_task=True,
+                    behavior_dataset_root="/vepfs-C/dataset/Behavior-1k",
+                    episodes_index=list(range(0, 180)),
+                    fine_grained_level=1,
+                    skill_list=["pick up from"],
+                ),
+            ),
+            RoboInterVQADataConfig(
+                repo_id="RoboInter-VQA",
+                local_vqa_root="/vepfs-C/dataset/RoboInter-VQA",
+                robointer_annotation_paths=(
+                    "Understanding/meta/train/rh20t/contact_decide.json",
+                    "Understanding/meta/train/rh20t/grasppose_choice.json",
+                    "Understanding/meta/train/rh20t/grounding_choice.json",
+                    "Understanding/meta/train/rh20t/traj_choice.json",
+                    "Understanding/meta/train/rh20t/traj_direction_choice.json",
+                    "Understanding/meta/train/rh20t/trajlang_choice.json",
+                    "Generation/meta/train/droid/smart_resize_format/full_single_multi_contact_obj_contact_box_qa.json",
+                    "Generation/meta/train/droid/smart_resize_format/full_single_multi_contact_obj_contact_point_qa.json",
+                    "Generation/meta/train/droid/smart_resize_format/full_single_multi_contact_obj_current_box_qa.json",
+                    "Generation/meta/train/droid/smart_resize_format/full_single_multi_contact_obj_final_box_qa.json",
+                    "Generation/meta/train/droid/smart_resize_format/full_single_multi_contact_obj_gripper_det_qa.json",
+                    "Generation/meta/train/droid/smart_resize_format/full_single_multi_contact_obj_traj_qa.json",
+                    "Generation/meta/train/droid/smart_resize_format/full_single_multi_contact_obj_traj_qa_wo_init_pos.json",
+                ),
+                base_config=DataConfig(prompt_from_task=False),
+            ),
+        ],
+        sample_weights=[0.85, 0.15],
+        weight_loader=weight_loaders.CheckpointWeightLoader(
+            "/vepfs-C/model_pretrained/pi/pi05_base/params"
+        ),
+        num_train_steps=50_000,
+        lr_schedule=_optimizer.CosineDecaySchedule(
+            peak_lr=2.5e-5,
+            decay_steps=50_000,
+            decay_lr=2.5e-5
+        ),
+        log_interval=100,
+        save_interval=5000,
+        val_log_interval=100,
+        val_num_batches=10,
+        val_batch_size=2 * 32,
+        val_episodes_index=list(range(180, 200)),
+        freeze_filter=pi0_config.Pi0Config(
+            pi05=True,
+            action_horizon=32,
+            knowledge_insulation=True,
+        ).get_freeze_filter(),
+        ema_decay=None,
+        checkpoint_base_dir="./outputs/checkpoints/pi05_b1k-ki-vqa-joint-pick-up-from-no-task-planning",
+        num_workers=16,
         batch_size=8 * 32,
     ),
     # 3. RFT Configs

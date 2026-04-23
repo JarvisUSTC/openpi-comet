@@ -1,6 +1,7 @@
 import bisect
 from collections import defaultdict
 from collections.abc import Callable, Iterable
+import hashlib
 import json
 import os
 from pathlib import Path
@@ -9,6 +10,7 @@ import re
 
 import datasets
 from datasets import load_dataset
+from filelock import FileLock
 from huggingface_hub import snapshot_download
 from lerobot.constants import HF_LEROBOT_HOME
 from lerobot.datasets.lerobot_dataset import CODEBASE_VERSION
@@ -40,6 +42,8 @@ from omnigibson.learning.utils.lerobot_utils import hf_transform_to_torch
 from omnigibson.learning.utils.obs_utils import OBS_LOADER_MAP
 from omnigibson.learning.utils.obs_utils import instance_id_to_instance
 from omnigibson.utils.ui_utils import create_module_logger
+from openpi.shared.download import get_behavior_cache_dir
+from openpi.shared.download import get_hf_datasets_cache_dir
 import packaging.version
 import torch as th
 from torch.utils.data import Dataset
@@ -54,6 +58,45 @@ _SKILL_PREP_PATTERNS = [
     (" from", 5), (" on", 3), (" in", 3), (" into", 5), (" onto", 5),
     (" under", 6), (" to", 3), (" off", 4), (" with", 5),
 ]
+
+
+def _stable_hash(payload: object) -> str:
+    return hashlib.sha256(json.dumps(payload, sort_keys=True, separators=(",", ":")).encode("utf-8")).hexdigest()
+
+
+def _read_chunk_cache(cache_path: Path, expected_key: dict) -> list[tuple[int, int, int]] | None:
+    if not cache_path.exists():
+        return None
+    lock = FileLock(str(cache_path) + ".lock")
+    with lock:
+        try:
+            with cache_path.open() as f:
+                payload = json.load(f)
+        except (OSError, json.JSONDecodeError):
+            return None
+    if payload.get("cache_key") != expected_key:
+        return None
+    chunks = payload.get("chunks")
+    if not isinstance(chunks, list):
+        return None
+    try:
+        return [tuple(int(v) for v in chunk) for chunk in chunks]
+    except (TypeError, ValueError):
+        return None
+
+
+def _write_chunk_cache(cache_path: Path, cache_key: dict, chunks: list[tuple[int, int, int]]) -> None:
+    cache_path.parent.mkdir(parents=True, exist_ok=True)
+    payload = {
+        "cache_key": cache_key,
+        "chunks": [list(chunk) for chunk in chunks],
+    }
+    lock = FileLock(str(cache_path) + ".lock")
+    with lock:
+        tmp_path = cache_path.with_suffix(cache_path.suffix + ".tmp")
+        with tmp_path.open("w") as f:
+            json.dump(payload, f)
+        os.replace(tmp_path, cache_path)
 
 
 def _sanitize_object_name(obj_id: str) -> str:
@@ -122,6 +165,20 @@ def format_skill_prompt(skill_item: dict) -> str:
     return f"{skill_desc} {' '.join(objs_clean)}".strip()
 
 
+def canonical_skill_name(skill_item: dict) -> str:
+    raw = skill_item.get("skill_description")
+    if isinstance(raw, list):
+        return str((raw or [""])[0]).strip()
+    return str(raw).strip() if raw else ""
+
+
+def assembled_subtask_prompt(skill_item: dict) -> str:
+    assembled = skill_item.get("assembled_subtask")
+    if isinstance(assembled, str) and assembled.strip():
+        return assembled.strip()
+    return format_skill_prompt(skill_item)
+
+
 def build_orchestrator_levels_from_annotations(
     episode_key: int,
     episode_len: int,
@@ -131,7 +188,8 @@ def build_orchestrator_levels_from_annotations(
     """
     Build orchestrator levels 0, 1, 2 from skill_annotation when no orchestrator files exist.
     - level 0: one segment, whole episode, level_0_task.
-    - level 1 & 2: one segment per skill; task text = format_skill_prompt(skill).
+    - level 1: one segment per skill; task text = assembled_subtask when available.
+    - level 2: one segment per skill; task text = formatted canonical skill prompt.
     Uses frame_duration [start, end] per skill if present (end exclusive); else equal split.
     """
     output_data = defaultdict(list)
@@ -162,7 +220,9 @@ def build_orchestrator_levels_from_annotations(
 
     n = len(skill_annotation)
     for i, s in enumerate(skill_annotation):
-        task_text = format_skill_prompt(s)
+        skill_name = canonical_skill_name(s)
+        level_1_text = assembled_subtask_prompt(s)
+        level_2_text = format_skill_prompt(s)
         parsed = _parse_frame_duration(s.get("frame_duration")) if "frame_duration" in s else None
         if parsed is not None:
             start_f, end_f = parsed
@@ -172,12 +232,14 @@ def build_orchestrator_levels_from_annotations(
             start_frame = (i * episode_len) // n
             end_frame = ((i + 1) * episode_len - 1) // n if i < n - 1 else episode_len - 1
         output_data[1].append({
-            "task": task_text,
+            "task": level_1_text,
+            "skill_name": skill_name,
             "start_frame": start_frame,
             "end_frame": end_frame,
         })
         output_data[2].append({
-            "task": task_text,
+            "task": level_2_text,
+            "skill_name": skill_name,
             "start_frame": start_frame,
             "end_frame": end_frame,
         })
@@ -225,6 +287,7 @@ class BehaviorLeRobotDataset(LeRobotDataset):
         train_rgb_type: str = "regular",  # regular | bbox | point
         return_seg_instance: bool = False,
         skill_list: list[str] = ["all"],
+        hf_cache_dir: str | None = None,
     ):
         """
         Custom args:
@@ -269,12 +332,23 @@ class BehaviorLeRobotDataset(LeRobotDataset):
         self.return_seg_instance = return_seg_instance
         self.train_rgb_type = train_rgb_type
         self.skill_list = skill_list
+        self._stream_shuffle = shuffle
+        self._stream_epoch = 0
+        self._strict_skill_whitelist = "all" not in skill_list and len(skill_list) > 0
+        self._skill_whitelist = {
+            item.rsplit(":", 1)[0].strip() if ":" in item else item.strip()
+            for item in skill_list
+            if item.strip() and item.strip() != "all"
+        }
 
         # Unused attributes
         self.image_writer = None
         self.episode_buffer = None
 
         self.root.mkdir(exist_ok=True, parents=True)
+        self._hf_dataset_cache_dir = Path(hf_cache_dir).expanduser().resolve() if hf_cache_dir else get_hf_datasets_cache_dir()
+        self._index_cache_dir = get_behavior_cache_dir(self.root) / "chunks"
+        self._index_cache_dir.mkdir(parents=True, exist_ok=True)
 
         # ========== Customizations ==========
         self.seed = seed
@@ -315,6 +389,13 @@ class BehaviorLeRobotDataset(LeRobotDataset):
                 epi_by_task[task_id] = [epi_by_task[task_id][i] for i in episodes if i < len(epi_by_task[task_id])]
         # now put episodes back together
         self.episodes = sorted([ep for eps in epi_by_task.values() for ep in eps])
+        episode_lengths = {ep_idx: self.meta.episodes[ep_idx]["length"] for ep_idx in self.episodes}
+        self._episode_global_ranges = {}
+        offset = 0
+        for ep_idx in self.episodes:
+            length = episode_lengths[ep_idx]
+            self._episode_global_ranges[ep_idx] = (offset, offset + length)
+            offset += length
         # handle streaming mode and shuffling of episodes
         self._chunk_streaming_using_keyframe = chunk_streaming_using_keyframe
         if self._chunk_streaming_using_keyframe:
@@ -370,6 +451,12 @@ class BehaviorLeRobotDataset(LeRobotDataset):
             self.delta_indices = get_delta_indices(self.delta_timestamps, self.fps)
 
         self.prepare_task(fine_grained_level)
+        if self._chunk_streaming_using_keyframe:
+            self.chunks = self._filter_chunks_by_skill_list(self.chunks)
+            if not self.chunks:
+                raise ValueError("No chunks available for streaming after skill filtering.")
+            self.current_streaming_chunk_idx = None if self._stream_shuffle else 0
+            self.current_streaming_frame_idx = None if self._stream_shuffle else self.chunks[0][0]
 
         self.omnigibson_mapping = {ep_idx: defaultdict(dict) for ep_idx in self.episodes}
 
@@ -386,6 +473,114 @@ class BehaviorLeRobotDataset(LeRobotDataset):
             print(f"[warn] {self.repo_id} failed to calculate episode subtask cumulate: {e}")
 
         print(f"prepare task with fine_grained_level {self.fine_grained_level} for {self.root}")
+
+    def _episode_lengths_for_selection(self) -> list[int]:
+        episode_lengths = {ep_idx: self.meta.episodes[ep_idx]["length"] for ep_idx in self.episodes}
+        return [int(episode_lengths[ep_idx]) for ep_idx in self.episodes]
+
+    def _orchestrator_digest(self, level: int) -> str:
+        hasher = hashlib.sha256()
+        for ep_idx in self.episodes:
+            hasher.update(f"{ep_idx}|".encode("utf-8"))
+            for segment in self.meta.orchestrators.get(ep_idx, {}).get(level, []):
+                hasher.update(
+                    (
+                        f"{segment.get('start_frame', -1)}|{segment.get('end_frame', -1)}|"
+                        f"{segment.get('skill_name', '')}|{segment.get('task', '')}\n"
+                    ).encode("utf-8")
+                )
+        return hasher.hexdigest()
+
+    def _chunk_cache_path(self, kind: str, cache_key: dict) -> Path:
+        return self._index_cache_dir / f"{kind}-{_stable_hash(cache_key)[:16]}.json"
+
+    def _reset_active_chunks(self, worker_id: int, num_workers: int) -> None:
+        indices = list(range(worker_id, len(self.chunks), num_workers))
+        worker_chunks = [self.chunks[i] for i in indices]
+        if self._stream_shuffle:
+            rng = np.random.default_rng(self.seed + worker_id + self._stream_epoch * 9973)
+            rng.shuffle(worker_chunks)
+        self._active_chunks = worker_chunks
+        self.current_streaming_chunk_idx = 0
+        self.current_streaming_frame_idx = (
+            self._active_chunks[0][0] if self._active_chunks else None
+        )
+
+    def _chunk_episode_index(self, global_start: int) -> int | None:
+        for ep_idx, (ep_start, ep_end) in self._episode_global_ranges.items():
+            if ep_start <= global_start < ep_end:
+                return ep_idx
+        return None
+
+    def _frame_skill_name(self, ep_idx: int, frame_index: int) -> str | None:
+        try:
+            segments = self.meta.orchestrators[ep_idx][1]
+            end_frames = [segment["end_frame"] for segment in segments]
+            sub_idx = bisect.bisect_right(end_frames, frame_index, hi=len(end_frames) - 1)
+            segment = segments[sub_idx]
+            return segment.get("skill_name", segment.get("task"))
+        except Exception:
+            return None
+
+    def _frame_matches_skill_whitelist(self, ep_idx: int, frame_index: int) -> bool:
+        if not self._strict_skill_whitelist:
+            return True
+        skill_name = self._frame_skill_name(ep_idx, frame_index)
+        return skill_name in self._skill_whitelist
+
+    def _chunk_overlaps_whitelisted_skill(self, chunk: tuple[int, int, int]) -> bool:
+        if not self._strict_skill_whitelist:
+            return True
+        global_start, global_end, _local_start = chunk
+        ep_idx = self._chunk_episode_index(global_start)
+        if ep_idx is None:
+            return False
+        ep_global_start, _ep_global_end = self._episode_global_ranges[ep_idx]
+        chunk_start = global_start - ep_global_start
+        chunk_end = global_end - ep_global_start - 1
+        for segment in self.meta.orchestrators.get(ep_idx, {}).get(1, []):
+            skill_name = segment.get("skill_name", segment.get("task"))
+            if skill_name not in self._skill_whitelist:
+                continue
+            if segment["start_frame"] <= chunk_end and chunk_start <= segment["end_frame"]:
+                return True
+        return False
+
+    def _filter_chunks_by_skill_list(self, chunks: list[tuple[int, int, int]]) -> list[tuple[int, int, int]]:
+        if not self._strict_skill_whitelist:
+            return chunks
+        cache_key = {
+            "repo_id": self.repo_id,
+            "root": str(self.root.resolve()),
+            "revision": str(self.revision),
+            "episodes": self.episodes,
+            "fine_grained_level": self.fine_grained_level,
+            "skill_whitelist": sorted(self._skill_whitelist),
+            "chunks_digest": _stable_hash(chunks),
+            "orchestrator_digest": self._orchestrator_digest(1),
+        }
+        cache_path = self._chunk_cache_path("skill-filtered", cache_key)
+        if filtered := _read_chunk_cache(cache_path, cache_key):
+            logger.info(
+                "Loaded filtered chunks from cache %s: kept %s / %s chunks for skills=%s",
+                cache_path,
+                len(filtered),
+                len(chunks),
+                sorted(self._skill_whitelist),
+            )
+            return filtered
+
+        filtered = [chunk for chunk in chunks if self._chunk_overlaps_whitelisted_skill(chunk)]
+        if not filtered:
+            raise ValueError(f"No chunks matched skill whitelist: {sorted(self._skill_whitelist)}")
+        _write_chunk_cache(cache_path, cache_key, filtered)
+        logger.info(
+            "Filtered chunks by skill whitelist: kept %s / %s chunks for skills=%s",
+            len(filtered),
+            len(chunks),
+            sorted(self._skill_whitelist),
+        )
+        return filtered
 
     def get_episodes_file_paths(self) -> list[str]:
         """
@@ -461,10 +656,10 @@ class BehaviorLeRobotDataset(LeRobotDataset):
         """hf_dataset contains all the observations, states, actions, rewards, etc."""
         if self.episodes is None:
             path = str(self.root / "data")
-            hf_dataset = load_dataset("parquet", data_dir=path, split="train")
+            hf_dataset = load_dataset("parquet", data_dir=path, split="train", cache_dir=str(self._hf_dataset_cache_dir))
         else:
             files = [str(self.root / self.meta.get_data_file_path(ep_idx)) for ep_idx in self.episodes]
-            hf_dataset = load_dataset("parquet", data_files=files, split="train")
+            hf_dataset = load_dataset("parquet", data_files=files, split="train", cache_dir=str(self._hf_dataset_cache_dir))
 
         hf_dataset.set_transform(hf_transform_to_torch)
         return hf_dataset
@@ -486,21 +681,21 @@ class BehaviorLeRobotDataset(LeRobotDataset):
             worker_info = get_worker_info()
             worker_id = 0 if worker_info is None else worker_info.id
             num_workers = 1 if worker_info is None else worker_info.num_workers
-            if not hasattr(self, "_active_chunks") or self._active_chunks is None:
-                indices = list(range(worker_id, len(self.chunks), num_workers))
-                worker_chunks = [self.chunks[i] for i in indices]
-                rng = np.random.default_rng(self.seed + worker_id)
-                rng.shuffle(worker_chunks)
-                self._active_chunks = worker_chunks
-            rng = np.random.default_rng(self.seed + worker_id)
-            self.current_streaming_chunk_idx = rng.integers(0, len(self._active_chunks)).item()
-            self.current_streaming_frame_idx = self._active_chunks[self.current_streaming_chunk_idx][0]
+            self._reset_active_chunks(worker_id, num_workers)
         # Current chunk iterated, move to next chunk
         if self.current_streaming_frame_idx >= self._active_chunks[self.current_streaming_chunk_idx][1]:
             self.current_streaming_chunk_idx += 1
             # All data iterated, restart from beginning
             if self.current_streaming_chunk_idx >= len(self._active_chunks):
-                self.current_streaming_chunk_idx = 0
+                worker_info = get_worker_info()
+                worker_id = 0 if worker_info is None else worker_info.id
+                num_workers = 1 if worker_info is None else worker_info.num_workers
+                self._stream_epoch += 1
+                self._reset_active_chunks(worker_id, num_workers)
+                if not self._active_chunks:
+                    raise RuntimeError("No active chunks available after resetting chunk stream.")
+                self._should_obs_loaders_reload = True
+                return self.__getitem__(idx)
             self.current_streaming_frame_idx = self._active_chunks[self.current_streaming_chunk_idx][0]
             self._should_obs_loaders_reload = True
         item = self.hf_dataset[self.current_streaming_frame_idx]
@@ -556,9 +751,15 @@ class BehaviorLeRobotDataset(LeRobotDataset):
             for key, val in query_result.items():
                 item[key] = val
 
-        task_skill = self._get_current_task_skill(item)
+        frame_index = round(item["timestamp"].item() * self.fps)
+        task_skill = self._get_current_skill_name(item)
         weight = skill_weight(task_skill, self.skill_list)
-        if not random.choices([True, False], weights=[weight, 1 - weight])[0]:
+        if not self._frame_matches_skill_whitelist(ep_idx, frame_index):
+            self.current_streaming_frame_idx += 1
+            for key in self.meta.video_keys:
+                next(self.obs_loaders[key])[0]
+            return self.__getitem__(idx)
+        if weight < 1.0 and not random.choices([True, False], weights=[weight, 1 - weight])[0]:
             self.current_streaming_frame_idx += 1
             for key in self.meta.video_keys:
                 next(self.obs_loaders[key])[0]
@@ -604,12 +805,14 @@ class BehaviorLeRobotDataset(LeRobotDataset):
 
         return item
 
-    def _get_current_task_skill(self, item: dict) -> str:
+    def _get_current_skill_name(self, item: dict) -> str:
         ep_idx = item["episode_index"].item()
         frame_index = round(item["timestamp"].item() * self.fps)
-        sub_idx = bisect.bisect_right(self.task_sizes[ep_idx], frame_index, hi=len(self.task_sizes[ep_idx]) - 1)
-        task_skill = self.meta.orchestrators[ep_idx][1][sub_idx]["task"]
-        return task_skill
+        segments = self.meta.orchestrators[ep_idx][1]
+        end_frames = [segment["end_frame"] for segment in segments]
+        sub_idx = bisect.bisect_right(end_frames, frame_index, hi=len(end_frames) - 1)
+        segment = segments[sub_idx]
+        return segment.get("skill_name", segment.get("task"))
 
     def _get_fine_grained_task(self, item: dict) -> str:
         ep_idx = item["episode_index"].item()
@@ -723,8 +926,20 @@ class BehaviorLeRobotDataset(LeRobotDataset):
         Returns:
             List of tuples, where each tuple contains (start_index, end_index, local_start_index) for each chunk.
         """
-        episode_lengths = {ep_idx: ep_dict["length"] for ep_idx, ep_dict in self.meta.episodes.items()}
-        episode_lengths = [episode_lengths[ep_idx] for ep_idx in self.episodes]
+        episode_lengths = self._episode_lengths_for_selection()
+        cache_key = {
+            "repo_id": self.repo_id,
+            "root": str(self.root.resolve()),
+            "revision": str(self.revision),
+            "episodes": self.episodes,
+            "episode_lengths": episode_lengths,
+            "chunk_size": chunk_size,
+        }
+        cache_path = self._chunk_cache_path("keyframe-chunks", cache_key)
+        if chunks := _read_chunk_cache(cache_path, cache_key):
+            logger.info("Loaded %s keyframe chunks from cache %s", len(chunks), cache_path)
+            return chunks
+
         chunks = []
         offset = 0
         for L in episode_lengths:
@@ -733,6 +948,7 @@ class BehaviorLeRobotDataset(LeRobotDataset):
             for ls, le in zip(local_starts, local_ends):
                 chunks.append((offset + ls, offset + le, ls))
             offset += L
+        _write_chunk_cache(cache_path, cache_key, chunks)
         return chunks
 
 
@@ -943,6 +1159,7 @@ def load_orchestrators_data(episode_path_or_level_0_task, episode_len):
             output_data[1].append(
                 {
                     "task": skill,
+                    "skill_name": skill,
                     "start_frame": start_frame,
                     "end_frame": end_frame,
                 }
@@ -950,6 +1167,7 @@ def load_orchestrators_data(episode_path_or_level_0_task, episode_len):
             output_data[2].append(
                 {
                     "task": subtask,
+                    "skill_name": skill,
                     "start_frame": start_frame,
                     "end_frame": end_frame,
                 }
@@ -976,14 +1194,19 @@ def skill_weight(cur_skill, skill_list: list[str]) -> float:
     if "all" in skill_list:
         skill_list = [skill for skill in skill_list if skill != "all"]
         for skill_item in skill_list:
-            skill, weight = skill_item.split(":")
+            if ":" not in skill_item:
+                continue
+            skill, weight = skill_item.rsplit(":", 1)
             if skill == cur_skill:
                 return float(weight)
         return 1.0
     for skill_item in skill_list:
-        skill, weight = skill_item.split(":")
-        if skill == cur_skill:
-            return float(weight)
+        if ":" in skill_item:
+            skill, weight = skill_item.rsplit(":", 1)
+            if skill == cur_skill:
+                return float(weight)
+        elif skill_item == cur_skill:
+            return 1.0
     return 0.0
 
 

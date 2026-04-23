@@ -29,7 +29,9 @@ import logging
 import os
 import platform
 import shutil
+import statistics
 import time
+from contextlib import nullcontext
 
 import jax
 import numpy as np
@@ -559,16 +561,23 @@ def train_loop(config: _config.TrainConfig):
                     logging.exception("Failed to decode/log prompt at step=%s", global_step)
 
             # The unified data loader returns (observation, actions) tuple
-            observation = jax.tree.map(lambda x: x.to(device), observation)  # noqa: PLW2901
-            actions = actions.to(torch.float32)  # noqa: PLW2901
-            actions = actions.to(device)  # noqa: PLW2901
+            observation = jax.tree.map(lambda x: x.to(device, non_blocking=True), observation)  # noqa: PLW2901
+            actions = actions.to(device=device, dtype=torch.float32, non_blocking=True)  # noqa: PLW2901
 
             # Update LR
             for pg in optim.param_groups:
                 pg["lr"] = lr_schedule(global_step)
 
-            # Forward pass
-            losses = model(observation, actions)
+            use_amp = device.type == "cuda" and config.pytorch_training_precision == "bfloat16"
+            amp_ctx = (
+                torch.autocast(device_type="cuda", dtype=torch.bfloat16)
+                if use_amp
+                else nullcontext()
+            )
+
+            # Forward pass (bf16 autocast enables Tensor Cores on supported ops)
+            with amp_ctx:
+                losses = model(observation, actions)
             # Ensure losses is a tensor and handle different return types
             if isinstance(losses, list | tuple):
                 losses = torch.stack(losses)
@@ -590,12 +599,6 @@ def train_loop(config: _config.TrainConfig):
             # Optimizer step
             optim.step()
             optim.zero_grad(set_to_none=True)
-
-            # Clear gradients more aggressively
-            for param in model.parameters():
-                if param.grad is not None:
-                    param.grad.detach_()
-                    param.grad = None
 
             # Collect stats
             if is_main:
@@ -629,14 +632,37 @@ def train_loop(config: _config.TrainConfig):
 
                 # Log to wandb
                 if config.wandb_enabled and len(infos) > 0:
+                    n_log = len(infos)
+                    loss_vals = [float(x["loss"]) for x in infos]
+                    lr_vals = [float(x["learning_rate"]) for x in infos]
                     log_payload = {
                         "loss": avg_loss,
+                        "loss_std": statistics.pstdev(loss_vals) if n_log > 1 else 0.0,
+                        "loss_min": min(loss_vals),
+                        "loss_max": max(loss_vals),
                         "learning_rate": avg_lr,
+                        "learning_rate_std": statistics.pstdev(lr_vals) if n_log > 1 else 0.0,
+                        "learning_rate_min": min(lr_vals),
+                        "learning_rate_max": max(lr_vals),
                         "step": global_step,
-                        "time_per_step": elapsed / config.log_interval,
+                        "wall_time_per_step_ms": 1000.0 * elapsed / n_log,
+                        "throughput_samples_per_sec": (n_log * config.batch_size) / max(elapsed, 1e-9),
+                        "throughput_steps_per_sec": n_log / max(elapsed, 1e-9),
+                        "log_window_steps": float(n_log),
                     }
                     if avg_grad_norm is not None:
+                        gvals = [
+                            float(x["grad_norm"])
+                            for x in infos
+                            if "grad_norm" in x and x["grad_norm"] is not None
+                        ]
                         log_payload["grad_norm"] = avg_grad_norm
+                        if len(gvals) > 1:
+                            log_payload["grad_norm_std"] = statistics.pstdev(gvals)
+                        else:
+                            log_payload["grad_norm_std"] = 0.0
+                        log_payload["grad_norm_min"] = min(gvals)
+                        log_payload["grad_norm_max"] = max(gvals)
                     wandb.log(log_payload, step=global_step)
 
                 start_time = time.time()

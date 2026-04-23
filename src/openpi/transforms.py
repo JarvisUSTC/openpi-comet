@@ -352,13 +352,26 @@ class TokenizeFASTInputs(DataTransformFn):
         _debug_log_prompt(prompt)
 
         state, actions = data["state"], data.get("actions")
-        tokens, token_mask, ar_mask, loss_mask = self.tokenizer.tokenize(prompt, state, actions)
+        answer = data.pop("answer", None)
+        is_vqa = answer is not None
+        supervised_actions = None if is_vqa else actions
+        prompt_state = None if is_vqa else state
+        tokens, token_mask, ar_mask, loss_mask, flow_tokens, flow_token_mask = self.tokenizer.tokenize(
+            prompt,
+            prompt_state,
+            supervised_actions,
+            answer=answer.item() if isinstance(answer, np.ndarray) else answer,
+        )
         return {
             **data,
             "tokenized_prompt": tokens,
             "tokenized_prompt_mask": token_mask,
             "token_ar_mask": ar_mask,
             "token_loss_mask": loss_mask,
+            "flow_tokenized_prompt": flow_tokens,
+            "flow_tokenized_prompt_mask": flow_token_mask,
+            "flow_loss_mask": np.asarray(not is_vqa),
+            "is_vqa": np.asarray(is_vqa),
         }
 
 
