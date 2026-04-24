@@ -122,3 +122,17 @@ def test_fast_tokenizer_truncation_preserves_action_postfix():
     assert int(loss_masks.sum()) == len(postfix_tokens)
     assert tokens[-len(postfix_tokens) :].tolist() == postfix_tokens
     assert ar_masks[-len(postfix_tokens) :].all()
+
+
+def test_fast_tokenizer_truncation_aligns_flow_prefix_with_supervised_prefix():
+    tokenizer = _make_fast_tokenizer(max_len=64)
+    prompt = "x" * 500  # Force prefix overflow
+    state = np.zeros((64,), dtype=np.float32)
+    actions = np.zeros((3, 2), dtype=np.float32)
+
+    tokens, token_masks, _, loss_masks, flow_tokens, flow_masks = tokenizer.tokenize(prompt, state, actions)
+
+    kept_prefix = tokens[token_masks & ~loss_masks]
+    flow_prefix = flow_tokens[flow_masks]
+
+    assert flow_prefix.tolist() == kept_prefix.tolist()

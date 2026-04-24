@@ -103,8 +103,12 @@ class FASTTokenizer:
         prefix_tokens = self._tokenize_prefix(prompt, state)
         postfix_tokens = self._tokenize_postfix(actions=actions, answer=answer)
 
-        tokens, token_mask, ar_mask, loss_mask = self._pad_token_sequence(prefix_tokens + postfix_tokens, len(prefix_tokens))
-        flow_tokens, flow_token_mask = self._pad_flow_prefix(prefix_tokens)
+        tokens, token_mask, ar_mask, loss_mask, kept_prefix_tokens = self._pad_token_sequence(
+            prefix_tokens,
+            postfix_tokens,
+        )
+        # Keep the flow prefix exactly aligned with the prefix that survives supervised truncation.
+        flow_tokens, flow_token_mask = self._pad_flow_prefix(kept_prefix_tokens)
 
         return (
             tokens,
@@ -148,16 +152,19 @@ class FASTTokenizer:
 
     def _pad_token_sequence(
         self,
-        tokens: list[int],
-        prefix_len: int,
-    ) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
-        postfix_len = len(tokens) - prefix_len
+        prefix_tokens: list[int],
+        postfix_tokens: list[int],
+    ) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, list[int]]:
+        tokens = prefix_tokens + postfix_tokens
+        prefix_len = len(prefix_tokens)
+        postfix_len = len(postfix_tokens)
         token_mask = [True] * len(tokens)
         ar_mask = [0] * prefix_len + [1] * postfix_len
         loss_mask = [False] * prefix_len + [True] * postfix_len
 
         tokens_len = len(tokens)
         if tokens_len < self._max_len:
+            kept_prefix = list(prefix_tokens)
             padding = [False] * (self._max_len - tokens_len)
             tokens = tokens + padding
             token_mask = token_mask + padding
@@ -171,16 +178,15 @@ class FASTTokenizer:
                 )
             if postfix_len <= 0:
                 # No supervised postfix to preserve; fall back to simple truncation.
+                kept_prefix = tokens[: self._max_len]
                 tokens = tokens[: self._max_len]
                 token_mask = token_mask[: self._max_len]
                 ar_mask = ar_mask[: self._max_len]
                 loss_mask = loss_mask[: self._max_len]
             else:
                 # Preserve postfix (the supervised region) and truncate only the prefix portion.
-                prefix_tokens = tokens[:prefix_len]
-                postfix_tokens = tokens[prefix_len:]
-
                 if postfix_len >= self._max_len:
+                    kept_prefix = []
                     tokens = postfix_tokens[-self._max_len :]
                     token_mask = [True] * self._max_len
                     ar_mask = [1] * self._max_len
@@ -217,7 +223,7 @@ class FASTTokenizer:
                         ar_mask = ar_mask[: self._max_len]
                         loss_mask = loss_mask[: self._max_len]
 
-        return np.asarray(tokens), np.asarray(token_mask), np.asarray(ar_mask), np.asarray(loss_mask)
+        return np.asarray(tokens), np.asarray(token_mask), np.asarray(ar_mask), np.asarray(loss_mask), kept_prefix
 
     def _pad_flow_prefix(self, prefix_tokens: list[int]) -> tuple[np.ndarray, np.ndarray]:
         tokens = list(prefix_tokens)

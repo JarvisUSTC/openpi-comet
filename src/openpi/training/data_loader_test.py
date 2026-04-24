@@ -39,10 +39,11 @@ class _DummyDataset:
 
 
 def test_huggingface_vqa_dataset_uses_config_columns(monkeypatch):
-    def _fake_load_dataset(name, config_name, split):
+    def _fake_load_dataset(name, config_name, split, cache_dir=None):
         assert name == "dummy/vqa"
         assert config_name == "default"
         assert split == "train"
+        assert cache_dir is not None
         return [
             {
                 "image": "img0",

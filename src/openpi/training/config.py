@@ -1288,8 +1288,15 @@ _CONFIGS = [
                 ),
                 base_config=DataConfig(prompt_from_task=False),
             ),
+            LocalVQASchemaDataConfig(
+                repo_id="RobustVLGuard",
+                local_vqa_schema_paths=(
+                    "/vepfs-C/dataset/RobustVLGuard/Extracted/comprehensive_4k_openpi_schema.jsonl",
+                ),
+                base_config=DataConfig(prompt_from_task=False),
+            ),
         ],
-        sample_weights=[0.85, 0.15],
+        sample_weights=[0.85, 0.14, 0.01],
         weight_loader=weight_loaders.CheckpointWeightLoader(
             "/vepfs-C/model_pretrained/pi/pi05_base/params"
         ),
