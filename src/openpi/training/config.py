@@ -1322,6 +1322,86 @@ _CONFIGS = [
         num_workers=16,
         batch_size=8 * 32,
     ),
+    TrainConfig(
+        name="pi05_b1k-knowledge_insulation-vqa-joint-skill-place",
+        exp_name="openpi_knowledge_insulation-vqa-joint-place",
+        project_name="B1K",
+        model=pi0_config.Pi0Config(
+            pi05=True,
+            action_horizon=32,
+            knowledge_insulation=True,
+            fast_loss_weight=1.0,
+            flow_loss_weight=1.0,
+            vqa_loss_weight=1.0,
+        ),
+        data=[
+            LeRobotB1KDataConfig(
+                repo_id="behavior-1k/2025-challenge-demos",
+                assets=AssetsConfig(
+                    assets_dir="/vepfs-C/model_pretrained/pi/pi05_base/assets"
+                ),
+                base_config=DataConfig(
+                    prompt_from_task=True,
+                    behavior_dataset_root="/vepfs-C/dataset/Behavior-1k",
+                    episodes_index=list(range(0, 180)),
+                    fine_grained_level=1,
+                    skill_list=["place on", "place on next to", "place in", "place in next to", "place under"],
+                ),
+            ),
+            RoboInterVQADataConfig(
+                repo_id="RoboInter-VQA",
+                local_vqa_root="/vepfs-C/dataset/RoboInter-VQA",
+                robointer_annotation_paths=(
+                    "Understanding/meta/train/rh20t/contact_decide.json",
+                    "Understanding/meta/train/rh20t/grasppose_choice.json",
+                    "Understanding/meta/train/rh20t/grounding_choice.json",
+                    "Understanding/meta/train/rh20t/traj_choice.json",
+                    "Understanding/meta/train/rh20t/traj_direction_choice.json",
+                    "Understanding/meta/train/rh20t/trajlang_choice.json",
+                    "Generation/meta/train/droid/smart_resize_format/full_single_multi_contact_obj_contact_box_qa.json",
+                    "Generation/meta/train/droid/smart_resize_format/full_single_multi_contact_obj_contact_point_qa.json",
+                    "Generation/meta/train/droid/smart_resize_format/full_single_multi_contact_obj_current_box_qa.json",
+                    "Generation/meta/train/droid/smart_resize_format/full_single_multi_contact_obj_final_box_qa.json",
+                    "Generation/meta/train/droid/smart_resize_format/full_single_multi_contact_obj_gripper_det_qa.json",
+                    "Generation/meta/train/droid/smart_resize_format/full_single_multi_contact_obj_traj_qa.json",
+                    "Generation/meta/train/droid/smart_resize_format/full_single_multi_contact_obj_traj_qa_wo_init_pos.json",
+                ),
+                base_config=DataConfig(prompt_from_task=False),
+            ),
+            LocalVQASchemaDataConfig(
+                repo_id="RobustVLGuard",
+                local_vqa_schema_paths=(
+                    "/vepfs-C/dataset/RobustVLGuard/Extracted/comprehensive_4k_openpi_schema.jsonl",
+                ),
+                base_config=DataConfig(prompt_from_task=False),
+            ),
+        ],
+        sample_weights=[0.85, 0.14, 0.01],
+        weight_loader=weight_loaders.CheckpointWeightLoader(
+            "/vepfs-C/model_pretrained/pi/pi05_base/params"
+        ),
+        num_train_steps=250_000,
+        lr_schedule=_optimizer.CosineDecaySchedule(
+            peak_lr=2.5e-5,
+            decay_steps=250_000,
+            decay_lr=2.5e-5
+        ),
+        log_interval=100,
+        save_interval=5000,
+        val_log_interval=100,
+        val_num_batches=10,
+        val_batch_size=2 * 32,
+        val_episodes_index=list(range(180, 200)),
+        freeze_filter=pi0_config.Pi0Config(
+            pi05=True,
+            action_horizon=32,
+            knowledge_insulation=True,
+        ).get_freeze_filter(),
+        ema_decay=None,
+        checkpoint_base_dir="./outputs/checkpoints/pi05_b1k-ki-vqa-joint-place-no-task-planning",
+        num_workers=16,
+        batch_size=8 * 32,
+    ),
     # 3. RFT Configs
     TrainConfig(
         name="pi05_b1k-turning_on_radio_lr2.5e-6_step20k_rft",
