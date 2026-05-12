@@ -40,6 +40,7 @@ class Pi0Config(_model.BaseModelConfig):
     # π0.5 + Knowledge Insulation: train backbone with FAST (discrete) action tokens and
     # action expert with flow-matching, with stop_gradient from action expert to backbone.
     knowledge_insulation: bool = False
+    flow_stop_gradient: bool = True
 
     # 本地 FAST tokenizer 路径（无外网时使用）。也可用环境变量 OPENPI_FAST_TOKENIZER_PATH。
     # 需包含 config.json 等，与 HuggingFace physical-intelligence/fast 目录结构一致。

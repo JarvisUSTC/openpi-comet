@@ -71,6 +71,7 @@ class Pi0(_model.BaseModel):
         self.pi05 = config.pi05
         self.pcd = config.pcd
         self.knowledge_insulation = getattr(config, "knowledge_insulation", False)
+        self.flow_stop_gradient = getattr(config, "flow_stop_gradient", True)
         self.fast_loss_weight = getattr(config, "fast_loss_weight", 1.0)
         self.flow_loss_weight = getattr(config, "flow_loss_weight", 1.0)
         self.vqa_loss_weight = getattr(config, "vqa_loss_weight", 1.0)
@@ -324,10 +325,11 @@ class Pi0(_model.BaseModel):
                 [full_tokens, None], mask=full_prefix_attn_mask, positions=full_prefix_positions
             )
 
-            # Slice KV cache to flow prefix length and apply stop_gradient.
+            # Slice KV cache to flow prefix length; KI keeps flow gradients out of the backbone by default.
             flow_prefix_len = flow_tokens.shape[1]
             kv_cache = jax.tree.map(lambda x: x[:, :, :flow_prefix_len, :], full_kv_cache)
-            kv_cache = jax.tree.map(jax.lax.stop_gradient, kv_cache)
+            if self.flow_stop_gradient:
+                kv_cache = jax.tree.map(jax.lax.stop_gradient, kv_cache)
 
             # Flow suffix: noisy actions + timestep, conditioned on frozen backbone KV cache.
             suffix_tokens, suffix_mask, suffix_ar_mask, adarms_cond = self.embed_suffix(observation, x_t, time)
